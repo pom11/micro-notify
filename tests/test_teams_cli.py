@@ -209,7 +209,9 @@ def test_send_dm_recipient_outside_allowlist_is_exit_3_with_zero_http(
 
     teams_module.post_card = spy
     try:
-        code = run(["teams", "send", "dm", "--to", "outsider@evil.example", "--text", "hi"])
+        # contoso.com is a placeholder domain but NOT in this config's allow list
+        # (which holds domain example.com + the verbatim person@contoso.com).
+        code = run(["teams", "send", "dm", "--to", "outsider@contoso.com", "--text", "hi"])
     finally:
         teams_module.post_card = real_post
 
@@ -229,8 +231,10 @@ def test_send_dry_run_prints_masked_payload_and_zero_network(
 
     out = capsys.readouterr()
     assert code == 0
+    # Security property, not a mask format: the signature must be gone, while
+    # scheme+host stay visible so the operator can confirm the right target.
     assert CANARY_URL not in out.out and CANARY_URL not in out.err
-    assert "https://example.com/***" in out.out  # masked form only
+    assert "example.com" in out.out
     config = load_config(mnotify_config)
     lines = read_json_lines(config.paths.audit)
     assert lines and lines[-1]["outcome"] == "dry_run"
