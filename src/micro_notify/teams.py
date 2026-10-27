@@ -8,6 +8,7 @@ to it goes through the audit module's ``mask_url``.
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 
@@ -63,6 +64,37 @@ def build_card(
             {"type": "Action.OpenUri", "title": link_title or "Open", "url": link}
         ]
     return card
+
+
+def parse_facts(raw: list[str] | None) -> list[tuple[str, str]]:
+    """Parse repeatable ``--fact k=v`` values; first ``=`` splits key and value."""
+    if not raw:
+        return []
+    facts: list[tuple[str, str]] = []
+    for item in raw:
+        key, sep, value = item.partition("=")
+        if not sep or not key.strip():
+            raise UsageError(f"--fact must be key=value, got '{item}'")
+        facts.append((key.strip(), value))
+    return facts
+
+
+def load_card_file(path: str) -> dict:
+    """Read a full Adaptive Card JSON file verbatim (``--card-file``, design §3.2)."""
+    from pathlib import Path
+
+    file = Path(path).expanduser()
+    try:
+        data = json.loads(file.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise UsageError(f"--card-file: cannot read {file} (FileNotFoundError)") from exc
+    except OSError as exc:
+        raise UsageError(f"--card-file: cannot read {file} ({type(exc).__name__})") from exc
+    except json.JSONDecodeError as exc:
+        raise UsageError(f"--card-file: {file} is not valid JSON") from exc
+    if not isinstance(data, dict) or data.get("type") != "AdaptiveCard" or "version" not in data:
+        raise UsageError(f"--card-file: {file} is not an Adaptive Card (needs type + version)")
+    return data
 
 
 def build_channel_payload(card: dict) -> dict:

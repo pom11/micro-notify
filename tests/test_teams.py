@@ -120,6 +120,57 @@ def test_build_dm_payload_matches_design_section_3_2() -> None:
     }
 
 
+# --- --fact k=v parsing and --card-file passthrough --------------------------
+def test_parse_facts_splits_each_pair_on_the_first_equals() -> None:
+    assert teams.parse_facts(["service=api", "url=https://example.com/a=b"]) == [
+        ("service", "api"),
+        ("url", "https://example.com/a=b"),
+    ]
+
+
+def test_parse_facts_rejects_an_entry_without_equals() -> None:
+    from micro_notify import UsageError
+
+    with pytest.raises(UsageError) as excinfo:
+        teams.parse_facts(["oops"])
+
+    assert "oops" in excinfo.value.message
+
+
+def test_parse_facts_none_given_yields_no_facts() -> None:
+    assert teams.parse_facts(None) == []
+
+
+def test_load_card_file_returns_the_card_json_verbatim(tmp_path) -> None:
+    card = {"type": "AdaptiveCard", "version": "1.4", "body": [], "extra": {"deep": [1, 2]}}
+    path = tmp_path / "card.json"
+    path.write_text(json.dumps(card), encoding="utf-8")
+
+    assert teams.load_card_file(str(path)) == card
+
+
+def test_load_card_file_rejects_json_that_is_not_a_card(tmp_path) -> None:
+    from micro_notify import UsageError
+
+    path = tmp_path / "card.json"
+    path.write_text('{"type": "AdaptiveCard"}', encoding="utf-8")
+
+    with pytest.raises(UsageError) as excinfo:
+        teams.load_card_file(str(path))
+
+    assert "card" in excinfo.value.message.lower()
+
+
+def test_load_card_file_rejects_invalid_json(tmp_path) -> None:
+    from micro_notify import UsageError
+
+    path = tmp_path / "card.json"
+    path.write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(UsageError):
+        teams.load_card_file(str(path))
+
+
 # --- Target resolution + keychain lookup (config + secrets seams only) ------
 def test_resolve_target_returns_configured_target(mnotify_config) -> None:
     from micro_notify.config import load_config
