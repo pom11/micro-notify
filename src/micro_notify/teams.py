@@ -54,3 +54,18 @@ def build_card(
             {"type": "Action.OpenUri", "title": link_title or "Open", "url": link}
         ]
     return card
+
+
+def build_channel_payload(card: dict) -> dict:
+    """Workflow "post to a channel" template body (design §3.2)."""
+    return {
+        "type": "message",
+        "attachments": [
+            {"contentType": ADAPTIVE_CARD_CONTENT_TYPE, "content": card}
+        ],
+    }
+
+
+def build_dm_payload(upn: str, card: dict) -> dict:
+    """Single DM workflow body: Flow bot posts to ``triggerBody()?['recipient']``."""
+    return {"recipient": upn, "attachments": [card]}
