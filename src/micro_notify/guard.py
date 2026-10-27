@@ -80,16 +80,28 @@ def check(
     config: Config,
     *,
     recipients: Sequence[str] = (),
+    cc: Sequence[str] = (),
+    bcc: Sequence[str] = (),
     dm_recipients: Sequence[str] = (),
 ) -> Verdict:
     """Decide one send attempt against the configured guardrails.
 
-    ``recipients`` are the mail to/cc/bcc addresses; ``dm_recipients`` are the
-    Teams DM UPNs. Every one of them must match the allowlist.
+    ``recipients`` are the mail ``to`` addresses, ``cc``/``bcc`` the carbon
+    copies, ``dm_recipients`` the Teams DM UPNs. Every one of them must match
+    the allowlist, and the combined per-message recipient count must fit
+    ``limits.max_recipients``.
     """
-    for address in [*recipients, *dm_recipients]:
+    all_recipients = [*recipients, *cc, *bcc, *dm_recipients]
+    for address in all_recipients:
         if not _allowed(config, address):
             return Verdict(REFUSED, f"recipient not allowed by [allow]: {address}")
+
+    limit = config.limits.max_recipients
+    if len(all_recipients) > limit:
+        return Verdict(
+            REFUSED,
+            f"{len(all_recipients)} recipients exceeds limits.max_recipients={limit}",
+        )
     return Verdict(OK)
 
 

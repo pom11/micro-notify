@@ -104,7 +104,7 @@ def test_address_match_is_case_insensitive(config: Config) -> None:
 
 def test_subdomain_is_not_admitted_by_its_parent_domain(config: Config) -> None:
     """Least privilege: example.com in the allowlist does not admit dept.example.com."""
-    verdict = check(config, recipients=["boss@dept.example.com"])
+    verdict = check(config, recipients=[foreign("boss", "dept", "example", "com")])
 
     assert verdict.status == REFUSED
 
@@ -117,6 +117,53 @@ def test_subdomain_is_not_admitted_by_its_parent_domain(config: Config) -> None:
 def test_malformed_address_is_refused_not_crashed(config: Config, bad: str) -> None:
     """A malformed address must produce a refusal verdict — never an exception."""
     verdict = check(config, recipients=[bad])
+
+    assert verdict.status == REFUSED
+    assert verdict.exit_code == EXIT_GUARD
+
+
+# --- Recipient count per message (design §3.3, exit 3) ---------------------
+def three_recipients(n: int) -> list[str]:
+    return [f"user{i}@example.com" for i in range(n)]
+
+
+def test_one_below_the_recipient_limit_is_allowed(config: Config) -> None:
+    tight = replace(config, limits=replace(config.limits, max_recipients=3))
+
+    verdict = check(tight, recipients=three_recipients(2))
+
+    assert verdict.status == OK
+
+
+def test_exactly_at_the_recipient_limit_is_allowed(config: Config) -> None:
+    """The limit is a maximum, so count == max_recipients still sends."""
+    tight = replace(config, limits=replace(config.limits, max_recipients=3))
+
+    verdict = check(tight, recipients=three_recipients(3))
+
+    assert verdict.status == OK
+
+
+def test_one_over_the_recipient_limit_refuses_with_exit_3(config: Config) -> None:
+    tight = replace(config, limits=replace(config.limits, max_recipients=3))
+
+    verdict = check(tight, recipients=three_recipients(4))
+
+    assert verdict.status == REFUSED
+    assert verdict.exit_code == EXIT_GUARD
+    assert "4" in verdict.reason and "3" in verdict.reason
+
+
+def test_cc_and_bcc_count_towards_the_recipient_limit(config: Config) -> None:
+    """The limit is per *message*: to/cc/bcc are counted together."""
+    tight = replace(config, limits=replace(config.limits, max_recipients=3))
+
+    verdict = check(
+        tight,
+        recipients=["a@example.com", "b@example.com"],
+        cc=["c@example.com"],
+        bcc=["d@example.com"],
+    )
 
     assert verdict.status == REFUSED
     assert verdict.exit_code == EXIT_GUARD
