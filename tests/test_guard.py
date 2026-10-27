@@ -17,7 +17,7 @@ import pytest
 
 from micro_notify import EXIT_GUARD, EXIT_OK
 from micro_notify.config import AllowConfig, Config
-from micro_notify.guard import OK, REFUSED, check
+from micro_notify.guard import OK, REFUSED, Attachment, check
 
 from conftest import placeholder_config
 
@@ -167,3 +167,50 @@ def test_cc_and_bcc_count_towards_the_recipient_limit(config: Config) -> None:
 
     assert verdict.status == REFUSED
     assert verdict.exit_code == EXIT_GUARD
+
+
+# --- Attachment total size (design §3.3: total <= limits.max_attach_mb) ----
+MB_BYTES = 1024 * 1024
+
+
+def test_attachment_at_the_limit_is_allowed(config: Config) -> None:
+    """Exactly max_attach_mb total bytes still sends — the cap is a maximum."""
+    verdict = check(
+        config,
+        recipients=["someone@example.com"],
+        attachments=[Attachment("report.pdf", MB_BYTES * config.limits.max_attach_mb)],
+    )
+
+    assert verdict.status == OK
+
+
+def test_attachment_one_byte_over_the_limit_refuses_with_exit_3(config: Config) -> None:
+    """Just over the cap on the *total* is refused before any network call."""
+    verdict = check(
+        config,
+        recipients=["someone@example.com"],
+        attachments=[Attachment("report.pdf", MB_BYTES * config.limits.max_attach_mb + 1)],
+    )
+
+    assert verdict.status == REFUSED
+    assert verdict.exit_code == EXIT_GUARD
+    assert "report.pdf" in verdict.reason
+
+
+def test_attachment_limit_applies_to_the_total_not_per_file(config: Config) -> None:
+    """Three files of 1.5 MB each are 4.5 MB total — refused even though each fits."""
+    half = MB_BYTES * config.limits.max_attach_mb // 2 + 1
+    verdict = check(
+        config,
+        recipients=["someone@example.com"],
+        attachments=[Attachment(f"part{i}.bin", half) for i in range(3)],
+    )
+
+    assert verdict.status == REFUSED
+    assert verdict.exit_code == EXIT_GUARD
+
+
+def test_no_attachments_never_trips_the_size_guard(config: Config) -> None:
+    verdict = check(config, recipients=["someone@example.com"], attachments=[])
+
+    assert verdict.status == OK
