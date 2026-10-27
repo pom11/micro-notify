@@ -8,6 +8,9 @@ the autouse ``no_network`` harness makes that impossible anyway.
 
 from __future__ import annotations
 
+import json
+
+import httpx
 import pytest
 
 from micro_notify import teams
@@ -165,3 +168,109 @@ def test_webhook_url_message_never_contains_the_url(fake_keychain) -> None:
         teams.webhook_url("alerts")
 
     assert CANARY_URL not in excinfo.value.message
+
+
+# --- POST + retry (design §9) — MockTransport + fake clock, zero sleeping ----
+def _handler(responses, seen):
+    """A MockTransport handler popping (status, headers, body) per request."""
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        status, headers, body = responses.pop(0) if len(responses) > 1 else responses[0]
+        return httpx.Response(status, headers=headers, json=body)
+
+    return handle
+
+
+def _post(payload, responses, *, sleeps=None, url=CANARY_URL, url_label="https://example.com/***"):
+    seen: list[httpx.Request] = []
+    transport = httpx.MockTransport(_handler(responses, seen))
+    delays: list[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        delays.append(seconds)
+
+    try:
+        result = teams.post_card(
+            url,
+            payload,
+            url_label=url_label,
+            transport=transport,
+            sleep=fake_sleep,
+        )
+        return result, seen, delays
+    except Exception as exc:
+        raise_ = exc
+        raise_._seen = seen  # type: ignore[attr-defined]
+        raise_._delays = delays  # type: ignore[attr-defined]
+        raise
+
+
+def test_post_card_posts_json_payload_and_succeeds_on_202() -> None:
+    result, seen, delays = _post({"type": "message"}, [(202, {}, {})])
+
+    assert seen[0].method == "POST"
+    assert seen[0].headers["content-type"].startswith("application/json")
+    assert json.loads(seen[0].content) == {"type": "message"}
+    assert delays == []
+    assert result.status == 202
+
+
+def test_post_card_400_raises_remote_error_without_retrying() -> None:
+    from micro_notify import RemoteError
+
+    try:
+        _post({"a": 1}, [(400, {}, {"error": "bad card"})])
+        pytest.fail("expected RemoteError")
+    except RemoteError as exc:
+        assert len(exc._seen) == 1  # type: ignore[attr-defined]
+        assert exc._delays == []  # type: ignore[attr-defined]
+        assert "400" in exc.message
+        assert "bad card" in exc.message
+
+
+def test_post_card_error_message_never_contains_the_url() -> None:
+    from micro_notify import RemoteError
+
+    try:
+        _post({"a": 1}, [(400, {}, {"error": "nope"})])
+        pytest.fail("expected RemoteError")
+    except RemoteError as exc:
+        assert CANARY_URL not in exc.message
+        assert "https://example.com/***" in exc.message
+
+
+def test_post_card_truncates_a_long_error_body() -> None:
+    from micro_notify import RemoteError
+
+    filler = "x" * 900
+    try:
+        _post({"a": 1}, [(400, {}, {"detail": filler})])
+        pytest.fail("expected RemoteError")
+    except RemoteError as exc:
+        assert filler[:20] in exc.message
+        assert len(exc.message) < 900 + 200  # truncated, not spewed
+        assert "..." in exc.message
+
+
+def test_post_card_retries_429_honouring_retry_after() -> None:
+    result, seen, delays = _post(
+        {"a": 1},
+        [(429, {"Retry-After": "7"}, {"err": "slow down"}), (202, {}, {})],
+    )
+
+    assert result.status == 202
+    assert len(seen) == 2
+    assert delays == [7.0]
+
+
+def test_post_card_retries_5xx_up_to_three_tries_then_fails() -> None:
+    from micro_notify import RemoteError
+
+    try:
+        _post({"a": 1}, [(503, {}, {"err": "unavailable"})])
+        pytest.fail("expected RemoteError")
+    except RemoteError as exc:
+        assert len(exc._seen) == 3  # type: ignore[attr-defined]
+        assert len(exc._delays) == 2  # type: ignore[attr-defined]
+        assert "503" in exc.message
