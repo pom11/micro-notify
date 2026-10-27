@@ -103,12 +103,28 @@ max_recipients = 20
 daily_max = 200
 max_attach_mb = 3
 
+[paths]                       # optional; lets tests point audit + counter at a tmp dir
+audit = "~/Library/Logs/mnotify/sent.jsonl"
+state_dir = "~/Library/Application Support/mnotify"   # holds counter.json
+
 [teams.targets.alerts]        # name -> kind; URL lives in the keychain
 kind = "channel"
 [teams.targets.dm]
 kind = "dm"
 ```
 Env overrides for CI/agents: `MICRO_NOTIFY_CONFIG` (path). No secrets via env in v1.
+
+Keychain accounts (service `mnotify`, design §3) — operator approved 2026-10-27:
+
+| account | holds |
+| --- | --- |
+| `graph.certificate_pem` | private key PEM (auth = "certificate") |
+| `graph.certificate_thumbprint` | cert thumbprint paired with the PEM |
+| `graph.client_secret` | client secret (auth = "secret") |
+| `teams:<target>` | Workflows webhook URL for target `<target>` (= a secret) |
+
+The config file above holds **no** secret values; `[paths]` exists so the test suite can redirect the
+audit log and `counter.json` into a temp dir instead of the real HOME.
 
 ## 4. CLI
 
@@ -135,7 +151,9 @@ Exit codes: 0 sent · 2 usage/config error · 3 refused by guard · 4 auth error
 ## 5. Packaging
 - Repo `pom11/micro-notify` (private until v0.1.0, then public on operator OK). MIT license *(my call)*.
   Releases tagged `vX.Y.Z` with GitHub release tarballs.
-- Tap `pom11/homebrew-micro-notify` (public with the repo), formula `micro-notify` = Python virtualenv
+- Tap `pom11/homebrew-micro-notify` — created **private** alongside the main repo (operator decision
+  2026-10-27); goes public with the repo at v0.1.0, so `brew install` works publicly only after the flip.
+  Formula `micro-notify` = Python virtualenv
   formula, `url` = release tarball + sha256, resources pinned. Same pattern as pom11/homebrew-hscc.
 - Release script bumps the formula (run by the orch; no GH Actions secrets needed v1).
 - Leak guard: a test scans tracked files and fails on GUIDs that are not the documented placeholders,

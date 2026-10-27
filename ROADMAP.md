@@ -49,7 +49,9 @@ Every step carries the same three VERIFY gates:
   Teams workflow creation + pasting webhook URLs). Orch writes the doc; only the operator runs it.
 - First real sends (`mnotify doctor --send-test`, one mail, one channel post, one DM) and the
   scoped-mailbox negative test expecting 403.
-- Visibility flip of `pom11/micro-notify` to public at v0.1.0, and creation of the public tap repo.
+- Visibility flip of `pom11/micro-notify` to public at v0.1.0, and the same flip for
+  `pom11/homebrew-micro-notify`. The tap repo itself is created **private** up front by the orchestrator
+  (operator decision 2026-10-27); only the flip stays with the operator.
 
 ## Definition of done for the project
 
