@@ -19,6 +19,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
+from urllib.parse import urlsplit
 
 from .config import Config
 from .guard import Attachment
@@ -34,6 +35,9 @@ FAILED = "failed"
 DRY_RUN = "dry_run"
 
 AUDIT_FILE_MODE = 0o600
+
+# The replacement tail mask_url() appends instead of path/query/credentials.
+MASKED_URL = "***"
 
 
 def body_digest(body: str) -> tuple[str, int]:
@@ -101,6 +105,23 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def mask_url(url: str) -> str:
+    """Return ``scheme://host/***`` — the only form a URL may appear in output.
+
+    Workflows webhook URLs carry their signature in the path (design §3.2), so
+    ``--dry-run`` output and any error path print this instead of the URL. If
+    the input is not a parseable absolute http(s) URL, nothing is echoed back:
+    an error path may hand us anything, and "***" is the safe answer.
+    """
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return MASKED_URL
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+        return MASKED_URL
+    return f"{parsed.scheme.lower()}://{parsed.hostname.lower()}/{MASKED_URL}"
+
+
 def _append_line(path: Path, line: str) -> None:
     """Append one JSONL line with mode 0600, creating parent dirs as needed."""
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -118,8 +139,10 @@ __all__ = [
     "CHANNEL_TEAMS",
     "DRY_RUN",
     "FAILED",
+    "MASKED_URL",
     "REFUSED",
     "SENT",
     "body_digest",
+    "mask_url",
     "record",
 ]
