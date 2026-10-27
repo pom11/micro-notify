@@ -8,6 +8,10 @@ to it goes through the audit module's ``mask_url``.
 
 from __future__ import annotations
 
+from . import AuthError, UsageError
+from .config import Config, TeamTarget
+from . import secrets
+
 ADAPTIVE_CARD_CONTENT_TYPE = "application/vnd.microsoft.card.adaptive"
 ADAPTIVE_CARD_SCHEMA = "http://adaptivecards.io/schemas/adaptive-card.json"
 
@@ -69,3 +73,33 @@ def build_channel_payload(card: dict) -> dict:
 def build_dm_payload(upn: str, card: dict) -> dict:
     """Single DM workflow body: Flow bot posts to ``triggerBody()?['recipient']``."""
     return {"recipient": upn, "attachments": [card]}
+
+
+# --- Target resolution + webhook URL lookup ----------------------------------
+def resolve_target(config: Config, name: str) -> TeamTarget:
+    """The ``[teams.targets.<name>]`` entry, or a usage error naming it (exit 2)."""
+    target = config.target(name)
+    if target is None:
+        raise UsageError(
+            f"unknown teams target '{name}' (configured: "
+            f"{', '.join(t.name for t in config.teams_targets) or 'none'}; "
+            "add one with `mnotify teams targets add`)"
+        )
+    return target
+
+
+def webhook_url(target_name: str) -> str:
+    """The Workflows webhook URL for ``target_name`` from the keychain.
+
+    Exit 4 when the account is absent; the message names the account, never a
+    URL (design §3.2 — the URL is a secret).
+    """
+    account = secrets.teams_account(target_name)
+    try:
+        return secrets.get(account)
+    except secrets.KeychainError as exc:
+        raise AuthError(
+            f"no webhook URL stored for teams target '{target_name}': keychain "
+            f"account '{account}' is missing (set it with "
+            f"`mnotify teams targets add {target_name} --kind <kind>`)"
+        ) from exc
