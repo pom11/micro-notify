@@ -81,3 +81,31 @@ def test_build_card_without_link_has_no_actions() -> None:
     card = teams.build_card(text="no link")
 
     assert "actions" not in card
+
+
+# --- Payload shapes: design §3.2 verbatim ------------------------------------
+def _tiny_card() -> dict:
+    return {"type": "AdaptiveCard", "version": "1.4", "body": []}
+
+
+def test_build_channel_payload_matches_design_section_3_2() -> None:
+    card = _tiny_card()
+
+    assert teams.build_channel_payload(card) == {
+        "type": "message",
+        "attachments": [
+            {
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": card,
+            }
+        ],
+    }
+
+
+def test_build_dm_payload_matches_design_section_3_2() -> None:
+    card = _tiny_card()
+
+    assert teams.build_dm_payload("person@contoso.com", card) == {
+        "recipient": "person@contoso.com",
+        "attachments": [card],
+    }
