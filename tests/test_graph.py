@@ -447,3 +447,269 @@ class TestTokenFailurePaths:
             graph.acquire_token(mail_config())
 
         assert excinfo.value.exit_code == EXIT_AUTH
+
+
+# --- Transport + retry (design sections 3.1, 9) -----------------------------
+REQUEST_ID = "req-00000000-0000-0000-0000-000000000000"
+
+
+def send_payload() -> dict:
+    return graph.build_send_payload(
+        to=["alice@example.com"], subject="hi", body="body"
+    )
+
+
+class RecordingSleeper:
+    """A fake clock for the backoff: records the sleep durations, sleeps never."""
+
+    def __init__(self) -> None:
+        self.slept: list[float] = []
+
+    def __call__(self, seconds: float) -> None:
+        self.slept.append(seconds)
+
+
+class TransportHarness:
+    """httpx.MockTransport scripted with canned responses + a full request log."""
+
+    def __init__(self, responses: list[httpx.Response]) -> None:
+        self.remaining = list(responses)
+        self.requested: list[httpx.Request] = []
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        self.requested.append(request)
+        if len(self.remaining) > 1:
+            return self.remaining.pop(0)
+        return self.remaining[0]
+
+    @property
+    def calls(self) -> int:
+        return len(self.requested)
+
+
+def harness(*responses: httpx.Response) -> TransportHarness:
+    return TransportHarness(list(responses))
+
+
+def ok202(request_id: str = REQUEST_ID) -> httpx.Response:
+    return httpx.Response(202, headers={"request-id": request_id})
+
+
+def mock(transport: TransportHarness) -> httpx.MockTransport:
+    """Wrap the scripted harness in the real MockTransport machinery."""
+    return httpx.MockTransport(transport.handler)
+
+
+@pytest.fixture
+def sleeper(monkeypatch: pytest.MonkeyPatch) -> RecordingSleeper:
+    """No test sleeps for real; every backoff duration is recorded instead."""
+    fake = RecordingSleeper()
+    monkeypatch.setattr(graph.time, "sleep", fake)
+    return fake
+
+
+class TestSendMailSuccess:
+    def test_202_returns_the_graph_request_id_and_posts_to_sendmail(
+        self, seeded_keychain, msal_stub, sleeper
+    ) -> None:
+        msal_stub.silent_result = {"access_token": "a-token"}
+        transport = harness(ok202())
+
+        result = graph.send_mail(
+            mail=mail_config(), payload=send_payload(), transport=mock(transport)
+        )
+
+        assert result.request_id == REQUEST_ID
+        assert transport.calls == 1
+        request = transport.requested[0]
+        assert request.method == "POST"
+        assert str(request.url) == (
+            graph.GRAPH_BASE + "/users/" + "noreply%40example.com" + "/sendMail"
+        )
+        assert request.headers["authorization"] == "Bearer a-token"
+        assert request.headers["content-type"].startswith("application/json")
+        body = json.loads(request.content)
+        assert body["message"]["subject"] == "hi"
+        assert body["saveToSentItems"] is True
+        assert sleeper.slept == []
+
+    def test_sender_is_url_encoded_in_the_path(
+        self, seeded_keychain, msal_stub, sleeper
+    ) -> None:
+        """An SMTP address is not a URL path segment; Graph wants it encoded."""
+        msal_stub.silent_result = {"access_token": "a-token"}
+        transport = harness(ok202())
+
+        graph.send_mail(
+            mail=mail_config(sender="first.last+alerts@example.com"),
+            payload=send_payload(),
+            transport=mock(transport),
+        )
+
+        assert "first.last%2Balerts%40example.com" in str(
+            transport.requested[0].url
+        )
+
+
+class TestNonRetryableErrors:
+    def test_400_is_exit_5_after_exactly_one_call_with_the_request_id(
+        self, seeded_keychain, msal_stub, sleeper
+    ) -> None:
+        """Design section 9: no retry on 4xx (other than 429). The Graph
+        request-id rides in the message so the operator can correlate (§4)."""
+        msal_stub.silent_result = {"access_token": "a-token"}
+        transport = harness(
+            httpx.Response(
+                400,
+                headers={"request-id": REQUEST_ID},
+                json={"error": {"code": "BadRequest", "message": "bad address"}},
+            )
+        )
+
+        with pytest.raises(RemoteError) as excinfo:
+            graph.send_mail(
+                mail=mail_config(),
+                payload=send_payload(),
+                transport=mock(transport),
+            )
+
+        assert excinfo.value.exit_code == EXIT_REMOTE
+        assert transport.calls == 1
+        assert REQUEST_ID in excinfo.value.message
+        assert "400" in excinfo.value.message
+        assert sleeper.slept == []
+
+    def test_401_is_exit_5_with_no_retry_and_no_body_leak(
+        self, seeded_keychain, msal_stub, sleeper
+    ) -> None:
+        """A 401 body from Graph can echo message content; only status +
+        request-id may reach the message (design section 2 anti-goals)."""
+        msal_stub.silent_result = {"access_token": "a-token"}
+        secret_word = "pipeline-is-red-body-content"
+        transport = harness(
+            httpx.Response(
+                401,
+                headers={"request-id": REQUEST_ID},
+                json={"error": {"message": f"echo: {secret_word}"}},
+            )
+        )
+
+        with pytest.raises(RemoteError) as excinfo:
+            graph.send_mail(
+                mail=mail_config(),
+                payload=graph.build_send_payload(
+                    to=["alice@example.com"], subject="hi", body=secret_word
+                ),
+                transport=mock(transport),
+            )
+
+        assert excinfo.value.exit_code == EXIT_REMOTE
+        assert transport.calls == 1
+        assert secret_word not in excinfo.value.message
+        assert REQUEST_ID in excinfo.value.message
+
+
+class TestRetryPolicy:
+    """Design section 9: retry on 429 and 5xx only, honour Retry-After capped at
+    60 s, max 3 tries total."""
+
+    def test_429_with_retry_after_is_retried_then_succeeds(
+        self, seeded_keychain, msal_stub, sleeper
+    ) -> None:
+        msal_stub.silent_result = {"access_token": "a-token"}
+        transport = harness(
+            httpx.Response(429, headers={"Retry-After": "1", "request-id": REQUEST_ID}),
+            ok202(),
+        )
+
+        result = graph.send_mail(
+            mail=mail_config(), payload=send_payload(), transport=mock(transport)
+        )
+
+        assert result.request_id == REQUEST_ID
+        assert transport.calls == 2
+        assert sleeper.slept == [1.0]
+
+    def test_retry_after_is_capped_at_60_seconds(
+        self, seeded_keychain, msal_stub, sleeper
+    ) -> None:
+        msal_stub.silent_result = {"access_token": "a-token"}
+        transport = harness(
+            httpx.Response(429, headers={"Retry-After": "3600", "request-id": REQUEST_ID}),
+            ok202(),
+        )
+
+        graph.send_mail(
+            mail=mail_config(), payload=send_payload(), transport=mock(transport)
+        )
+
+        assert sleeper.slept == [60.0]
+
+    def test_500_three_times_is_exit_5_after_exactly_three_tries(
+        self, seeded_keychain, msal_stub, sleeper
+    ) -> None:
+        msal_stub.silent_result = {"access_token": "a-token"}
+        transport = harness(
+            httpx.Response(500, headers={"request-id": REQUEST_ID})
+        )
+
+        with pytest.raises(RemoteError) as excinfo:
+            graph.send_mail(
+                mail=mail_config(),
+                payload=send_payload(),
+                transport=mock(transport),
+            )
+
+        assert excinfo.value.exit_code == EXIT_REMOTE
+        assert transport.calls == 3
+        # Two waits between the three tries, and no real sleeping.
+        assert len(sleeper.slept) == 2
+        assert REQUEST_ID in excinfo.value.message
+
+    def test_503_is_retried(
+        self, seeded_keychain, msal_stub, sleeper
+    ) -> None:
+        msal_stub.silent_result = {"access_token": "a-token"}
+        transport = harness(
+            httpx.Response(503, headers={"request-id": REQUEST_ID}),
+            ok202(),
+        )
+
+        result = graph.send_mail(
+            mail=mail_config(), payload=send_payload(), transport=mock(transport)
+        )
+
+        assert transport.calls == 2
+        assert result.request_id == REQUEST_ID
+
+    def test_429_without_retry_after_falls_back_to_exponential_backoff(
+        self, seeded_keychain, msal_stub, sleeper
+    ) -> None:
+        """Without a server hint the waits still grow and still stay capped."""
+        msal_stub.silent_result = {"access_token": "a-token"}
+        transport = harness(
+            httpx.Response(429, headers={"request-id": REQUEST_ID}),
+            ok202(),
+        )
+
+        graph.send_mail(
+            mail=mail_config(), payload=send_payload(), transport=mock(transport)
+        )
+
+        assert len(sleeper.slept) == 1
+        assert 0 < sleeper.slept[0] <= 60.0
+
+    def test_token_is_acquired_once_across_retries(
+        self, seeded_keychain, msal_stub, sleeper
+    ) -> None:
+        """Retries reuse the token; they do not re-auth on every try."""
+        msal_stub.silent_result = {"access_token": "a-token"}
+        transport = harness(
+            httpx.Response(500, headers={"request-id": REQUEST_ID}), ok202()
+        )
+
+        graph.send_mail(
+            mail=mail_config(), payload=send_payload(), transport=mock(transport)
+        )
+
+        assert msal_stub.token_calls == 1

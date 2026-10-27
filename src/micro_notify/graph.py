@@ -17,11 +17,16 @@ The msal and httpx imports are module-level attributes (``graph.msal``,
 from __future__ import annotations
 
 import base64
+import json
+import re
+import time
 from dataclasses import dataclass
+from urllib.parse import quote
 
+import httpx
 import msal
 
-from . import AuthError, GuardRefusal
+from . import AuthError, GuardRefusal, RemoteError
 from . import secrets
 from .config import AUTH_SECRET, MailConfig
 
@@ -126,3 +131,97 @@ def acquire_token(mail: MailConfig) -> str:
         detail = f"{error}: {description}" if description else str(error)
         raise AuthError(f"Graph token acquisition failed ({detail})")
     return result["access_token"]
+
+
+# --- Transport + retry (design sections 3.1, 9) ------------------------------
+MAX_TRIES = 3
+RETRY_AFTER_CAP_SECONDS = 60.0
+BASE_BACKOFF_SECONDS = 1.0
+SUCCESS_STATUSES = frozenset({200, 201, 202, 204})
+
+# Graph error codes are machine tokens; only that shape may join a message, so a
+# response body echoing message content can never reach stderr or the audit log.
+_GRAPH_CODE_CHARS = re.compile(r"^[A-Za-z][A-Za-z0-9_.]{0,63}$")
+
+
+@dataclass(frozen=True)
+class SendResult:
+    """What the caller needs for the design section 4 JSON and the audit line."""
+
+    status_code: int
+    request_id: str | None
+
+
+def _retryable(status_code: int) -> bool:
+    """Design section 9: retry on 429 and 5xx only — never another 4xx."""
+    return status_code == 429 or 500 <= status_code <= 599
+
+
+def _wait_seconds(response: httpx.Response, attempt: int) -> float:
+    """Honour ``Retry-After`` when Graph sends one, else back off exponentially.
+
+    Either way the wait is capped, so a hostile or misconfigured ``Retry-After``
+    cannot stall the CLI.
+    """
+    raw = response.headers.get("retry-after")
+    if raw is not None:
+        try:
+            requested = float(raw.strip())
+        except ValueError:
+            requested = BASE_BACKOFF_SECONDS
+        return min(max(requested, 0.0), RETRY_AFTER_CAP_SECONDS)
+    return min(BASE_BACKOFF_SECONDS * (2**attempt), RETRY_AFTER_CAP_SECONDS)
+
+
+def _failure_detail(response: httpx.Response, request_id: str | None) -> str:
+    """Status + Graph request-id (+ a machine-only error code). Never the body."""
+    parts = [f"HTTP {response.status_code}"]
+    code = ""
+    try:
+        body = response.json()
+    except (ValueError, UnicodeDecodeError):
+        body = None
+    if isinstance(body, dict):
+        candidate = (body.get("error") or {}).get("code") if isinstance(
+            body.get("error"), dict
+        ) else None
+        if isinstance(candidate, str) and _GRAPH_CODE_CHARS.match(candidate):
+            code = candidate
+    if code:
+        parts.append(f"code {code}")
+    if request_id:
+        parts.append(f"Graph request-id {request_id}")
+    return ", ".join(parts)
+
+
+def send_mail(
+    *,
+    mail: MailConfig,
+    payload: dict,
+    transport: httpx.BaseTransport | None = None,
+) -> SendResult:
+    """POST one sendMail request (design section 3.1) with the retry policy of §9.
+
+    ``transport`` is the seam tests use (``httpx.MockTransport``); production
+    leaves it None. The token is acquired once — retries reuse it.
+    """
+    token = acquire_token(mail)
+    url = f"{GRAPH_BASE}/users/{quote(mail.sender, safe='')}/sendMail"
+    headers = {
+        "authorization": f"Bearer {token}",
+        "content-type": "application/json; charset=utf-8",
+    }
+    with httpx.Client(transport=transport, timeout=30.0) as client:
+        for attempt in range(MAX_TRIES):
+            response = client.post(url, json=payload, headers=headers)
+            request_id = response.headers.get("request-id")
+            if response.status_code in SUCCESS_STATUSES:
+                return SendResult(
+                    status_code=response.status_code, request_id=request_id
+                )
+            if not _retryable(response.status_code) or attempt == MAX_TRIES - 1:
+                raise RemoteError(
+                    f"Graph sendMail failed ({_failure_detail(response, request_id)})"
+                )
+            time.sleep(_wait_seconds(response, attempt))
+    raise AssertionError("unreachable: the retry loop always returns or raises")
