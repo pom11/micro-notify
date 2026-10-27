@@ -27,11 +27,28 @@ OK = "ok"
 REFUSED = "refused"
 CAP_REACHED = "cap_reached"
 
+# limits.max_attach_mb is counted in binary megabytes (MiB) — the unit the
+# Graph fileAttachment guidance uses for the ~3.75 MB request body ceiling.
+BYTES_PER_MB = 1024 * 1024
+
 _STATUS_EXIT_CODES = {
     OK: EXIT_OK,
     REFUSED: EXIT_GUARD,
     CAP_REACHED: EXIT_DAILY_CAP,
 }
+
+
+@dataclass(frozen=True)
+class Attachment:
+    """One attachment's name and byte size.
+
+    The caller (``mail send``) stats the file and hands the guard numbers:
+    :func:`check` never opens the file, so a refusal happens before any body
+    or attachment bytes are read or encoded.
+    """
+
+    name: str
+    size_bytes: int
 
 
 @dataclass(frozen=True)
@@ -83,13 +100,15 @@ def check(
     cc: Sequence[str] = (),
     bcc: Sequence[str] = (),
     dm_recipients: Sequence[str] = (),
+    attachments: Sequence[Attachment] = (),
 ) -> Verdict:
     """Decide one send attempt against the configured guardrails.
 
     ``recipients`` are the mail ``to`` addresses, ``cc``/``bcc`` the carbon
     copies, ``dm_recipients`` the Teams DM UPNs. Every one of them must match
-    the allowlist, and the combined per-message recipient count must fit
-    ``limits.max_recipients``.
+    the allowlist, the combined per-message recipient count must fit
+    ``limits.max_recipients``, and the combined ``attachments`` size must fit
+    ``limits.max_attach_mb``.
     """
     all_recipients = [*recipients, *cc, *bcc, *dm_recipients]
     for address in all_recipients:
@@ -102,7 +121,18 @@ def check(
             REFUSED,
             f"{len(all_recipients)} recipients exceeds limits.max_recipients={limit}",
         )
+
+    max_attach_bytes = config.limits.max_attach_mb * BYTES_PER_MB
+    total_attach_bytes = sum(a.size_bytes for a in attachments)
+    if total_attach_bytes > max_attach_bytes:
+        names = ", ".join(a.name for a in attachments) or "(none)"
+        return Verdict(
+            REFUSED,
+            f"attachments total {total_attach_bytes} bytes over {names}; "
+            f"limits.max_attach_mb={config.limits.max_attach_mb} "
+            f"({max_attach_bytes} bytes)",
+        )
     return Verdict(OK)
 
 
-__all__ = ["CAP_REACHED", "OK", "REFUSED", "Verdict", "check"]
+__all__ = ["BYTES_PER_MB", "CAP_REACHED", "OK", "REFUSED", "Attachment", "Verdict", "check"]
