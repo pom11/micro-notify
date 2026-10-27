@@ -11,13 +11,15 @@ so no non-placeholder e-mail address ever appears literally in a tracked file
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 
 import pytest
 
-from micro_notify import EXIT_GUARD, EXIT_OK
+from micro_notify import EXIT_DAILY_CAP, EXIT_GUARD, EXIT_OK
+from micro_notify import guard
 from micro_notify.config import AllowConfig, Config
-from micro_notify.guard import OK, REFUSED, Attachment, check
+from micro_notify.guard import CAP_REACHED, OK, REFUSED, Attachment, check, record_send
 
 from conftest import placeholder_config
 
@@ -214,3 +216,114 @@ def test_no_attachments_never_trips_the_size_guard(config: Config) -> None:
     verdict = check(config, recipients=["someone@example.com"], attachments=[])
 
     assert verdict.status == OK
+
+
+# --- Daily counter (design §3.3: limits.daily_max, exit 6) ------------------
+TODAY = "2026-10-27"
+STALE_DAY = "2000-01-01"
+
+
+@pytest.fixture
+def frozen_today(monkeypatch: pytest.MonkeyPatch) -> str:
+    """Pin the guard's UTC clock so date behaviour is deterministic."""
+    monkeypatch.setattr(guard, "utc_today", lambda: TODAY)
+    return TODAY
+
+
+def seed_counter(config: Config, day: str, count: int) -> None:
+    """Write a counter.json by hand — the same shape record_send produces."""
+    path = config.paths.counter_file
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"date": day, "count": count}), encoding="utf-8")
+
+
+def test_check_allows_a_send_below_the_daily_cap(
+    config: Config, frozen_today: str
+) -> None:
+    seed_counter(config, frozen_today, config.limits.daily_max - 1)
+
+    verdict = check(config, recipients=["someone@example.com"])
+
+    assert verdict.status == OK
+
+
+def test_check_blocks_at_the_daily_cap_with_exit_6(
+    config: Config, frozen_today: str
+) -> None:
+    """Count == daily_max means the day's sends are spent: exit 6 (design §4)."""
+    seed_counter(config, frozen_today, config.limits.daily_max)
+
+    verdict = check(config, recipients=["someone@example.com"])
+
+    assert verdict.status == CAP_REACHED
+    assert verdict.exit_code == EXIT_DAILY_CAP
+    assert "daily" in verdict.reason.lower()
+
+
+def test_record_send_increments_the_counter(config: Config, frozen_today: str) -> None:
+    first = record_send(config)
+    second = record_send(config)
+
+    assert (first, second) == (1, 2)
+    stored = json.loads(config.paths.counter_file.read_text(encoding="utf-8"))
+    assert stored == {"date": frozen_today, "count": 2}
+
+
+def test_record_send_then_check_blocks_once_the_cap_is_reached(
+    config: Config, frozen_today: str
+) -> None:
+    """End-to-end: sends consume budget; the attempt after the cap is exit 6."""
+    tight = replace(config, limits=replace(config.limits, daily_max=2))
+
+    assert check(tight, recipients=["a@example.com"]).status == OK
+    record_send(tight)
+    assert check(tight, recipients=["a@example.com"]).status == OK
+    record_send(tight)
+
+    assert check(tight, recipients=["a@example.com"]).status == CAP_REACHED
+
+
+def test_counter_resets_on_a_new_utc_date(config: Config, frozen_today: str) -> None:
+    """A spent counter from a previous UTC day must not block today."""
+    seed_counter(config, STALE_DAY, config.limits.daily_max)
+
+    assert check(config, recipients=["someone@example.com"]).status == OK
+
+    assert record_send(config) == 1
+    stored = json.loads(config.paths.counter_file.read_text(encoding="utf-8"))
+    assert stored == {"date": frozen_today, "count": 1}
+
+
+def test_record_send_writes_atomically_leaving_no_temp_file(
+    config: Config, frozen_today: str
+) -> None:
+    """Atomic write evidence: only counter.json remains, parseable, 0600 mode."""
+    record_send(config)
+    record_send(config)
+
+    leftovers = [p.name for p in config.paths.state_dir.iterdir()]
+    assert leftovers == ["counter.json"]
+    assert json.loads(config.paths.counter_file.read_text(encoding="utf-8"))["count"] == 2
+    mode = config.paths.counter_file.stat().st_mode & 0o777
+    assert mode == 0o600
+
+
+def test_corrupt_counter_file_fails_closed(config: Config, frozen_today: str) -> None:
+    """An unreadable counter cannot prove budget remains — refuse, exit 3."""
+    path = config.paths.counter_file
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("this is not json {{{", encoding="utf-8")
+
+    verdict = check(config, recipients=["someone@example.com"])
+
+    assert verdict.status == REFUSED
+    assert verdict.exit_code == EXIT_GUARD
+    assert "counter" in verdict.reason
+
+
+def test_check_itself_never_writes_the_counter(
+    config: Config, frozen_today: str
+) -> None:
+    check(config, recipients=["someone@example.com"])
+
+    assert not config.paths.counter_file.exists()
