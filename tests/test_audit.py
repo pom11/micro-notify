@@ -12,18 +12,28 @@ from __future__ import annotations
 import hashlib
 import json
 
+from dataclasses import replace
+
 import pytest
 
 from micro_notify.audit import (
     CHANNEL_MAIL,
+    DRY_RUN,
+    FAILED,
     REFUSED,
     SENT,
     mask_url,
     record,
 )
+from micro_notify.config import AllowConfig
 from micro_notify.guard import Attachment
 
 from conftest import placeholder_config
+
+
+def without_allowlist(config):
+    """Same config but with the default-empty [allow] (refuse-everything)."""
+    return replace(config, allow=AllowConfig())
 
 # Fake values for the leak probe. The webhook host and the "secret" are
 # assembled at runtime; nothing here is a real credential.
@@ -144,6 +154,39 @@ def test_no_request_id_field_when_absent(config) -> None:
            recipients=["someone@example.com"], subject="x", body="y")
 
     assert "request_id" not in lines(config)[0]
+
+
+# --- Guard refusal -> `refused` audit line (card: "refuses ... and writes a
+#     refused audit line"). The command layer maps the verdict to exit 3; the
+#     audit writer stamps the same outcome name on the line.
+def test_guard_refusal_is_audited_as_refused(config) -> None:
+    """A refused attempt still produces exactly one audit line (design §3.3)."""
+    from micro_notify.guard import check
+
+    verdict = check(without_allowlist(config), recipients=["someone@example.com"])
+    assert verdict.status == REFUSED
+
+    record(config, channel=CHANNEL_MAIL, outcome=verdict.status,
+           sender="noreply@example.com", recipients=["someone@example.com"],
+           subject="hi", body="never sent")
+
+    entry = lines(config)[0]
+    assert entry["outcome"] == "refused"
+    assert verdict.exit_code == 3  # the exit code the command must return
+    # The body of a refused message is never stored either:
+    assert "never sent" not in config.paths.audit.read_text(encoding="utf-8")
+
+
+def test_dry_run_and_failed_outcomes_are_auditable(config) -> None:
+    """dry_run / failed are first-class outcomes, one line each."""
+    record(config, channel=CHANNEL_MAIL, outcome=DRY_RUN, sender="noreply@example.com",
+           recipients=["someone@example.com"], subject="s", body="b")
+    record(config, channel="teams", outcome=FAILED, target="alerts", title="t",
+           body="b", request_id="req-9")
+
+    entries = lines(config)
+    assert [e["outcome"] for e in entries] == [DRY_RUN, FAILED]
+    assert entries[1]["request_id"] == "req-9"
 
 
 # --- mask_url: safe for --dry-run output and error paths (design §3.3) ------
