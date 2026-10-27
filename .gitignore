@@ -7,3 +7,6 @@ build/
 .pytest_cache/
 *.pem
 *.key
+
+# orchestrator-managed worker worktrees
+.worktrees/
