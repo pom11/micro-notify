@@ -296,10 +296,8 @@ def test_error_message_never_suggests_a_send_happened(tmp_path, monkeypatch, cap
     "argv,owner",
     [
         (MAIL_SEND, "mail"),
-        (["teams", "send", "alerts", "--text", "hi"], "teams"),
-        (["teams", "targets", "add", "alerts", "--kind", "channel"], "teams"),
-        (["teams", "targets", "list"], "teams"),
-        (["teams", "targets", "remove", "alerts"], "teams"),
+        # teams argvs dropped: commands/teams.py is implemented on wt/p4 (t_ba58663d) and its
+        # behaviour is pinned by tests/test_teams_cli.py; these pins only exist for stubs.
         (["setup"], "setup"),
         (["doctor"], "doctor"),
     ],
