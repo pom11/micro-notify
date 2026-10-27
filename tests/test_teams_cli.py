@@ -273,9 +273,12 @@ def test_canary_url_absent_from_every_output_surface(
 
     fake_keychain.seed("teams:alerts", CANARY_URL)
 
-    run(["teams", "send", "alerts", "--text", "hello", "--dry-run"])
-    run(["teams", "targets", "list"])
+    dry = run(["teams", "send", "alerts", "--text", "hello", "--dry-run"])
+    listed = run(["teams", "targets", "list"])
 
+    # Not vacuous: both commands must have actually succeeded.
+    assert dry == 0
+    assert listed == 0
     out = capsys.readouterr()
     config = load_config(mnotify_config)
     audit_text = config.paths.audit.read_text(encoding="utf-8") if config.paths.audit.exists() else ""
