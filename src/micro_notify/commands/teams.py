@@ -33,7 +33,7 @@ import re
 from types import ModuleType
 
 from .. import EXIT_OK, UsageError
-from ..config import KIND_DM, load_config, with_team_target, without_team_target, write_config
+from ..config import KIND_CHANNEL, KIND_DM, load_config, with_team_target, without_team_target, write_config
 from .. import secrets
 from ..teams import (
     build_card,
