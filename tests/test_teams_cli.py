@@ -464,6 +464,49 @@ def test_card_file_is_posted_verbatim(
     assert recorded.bodies[0]["attachments"][0]["content"] == card
 
 
+def test_send_audit_digest_identifies_the_body_not_the_title(
+    mnotify_config, fake_keychain, mock_http, read_json_lines
+) -> None:
+    """§3.3 'body sha256 + size': with --title set, the digest is of the TEXT."""
+    from micro_notify.audit import body_digest
+    from micro_notify.config import load_config
+
+    fake_keychain.seed("teams:alerts", CANARY_URL)
+    mock_http([(202, {}, {})])
+
+    code = run(["teams", "send", "alerts", "--title", "Build failed", "--text", "deploy finished"])
+
+    assert code == 0
+    (entry,) = read_json_lines(load_config(mnotify_config).paths.audit)
+    assert entry["title"] == "Build failed"
+    sha, size = body_digest("deploy finished")
+    assert entry["body_sha256"] == sha
+    assert entry["body_size"] == size
+
+
+def test_send_card_file_audit_digest_identifies_the_posted_card(
+    mnotify_config, fake_keychain, mock_http, read_json_lines, tmp_path
+) -> None:
+    """No builder text exists for --card-file: the digest covers the card JSON."""
+    import hashlib
+
+    from micro_notify.config import load_config
+
+    card = {"type": "AdaptiveCard", "version": "1.4", "body": []}
+    path = tmp_path / "card.json"
+    path.write_text(json.dumps(card), encoding="utf-8")
+    fake_keychain.seed("teams:alerts", CANARY_URL)
+    mock_http([(202, {}, {})])
+
+    code = run(["teams", "send", "alerts", "--card-file", str(path)])
+
+    assert code == 0
+    (entry,) = read_json_lines(load_config(mnotify_config).paths.audit)
+    expected = json.dumps(card, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    assert entry["body_sha256"] == hashlib.sha256(expected).hexdigest()
+    assert entry["body_size"] == len(expected)
+
+
 def test_canary_url_absent_from_every_output_surface(
     mnotify_config, fake_keychain, mock_http, capsys, read_json_lines
 ) -> None:
