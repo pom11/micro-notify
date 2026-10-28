@@ -562,9 +562,13 @@ When Entra warns the credential is near expiry: run `mnotify setup --gen-cert
 --force` with the same `--tenant-id` / `--client-id` / `--sender` /
 `--allow-domain` values (it replaces the keychain items and rewrites the public
 certificate file), upload the new public certificate in Entra, verify the new
-thumbprint, then remove the old certificate from the app registration. `mnotify
-doctor` confirms the swap. Keep the old certificate until `mnotify doctor
---send-test` succeeds with the new one — Entra accepts several certificates at once.
+thumbprint, then remove the old certificate from the app registration. Check the
+swap with `mnotify doctor`: after step 3 it stops at the `token` check either way, but
+the detail it prints tells you which half is wrong — an `AADSTS…` detail means the new
+certificate is not accepted (not uploaded, or the thumbprint pair is mismatched), while
+"roles do not include Mail.Send" means authentication worked and only the (intentional)
+Entra consent is missing. Confirm end to end with a real `mnotify mail send`, and keep
+the old certificate until that succeeds — Entra accepts several at once.
 
 ## Where to look when something fails
 
