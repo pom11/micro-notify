@@ -256,6 +256,21 @@ def test_setup_refuses_a_url_in_any_written_value(target_config, fake_keychain, 
     assert not target_config.exists()
 
 
+def test_setup_refuses_a_webhook_url_passed_to_allow_domain(
+    target_config, fake_keychain, monkeypatch, capsys
+) -> None:
+    """``--allow-domain`` takes a bare domain; a URL there is the classic copy-paste slip.
+
+    The address validator would reject it anyway for a different reason (one '@'), so
+    without this case the URL guard itself was never the thing under test.
+    """
+    non_interactive(monkeypatch)
+    url = canary_webhook_url()
+    assert run_setup(*BASE, "--allow-domain", url) == EXIT_USAGE
+    assert not target_config.exists()
+    assert url not in capsys.readouterr().err, "the refusal must not echo the webhook URL"
+
+
 # --- Interactive prompts -----------------------------------------------------
 def test_prompts_fill_what_flags_omitted(target_config, fake_keychain, monkeypatch) -> None:
     """tenant/client/sender/auth are prompted when not given; certgen confirmed."""

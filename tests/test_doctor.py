@@ -329,6 +329,20 @@ def test_doctor_does_not_spend_the_daily_budget_itself(
     assert run_doctor() == EXIT_OK
 
 
+def test_doctor_without_send_test_leaves_no_counter_file(
+    mnotify_config, seeded_keychain, msal_stub, http_counter
+) -> None:
+    """The state-level half of the budget guarantee: nothing on disk after a check run.
+
+    A monkeypatch tripwire only bites when the patched function is reachable; the
+    counter file simply not existing proves no budget was spent on any path.
+    """
+    msal_stub(jwt_with_roles("Mail.Send"))
+    assert run_doctor() == EXIT_OK
+    counter = load_config(mnotify_config).paths.counter_file
+    assert not counter.exists(), f"doctor spent daily budget without sending: {counter}"
+
+
 # --- Secrets never printed ---------------------------------------------------
 def test_report_contains_no_canary_secret_or_webhook_url(
     mnotify_config, seeded_keychain, msal_stub, http_counter, capsys
@@ -368,6 +382,22 @@ def test_send_test_routes_through_the_guard_and_the_mail_send_path(
     ]
     assert [r.url.host for r in http_counter.requests] == ["graph.microsoft.com"]
     assert len(http_counter.requests) == 1, "--send-test must send exactly ONE message"
+
+
+def test_send_test_spends_exactly_one_unit_of_daily_budget(
+    mnotify_config, seeded_keychain, msal_stub, http_counter
+) -> None:
+    """The counter belongs to the send path: one confirmed 202 = counter 1, no more.
+
+    If doctor ever calls record_send itself (on top of the mail command's own
+    bookkeeping) a diagnostic run quietly burns two units of the operator's budget.
+    """
+    msal_stub(jwt_with_roles("Mail.Send"))
+    http_counter.responses.append(httpx.Response(202))
+
+    assert run_doctor("--send-test", SEND_TARGET) == EXIT_OK
+    counter = load_config(mnotify_config).paths.counter_file
+    assert json.loads(counter.read_text(encoding="utf-8"))["count"] == 1
 
 
 def test_send_test_payload_addresses_only_the_flag_recipient(
