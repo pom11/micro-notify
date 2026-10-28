@@ -69,6 +69,14 @@ mnotify doctor --send-test you@example.com   # plus one real test send
 failure, printing a `fix:` hint that names the command or admin step that resolves
 it. It prints presence only — never a secret.
 
+One thing to expect: `doctor` proves the `Mail.Send` grant by reading it out of the
+token Entra issued. The tenant hardening in
+[`docs/ADMIN-SETUP.md`](docs/ADMIN-SETUP.md) step 3 removes that Entra consent on
+purpose, so that the Exchange scoped role is the only thing limiting the app to one
+mailbox. After that step `doctor`'s `token` check reports `Mail.Send` missing and
+exits 4 — that red line means the hardening worked, not that something broke. Verify
+sends with `mnotify mail send` from then on.
+
 ## Guardrails: read this before your first send
 
 **An empty allowlist means every send is refused until you configure it.** `[allow]
@@ -209,8 +217,9 @@ mnotify teams send alerts --text "dry" --dry-run
 ```
 
 Exit 0 means "the payload is valid and the guardrails passed" — it does **not**
-prove the credential works or that Microsoft will accept it. For that, use
-`mnotify doctor`.
+prove the credential works or that Microsoft will accept it. For that you have to
+send for real: `mnotify mail send` (or `mnotify doctor --send-test <addr>`, whose
+token check needs the Entra consent that ADMIN-SETUP step 3 removes).
 
 ## Teams targets
 
