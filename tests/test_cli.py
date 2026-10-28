@@ -295,7 +295,8 @@ def test_error_message_never_suggests_a_send_happened(tmp_path, monkeypatch, cap
 @pytest.mark.parametrize(
     "argv,owner",
     [
-        (MAIL_SEND, "mail"),
+        # mail argv dropped: commands/mail.py is implemented on wt/p3 (t_349ecae3) and its
+        # behaviour is pinned by tests/test_mail_cli.py; these pins only exist for stubs.
         # teams argvs dropped: commands/teams.py is implemented on wt/p4 (t_ba58663d) and its
         # behaviour is pinned by tests/test_teams_cli.py; these pins only exist for stubs.
         (["setup"], "setup"),
