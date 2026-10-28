@@ -152,6 +152,20 @@ class SendResult:
     request_id: str | None
 
 
+class GraphRemoteError(RemoteError):
+    """:class:`RemoteError` plus the Graph request-id as *data*.
+
+    ``cli.py`` (P1) maps ``MicroNotifyError.exit_code`` to the exit code and prints
+    ``message``; it knows nothing of Graph. The audit line, though, must carry the
+    request-id (§3.3), so the caller needs it as an attribute rather than having
+    to re-parse it out of the message. Subclassing keeps ``cli.py`` untouched.
+    """
+
+    def __init__(self, message: str, request_id: str | None = None) -> None:
+        super().__init__(message)
+        self.request_id = request_id
+
+
 def _retryable(status_code: int) -> bool:
     """Design section 9: retry on 429 and 5xx only — never another 4xx."""
     return status_code == 429 or 500 <= status_code <= 599
@@ -213,15 +227,24 @@ def send_mail(
     }
     with httpx.Client(transport=transport, timeout=30.0) as client:
         for attempt in range(MAX_TRIES):
-            response = client.post(url, json=payload, headers=headers)
+            try:
+                response = client.post(url, json=payload, headers=headers)
+            except httpx.TransportError as exc:
+                # Design §4: an unreachable Graph is a remote error (exit 5), not a
+                # crash (exit 1). §9 scopes retries to HTTP statuses, so a
+                # transport-level failure fails fast — no request-id exists.
+                raise GraphRemoteError(
+                    f"Graph sendMail failed (transport error {type(exc).__name__})"
+                ) from exc
             request_id = response.headers.get("request-id")
             if response.status_code in SUCCESS_STATUSES:
                 return SendResult(
                     status_code=response.status_code, request_id=request_id
                 )
             if not _retryable(response.status_code) or attempt == MAX_TRIES - 1:
-                raise RemoteError(
-                    f"Graph sendMail failed ({_failure_detail(response, request_id)})"
+                raise GraphRemoteError(
+                    f"Graph sendMail failed ({_failure_detail(response, request_id)})",
+                    request_id=request_id,
                 )
             time.sleep(_wait_seconds(response, attempt))
     raise AssertionError("unreachable: the retry loop always returns or raises")

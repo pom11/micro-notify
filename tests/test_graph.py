@@ -713,3 +713,40 @@ class TestRetryPolicy:
         )
 
         assert msal_stub.token_calls == 1
+
+    def test_failure_exception_carries_the_request_id_for_the_audit_line(
+        self, seeded_keychain, msal_stub, sleeper
+    ) -> None:
+        """The caller audits the Graph request-id on the failed line, so the
+        exception must expose it as data, not only inside the message."""
+        msal_stub.silent_result = {"access_token": "a-token"}
+        transport = harness(httpx.Response(502, headers={"request-id": REQUEST_ID}))
+
+        with pytest.raises(RemoteError) as excinfo:
+            graph.send_mail(
+                mail=mail_config(), payload=send_payload(), transport=mock(transport)
+            )
+
+        assert excinfo.value.request_id == REQUEST_ID
+
+    def test_unreachable_graph_is_exit_5_not_a_crash(
+        self, seeded_keychain, msal_stub, sleeper
+    ) -> None:
+        """Design §4 exit 5 covers an unreachable Graph: a transport error becomes
+        RemoteError, so cli.main never prints a traceback (exit 1) for it."""
+        msal_stub.silent_result = {"access_token": "a-token"}
+        calls: list[httpx.Request] = []
+
+        def refusing(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            raise httpx.ConnectError("connection refused")
+
+        with pytest.raises(RemoteError) as excinfo:
+            graph.send_mail(
+                mail=mail_config(),
+                payload=send_payload(),
+                transport=httpx.MockTransport(refusing),
+            )
+
+        assert excinfo.value.exit_code == EXIT_REMOTE
+        assert len(calls) == 1
