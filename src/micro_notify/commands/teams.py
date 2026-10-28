@@ -247,6 +247,8 @@ def _send(args: argparse.Namespace) -> int:
                 "--title/--text/--text-file/--fact/--link/--link-title"
             )
         card = load_card_file(args.card_file)
+        # No builder text exists: the audit digest covers the card JSON we post.
+        body_text = json.dumps(card, ensure_ascii=False, sort_keys=True)
     else:
         text = read_text_argument(
             args.text, args.text_file, flag="--text", file_flag="--text-file"
@@ -260,6 +262,7 @@ def _send(args: argparse.Namespace) -> int:
             link=args.link,
             link_title=args.link_title,
         )
+        body_text = text
 
     # --- guard (design §3.3: every guardrail before any network call) ---------
     # A channel post has no recipient list, so only the daily cap applies to it;
@@ -275,7 +278,7 @@ def _send(args: argparse.Namespace) -> int:
             recipients=[args.to] if target.kind == KIND_DM else (),
             target=target.name,
             title=args.title,
-            **_body_field(card),
+            **_body_field(body_text),
         )
         refusal = DailyCapReached if verdict.status == guard.CAP_REACHED else GuardRefusal
         raise refusal(verdict.reason)
@@ -299,7 +302,7 @@ def _send(args: argparse.Namespace) -> int:
             recipients=[args.to] if target.kind == KIND_DM else (),
             target=target.name,
             title=args.title,
-            **_body_field(card),
+            **_body_field(body_text),
         )
         return EXIT_OK
 
@@ -314,7 +317,7 @@ def _send(args: argparse.Namespace) -> int:
             recipients=[args.to] if target.kind == KIND_DM else (),
             target=target.name,
             title=args.title,
-            **_body_field(card),
+            **_body_field(body_text),
         )
         raise
     guard.record_send(config)
@@ -325,7 +328,7 @@ def _send(args: argparse.Namespace) -> int:
         recipients=[args.to] if target.kind == KIND_DM else (),
         target=target.name,
         title=args.title,
-        **_body_field(card),
+        **_body_field(body_text),
     )
     recipients = [args.to] if target.kind == KIND_DM else []
     if args.json:
@@ -343,20 +346,14 @@ def _send(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _body_field(card: dict) -> dict:
+def _body_field(body_text: str) -> dict:
     """Audit carries the body as sha256 + size only (design §3.3, §7).
 
-    For a builder card that is the markdown text; for ``--card-file`` it is the
-    card JSON that goes on the wire, so the digest identifies what was posted.
+    The caller hands the text it actually put on the wire — the markdown for a
+    built card, the card JSON for ``--card-file`` — so the digest identifies
+    what was sent without re-deriving it from the card structure.
     """
-    text = None
-    for element in card.get("body", []):
-        if isinstance(element, dict) and element.get("type") == "TextBlock":
-            text = element.get("text")
-            break
-    if text is None:
-        text = json.dumps(card, ensure_ascii=False, sort_keys=True)
-    return {"body": text}
+    return {"body": body_text}
 
 
 def _print_dry_run(kind: str, url_label: str, payload: dict, upn: str | None, *, json_mode: bool) -> None:
