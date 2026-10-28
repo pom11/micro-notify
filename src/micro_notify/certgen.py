@@ -37,7 +37,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import EXIT_USAGE, UsageError
+from . import UsageError
 
 OPENSSL_BINARY = "/usr/bin/openssl"
 OPENSSL_TIMEOUT = 60.0

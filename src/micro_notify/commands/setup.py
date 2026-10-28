@@ -34,7 +34,7 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 
-from .. import EXIT_OK, EXIT_USAGE, UsageError
+from .. import EXIT_OK, UsageError
 from .. import certgen
 from .. import secrets
 from ..config import (
