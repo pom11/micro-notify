@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
+from collections.abc import Callable
 
 import httpx
 
@@ -177,7 +178,7 @@ def post_card(
     *,
     url_label: str,
     transport: httpx.BaseTransport | None = None,
-    sleep=time.sleep,
+    sleep: Callable[[float], None] | None = None,
     timeout: float = WEBHOOK_TIMEOUT,
 ) -> PostResult:
     """POST the Workflows payload; retry 429/5xx per design §9 (max 3 tries).
@@ -185,7 +186,13 @@ def post_card(
     ``url_label`` is the masked form (``audit.mask_url(url)``) used in every
     message; the raw URL never appears in an error or log line. Non-2xx raises
     :class:`RemoteError` (exit 5) with status + truncated response text.
+
+    ``sleep`` is the backoff clock, resolved when the call runs rather than
+    bound as a default argument: a default of ``time.sleep`` would capture the
+    function at import time and keep the real one even after a test patches
+    ``time.sleep``, i.e. a suite that silently sleeps for real.
     """
+    wait = sleep if sleep is not None else time.sleep
     tries = 0
     last: httpx.Response | None = None
     with httpx.Client(transport=transport, timeout=timeout) as client:
@@ -204,7 +211,7 @@ def post_card(
                 break
             if tries >= MAX_TRIES:
                 break
-            sleep(_retry_delay(response, tries))
+            wait(_retry_delay(response, tries))
     assert last is not None
     raise RemoteError(
         f"teams webhook {url_label} returned HTTP {last.status_code}: "

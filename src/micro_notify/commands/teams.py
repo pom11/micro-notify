@@ -29,19 +29,31 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import re
 from types import ModuleType
 
-from .. import EXIT_OK, UsageError
+from .. import (
+    EXIT_OK,
+    DailyCapReached,
+    GuardRefusal,
+    RemoteError,
+    UsageError,
+)
+from .. import audit, guard
 from ..config import KIND_CHANNEL, KIND_DM, load_config, with_team_target, without_team_target, write_config
 from .. import secrets
 from ..teams import (
     build_card,
+    build_channel_payload,
+    build_dm_payload,
     load_card_file,
     parse_facts,
+    post_card,
     resolve_target,
+    webhook_url,
 )
-from . import not_implemented, print_json, read_text_argument  # shared seam
+from . import print_json, read_text_argument  # shared seam
 
 NAME = "teams"
 BUILD_STEP = "4"
@@ -249,7 +261,117 @@ def _send(args: argparse.Namespace) -> int:
             link_title=args.link_title,
         )
 
-    # guard -> (dry-run stop) -> POST -> audit is build step 2 territory:
-    # guard.py and audit.py must exist and expose check()/mask_url(). Until
-    # then nothing is guessed and nothing is sent.
-    raise not_implemented("mnotify teams send (guardrails + audit stages)", "2")
+    # --- guard (design §3.3: every guardrail before any network call) ---------
+    # A channel post has no recipient list, so only the daily cap applies to it;
+    # a DM UPN must satisfy [allow] like any other recipient.
+    verdict = guard.check(
+        config, dm_recipients=[args.to] if target.kind == KIND_DM else ()
+    )
+    if verdict.status != guard.OK:
+        audit.record(
+            config,
+            channel=audit.CHANNEL_TEAMS,
+            outcome=audit.REFUSED,
+            recipients=[args.to] if target.kind == KIND_DM else (),
+            target=target.name,
+            title=args.title,
+            **_body_field(card),
+        )
+        refusal = DailyCapReached if verdict.status == guard.CAP_REACHED else GuardRefusal
+        raise refusal(verdict.reason)
+
+    # The webhook URL is resolved only once the send is actually allowed.
+    url = webhook_url(target.name)
+    payload = (
+        build_dm_payload(args.to, card)
+        if target.kind == KIND_DM
+        else build_channel_payload(card)
+    )
+    url_label = audit.mask_url(url)
+
+    # --- dry-run stop (design §4: prints the payload, secrets masked, no HTTP) -
+    if args.dry_run:
+        _print_dry_run(target.kind, url_label, payload, args.to, json_mode=args.json)
+        audit.record(
+            config,
+            channel=audit.CHANNEL_TEAMS,
+            outcome=audit.DRY_RUN,
+            recipients=[args.to] if target.kind == KIND_DM else (),
+            target=target.name,
+            title=args.title,
+            **_body_field(card),
+        )
+        return EXIT_OK
+
+    # --- POST, then audit; a failed send costs no daily budget ----------------
+    try:
+        result = post_card(url, payload, url_label=url_label)
+    except RemoteError:
+        audit.record(
+            config,
+            channel=audit.CHANNEL_TEAMS,
+            outcome=audit.FAILED,
+            recipients=[args.to] if target.kind == KIND_DM else (),
+            target=target.name,
+            title=args.title,
+            **_body_field(card),
+        )
+        raise
+    guard.record_send(config)
+    audit.record(
+        config,
+        channel=audit.CHANNEL_TEAMS,
+        outcome=audit.SENT,
+        recipients=[args.to] if target.kind == KIND_DM else (),
+        target=target.name,
+        title=args.title,
+        **_body_field(card),
+    )
+    recipients = [args.to] if target.kind == KIND_DM else []
+    if args.json:
+        print_json(
+            {
+                "ok": True,
+                "outcome": "sent",
+                "target": target.name,
+                "recipients": recipients,
+                "status": result.status,
+            }
+        )
+    else:
+        print(f"teams {target.kind} message sent to '{target.name}' (HTTP {result.status})")
+    return EXIT_OK
+
+
+def _body_field(card: dict) -> dict:
+    """Audit carries the body as sha256 + size only (design §3.3, §7).
+
+    For a builder card that is the markdown text; for ``--card-file`` it is the
+    card JSON that goes on the wire, so the digest identifies what was posted.
+    """
+    text = None
+    for element in card.get("body", []):
+        if isinstance(element, dict) and element.get("type") == "TextBlock":
+            text = element.get("text")
+            break
+    if text is None:
+        text = json.dumps(card, ensure_ascii=False, sort_keys=True)
+    return {"body": text}
+
+
+def _print_dry_run(kind: str, url_label: str, payload: dict, upn: str | None, *, json_mode: bool) -> None:
+    """Print the exact payload plus the masked URL; the URL itself never appears."""
+    if json_mode:
+        print_json(
+            {
+                "ok": True,
+                "outcome": "dry_run",
+                "kind": kind,
+                "target_url": url_label,
+                "recipients": [upn] if upn else [],
+                "payload": payload,
+            }
+        )
+        return
+    print(f"dry run — would POST to {url_label}")
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
