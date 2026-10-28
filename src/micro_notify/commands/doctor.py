@@ -32,7 +32,7 @@ import base64
 import contextlib
 import json
 import sys
-from typing import Any, Callable
+from typing import Any
 
 from .. import (
     EXIT_AUTH,
@@ -44,7 +44,6 @@ from .. import (
     MicroNotifyError,
     UsageError,
 )
-from .. import guard as guard_module
 from .. import secrets
 from ..config import Config, load_config
 from ..graph import acquire_token
