@@ -50,14 +50,29 @@ def canary_webhook_url() -> str:
     return "https" + "://" + host + "/triggers/R7x9Qm2/HTTP"
 
 
-def jwt_with_roles(*roles: str) -> str:
-    """An unsigned JWT-shaped bearer token carrying ``roles`` in its payload."""
+def jwt_payload(payload: dict) -> str:
+    """An unsigned JWT-shaped bearer token carrying ``payload`` as its claims."""
 
     def segment(value: dict) -> str:
         raw = json.dumps(value).encode("utf-8")
         return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
-    return f"{segment({'alg': 'RS256', 'typ': 'JWT'})}.{segment({'roles': list(roles)})}.sig"
+    return f"{segment({'alg': 'RS256', 'typ': 'JWT'})}.{segment(payload)}.sig"
+
+
+def jwt_with_roles(*roles: str) -> str:
+    """An unsigned JWT-shaped bearer token carrying ``roles`` in its payload."""
+    return jwt_payload({"roles": list(roles)})
+
+
+def jwt_without_roles() -> str:
+    """A token as Entra issues it once the tenant-wide Mail.Send consent is gone
+    (design §6 step 3): a readable payload with **no** ``roles`` claim at all.
+
+    The Exchange Online ``Application Mail.Send`` scoped role that authorises the
+    send after step 3 is not, and cannot be, a claim in this token.
+    """
+    return jwt_payload({"aud": "https://graph.microsoft.com", "tid": "00000000-0000-0000-0000-000000000000"})
 
 
 class MsalStub:
@@ -253,6 +268,271 @@ def test_roles_come_from_the_token_payload_with_zero_http(
     assert run_doctor() == EXIT_OK
     assert stub.token_calls == 1, "roles must not cost a second token acquisition"
     assert http_counter.requests == [], f"doctor made HTTP requests: {http_counter.requests}"
+
+
+# --- Check 4, post-§6-step-3: an absent roles claim is NOT a failure --------
+# Design §6 step 3 tells the operator to REMOVE the tenant-wide Entra Mail.Send
+# consent and keep only the Exchange Online ``Application Mail.Send`` scoped role.
+# That grant is deliberately invisible to the Entra token's ``roles`` claim, so on a
+# correctly hardened tenant the claim is absent *by construction*. Treating it as a
+# failure made `mnotify doctor` unsatisfiable (exit 4 forever), skipped `allow`, and
+# made `--send-test` — §6 step 3's own verification command — unreachable. See card
+# t_24a04813. An ABSENT claim is therefore "not verifiable", not "not authorised";
+# a PRESENT claim that lacks the role stays a hard failure, because there Entra is
+# speaking authoritatively.
+def test_absent_roles_claim_warns_and_does_not_fail_the_run(
+    mnotify_config, seeded_keychain, msal_stub, http_counter, capsys
+) -> None:
+    """§6 step 3 end state: token acquired, no roles claim -> warn, exit 0."""
+    msal_stub(jwt_without_roles())
+    assert run_doctor() == EXIT_OK
+    out = capsys.readouterr().out
+    assert "token: warn" in out, f"an absent roles claim must be a warn line, got: {out}"
+    assert "Mail.Send" in out
+    assert "step 3" in out, "the note must name the §6 step that removes the claim"
+
+
+def test_absent_roles_claim_still_runs_the_later_checks(
+    mnotify_config, seeded_keychain, msal_stub, http_counter, capsys
+) -> None:
+    """The old bug in its sharpest form: a warn used to skip `allow` and `--send-test`."""
+    msal_stub(jwt_without_roles())
+    assert run_doctor("--json") == EXIT_OK
+    checks = {c["name"]: c for c in json.loads(capsys.readouterr().out)["checks"]}
+    assert checks["token"]["status"] == "warn"
+    assert checks["allow"]["status"] == "pass", "`allow` must still run after a warn"
+    assert checks["send-test"]["status"] == "skipped", "not requested, so skipped — not run"
+
+
+def test_absent_roles_claim_reaches_send_test_and_sends_exactly_one(
+    mnotify_config, seeded_keychain, msal_stub, http_counter
+) -> None:
+    """§6 step 3 says to re-run `mnotify doctor --send-test`; it must be reachable."""
+    msal_stub(jwt_without_roles())
+    http_counter.responses.append(httpx.Response(202))
+
+    assert run_doctor("--send-test", SEND_TARGET) == EXIT_OK
+    assert [r.url.path for r in http_counter.requests] == [
+        "/v1.0/users/noreply@example.com/sendMail"
+    ]
+    assert len(http_counter.requests) == 1, "--send-test must send exactly ONE message"
+
+
+def test_absent_roles_claim_send_test_still_pays_the_guard_first(
+    config_file, seeded_keychain, msal_stub, http_counter
+) -> None:
+    """The warn must not smuggle a send past the guardrail: outside [allow] -> exit 3, zero POSTs."""
+    from micro_notify.config import AllowConfig
+
+    msal_stub(jwt_without_roles())
+    config = placeholder_config(config_file.parent)
+    object.__setattr__(config, "allow", AllowConfig(domains=("contoso.com",)))
+    write_config(config, config_file)
+
+    assert run_doctor("--send-test", SEND_TARGET) == EXIT_GUARD
+    assert http_counter.requests == [], "a guard refusal must not reach the POST"
+
+
+def test_empty_roles_list_behaves_like_an_absent_claim(
+    mnotify_config, seeded_keychain, msal_stub, http_counter, capsys
+) -> None:
+    """`roles: []` and no `roles` key are the same tenant state — both are 'unknown'."""
+    msal_stub(jwt_payload({"roles": []}))
+    assert run_doctor() == EXIT_OK
+    assert "token: warn" in capsys.readouterr().out
+
+
+def test_empty_roles_list_still_reaches_send_test(
+    mnotify_config, seeded_keychain, msal_stub, http_counter
+) -> None:
+    msal_stub(jwt_payload({"roles": []}))
+    http_counter.responses.append(httpx.Response(202))
+    assert run_doctor("--send-test", SEND_TARGET) == EXIT_OK
+    assert len(http_counter.requests) == 1
+
+
+def test_absent_roles_claim_costs_no_extra_token_and_no_http_without_send_test(
+    mnotify_config, seeded_keychain, msal_stub, http_counter
+) -> None:
+    """The warn path must not buy its certainty with a second token or a request."""
+    stub = msal_stub(jwt_without_roles())
+    assert run_doctor() == EXIT_OK
+    assert stub.token_calls == 1
+    assert http_counter.requests == []
+    assert http_counter.clients == [], "doctor opened an HTTP client without --send-test"
+
+
+def test_warn_line_prints_on_stdout_not_stderr(
+    mnotify_config, seeded_keychain, msal_stub, http_counter, capsys
+) -> None:
+    """A warn is not a failure: it must not go to stderr like a fail does."""
+    msal_stub(jwt_without_roles())
+    assert run_doctor() == EXIT_OK
+    captured = capsys.readouterr()
+    assert "token: warn" in captured.out
+    assert "token: warn" not in captured.err
+
+
+def test_json_report_warn_does_not_claim_the_role_was_proven(
+    mnotify_config, seeded_keychain, msal_stub, http_counter, capsys
+) -> None:
+    """`ok: true` means nothing failed; the warn detail must say the role is unverified."""
+    msal_stub(jwt_without_roles())
+    assert run_doctor("--json") == EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["exitCode"] == EXIT_OK
+    token = next(c for c in payload["checks"] if c["name"] == "token")
+    assert token["status"] == "warn"
+    detail = token["detail"].lower()
+    assert "not verifiable" in detail or "cannot verify" in detail
+    assert "scoped" in detail, "the note must point at the Exchange scoped role"
+
+
+def test_warn_reports_no_secret(
+    mnotify_config, seeded_keychain, msal_stub, http_counter, capsys
+) -> None:
+    """The new detail text names claims and roles — never a token value."""
+    msal_stub(jwt_without_roles())
+    assert run_doctor() == EXIT_OK
+    blob = capsys.readouterr().out + capsys.readouterr().err
+    for canary in (CANARY_PEM_BODY, canary_webhook_url(), "R7x9Qm2"):
+        assert canary not in blob
+    assert "triggers" not in blob
+    assert "eyJ" not in blob, "a JWT segment leaked into the report"
+
+
+def test_a_read_roles_claim_still_fails_closed_without_mail_send(
+    mnotify_config, seeded_keychain, msal_stub, http_counter, capsys
+) -> None:
+    """The hardening must not become a blanket pass: Entra listing other roles and no
+    Mail.Send is an authoritative 'not granted' -> exit 4."""
+    msal_stub(jwt_with_roles("User.Read", "Calendars.Read"))
+    assert run_doctor() == EXIT_AUTH
+    assert "Mail.Send" in capsys.readouterr().err
+
+
+def test_a_read_roles_claim_without_mail_send_still_skips_the_later_checks(
+    mnotify_config, seeded_keychain, msal_stub, http_counter, capsys
+) -> None:
+    """Ordering is unchanged for real failures: only the warn keeps the run going."""
+    msal_stub(jwt_with_roles("User.Read"))
+    assert run_doctor("--json") == EXIT_AUTH
+    checks = {c["name"]: c for c in json.loads(capsys.readouterr().out)["checks"]}
+    assert checks["token"]["status"] == "fail"
+    assert checks["allow"]["status"] == "skipped"
+    assert checks["send-test"]["status"] == "skipped"
+
+
+def test_unreadable_token_still_fails_closed_after_the_change(
+    mnotify_config, seeded_keychain, msal_stub, http_counter
+) -> None:
+    """Not-a-JWT is NOT 'absent claim': we cannot read the assertion, so we refuse."""
+    msal_stub("not-a-jwt-at-all")
+    assert run_doctor("--json") == EXIT_AUTH
+    # (asserted again by the pre-existing test_a_token_we_cannot_read_fails_closed;
+    # pinned here so a future 'treat anything unreadable as warn' fix trips on it.)
+
+
+def test_unreadable_token_with_send_test_sends_nothing(
+    mnotify_config, seeded_keychain, msal_stub, http_counter, capsys
+) -> None:
+    """Fail-closed means the run STOPS, not 'print red and carry on to a real send'.
+
+    An unreadable assertion is the one token state where we know nothing at all, so
+    reaching the POST would be a send with no verification behind it. The exit code
+    alone cannot prove this (the FAIL already set it), which is why the POST count and
+    the skipped lines are asserted here.
+    """
+    msal_stub("not-a-jwt-at-all")
+    http_counter.responses.append(httpx.Response(202))
+
+    assert run_doctor("--send-test", SEND_TARGET, "--json") == EXIT_AUTH
+    assert http_counter.requests == [], "an unreadable token must not reach the POST"
+    checks = {c["name"]: c for c in json.loads(capsys.readouterr().out)["checks"]}
+    assert checks["token"]["status"] == "fail"
+    assert checks["allow"]["status"] == "skipped"
+    assert checks["send-test"]["status"] == "skipped"
+    counter = load_config(mnotify_config).paths.counter_file
+    assert not counter.exists(), "a refused pre-flight must not spend daily budget"
+
+
+# --- The claim reader itself ------------------------------------------------
+# The tri-state lives here, so it is pinned at unit level too: an e2e test cannot
+# tell "the reader said absent" from "the reader said unreadable and the caller
+# happened to map it to the same line".
+def test_read_roles_claim_distinguishes_the_three_states() -> None:
+    from micro_notify.commands.doctor import (
+        CLAIM_ABSENT,
+        CLAIM_READ,
+        CLAIM_UNREADABLE,
+        read_roles_claim,
+    )
+
+    assert read_roles_claim(jwt_with_roles("Mail.Send", "User.Read")) == (
+        CLAIM_READ, ["Mail.Send", "User.Read"])
+    assert read_roles_claim(jwt_with_roles("User.Read")) == (CLAIM_READ, ["User.Read"])
+    assert read_roles_claim(jwt_without_roles()) == (CLAIM_ABSENT, [])
+    assert read_roles_claim(jwt_payload({"roles": []})) == (CLAIM_ABSENT, [])
+    for unreadable in ("not-a-jwt-at-all", "a.b", "a.b.c.d", ""):
+        assert read_roles_claim(unreadable) == (CLAIM_UNREADABLE, []), unreadable
+
+
+def test_read_roles_claim_rejects_a_shape_entra_cannot_produce() -> None:
+    """A `roles` claim that is not a list of strings is not evidence of anything."""
+    from micro_notify.commands.doctor import (
+        CLAIM_ABSENT,
+        CLAIM_UNREADABLE,
+        read_roles_claim,
+    )
+
+    assert read_roles_claim(jwt_payload({"roles": "Mail.Send"})) == (CLAIM_UNREADABLE, [])
+    assert read_roles_claim(jwt_payload({"roles": {"a": 1}})) == (CLAIM_UNREADABLE, [])
+    assert read_roles_claim(jwt_payload({"roles": [1, 2]})) == (CLAIM_UNREADABLE, [])
+    # A half-string claim is not a shape Entra produces either, and the code must not
+    # quietly drop the entry it could not read: that would turn a bogus token into a
+    # "no roles" answer, which is the one state allowed to reach --send-test.
+    assert read_roles_claim(jwt_payload({"roles": ["Mail.Send", 7]})) == (CLAIM_UNREADABLE, [])
+    # A payload that is valid JSON but not an object cannot carry claims at all.
+    not_a_dict = ".".join(["e30", "WyJhIiwgImIiXQ", "c2ln"])
+    assert read_roles_claim(not_a_dict) == (CLAIM_UNREADABLE, [])
+    # (and the trivially readable empty object is an absent claim, not garbage)
+    assert read_roles_claim(jwt_payload({})) == (CLAIM_ABSENT, [])
+
+
+def test_send_test_after_step_three_audits_one_sent_line(
+    mnotify_config, seeded_keychain, msal_stub, http_counter, read_json_lines
+) -> None:
+    msal_stub(jwt_without_roles())
+    http_counter.responses.append(httpx.Response(202))
+    assert run_doctor("--send-test", SEND_TARGET) == EXIT_OK
+    entries = read_json_lines(load_config(mnotify_config).paths.audit)
+    assert [e["outcome"] for e in entries] == ["sent"]
+
+
+def test_doctor_does_not_spend_the_daily_budget_itself_after_step_three(
+    mnotify_config, seeded_keychain, msal_stub, http_counter, monkeypatch
+) -> None:
+    """The warn path must not re-introduce doctor's own record_send call."""
+    from micro_notify import guard
+
+    msal_stub(jwt_without_roles())
+
+    def never(*_args, **_kwargs):
+        raise AssertionError("doctor wrote the daily counter")
+
+    monkeypatch.setattr(guard, "record_send", never)
+    assert run_doctor() == EXIT_OK
+
+
+def test_send_test_after_step_three_spends_exactly_one_unit(
+    mnotify_config, seeded_keychain, msal_stub, http_counter
+) -> None:
+    msal_stub(jwt_without_roles())
+    http_counter.responses.append(httpx.Response(202))
+    assert run_doctor("--send-test", SEND_TARGET) == EXIT_OK
+    counter = load_config(mnotify_config).paths.counter_file
+    assert json.loads(counter.read_text(encoding="utf-8"))["count"] == 1
 
 
 # --- Check 5: empty allowlist ------------------------------------------------
