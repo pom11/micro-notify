@@ -1,0 +1,144 @@
+# frozen_string_literal: true
+
+# micro-notify — Homebrew Python virtualenv formula (design section 5).
+#
+# This file is a TEMPLATE: scripts/release.py fills {{VERSION}}, {{URL}} and
+# {{SHA256}} from the release tarball it hashed and writes the result to
+# <tap>/Formula/micro-notify.rb. The placeholder-free text is already valid
+# Ruby (`ruby -c` passes with the placeholders substituted) so the template in
+# git is the same structure that ships.
+#
+# Pattern reference: pom11/homebrew-hscc (same virtualenv shape) and
+# homebrew-core's awscli (pinned sdists, build-isolated PEP 517 backends).
+class MicroNotify < Formula
+  include Language::Python::Virtualenv
+
+  desc "CLI for agents and scripts: Microsoft 365 mail via Graph, Teams via Workflows webhooks"
+  homepage "https://github.com/pom11/micro-notify"
+  url "{{URL}}"
+  version "{{VERSION}}"
+  sha256 "{{SHA256}}"
+  license "MIT"
+
+  livecheck do
+    url "https://github.com/pom11/micro-notify/releases"
+    strategy :github_latest
+  end
+
+  depends_on "python@3.12"
+  depends_on "pkgconf" => :build
+  depends_on "rust" => :build       # cryptography ships a Rust extension; its sdist needs a cargo
+  depends_on "openssl@3"            # cryptography links OpenSSL
+
+  # The FULL runtime closure of msal>=1.28 + httpx>=0.27 on CPython 3.12, as
+  # sdists with sha256, so `--no-deps` pip installs (Homebrew's std_pip_args)
+  # never resolve a version off the network. Update together with pyproject
+  # dependencies, never piecemeal.
+  resource "anyio" do
+    url "https://files.pythonhosted.org/packages/a9/d2/f4d173e22df740bc37b1db102b386ba719b66e95b0f0d751f556b387e6d2/anyio-4.15.1.tar.gz"
+    sha256 "9f28306018cbd6d329e64a36d58256edff76dd996fe423bc957326e578b82a94"
+  end
+
+  resource "certifi" do
+    url "https://files.pythonhosted.org/packages/fd/11/b524cbd9bbdaca58608e4cf4053fd463417549e1959fa8d3aa18319f9555/certifi-2026.10.23.tar.gz"
+    sha256 "a9895e6e2758b371e0545e321a3a8fd1fcfd9829ada8824a936dfb16aaaf36cd"
+  end
+
+  resource "cffi" do
+    url "https://files.pythonhosted.org/packages/9e/ef/008a1939e372c06329a3fce4279c02f328488f3526744906eeec3da7ad5f/cffi-2.1.1.tar.gz"
+    sha256 "dd31f52ea1086513bb9df30f8fcee9b8918323ae067a3d5b78bc826a000712be"
+  end
+
+  resource "charset-normalizer" do
+    url "https://files.pythonhosted.org/packages/33/1c/f41d4e74c28ab327ff3acd36053f7ea506c55872d7a90b0fa71aa3ab0c89/charset_normalizer-3.5.2.tar.gz"
+    sha256 "39de2a259fc954455c57274dc94c79d5842774e1247a016aff30bc0efed0f4ef"
+  end
+
+  resource "cryptography" do
+    url "https://files.pythonhosted.org/packages/9d/af/182eb91b0df3fe75c4d9f26fe70684569566745f6ba7e5c9c73a862c5252/cryptography-50.0.2.tar.gz"
+    sha256 "7b46165bb56eb4704e2eaaf86f3c940d19154535d9b0ca7d6d590b04060e00d5"
+  end
+
+  resource "h11" do
+    url "https://files.pythonhosted.org/packages/01/ee/02a2c011bdab74c6fb3c75474d40b3052059d95df7e73351460c8588d963/h11-0.16.0.tar.gz"
+    sha256 "4e35b956cf45792e4caa5885e69fba00bdbc6ffafbfa020300e549b208ee5ff1"
+  end
+
+  resource "httpcore" do
+    url "https://files.pythonhosted.org/packages/06/94/82699a10bca87a5556c9c59b5963f2d039dbd239f25bc2a63907a05a14cb/httpcore-1.0.9.tar.gz"
+    sha256 "6e34463af53fd2ab5d807f399a9b45ea31c3dfa2276f15a2c3f00afff6e176e8"
+  end
+
+  resource "httpx" do
+    url "https://files.pythonhosted.org/packages/b1/df/48c586a5fe32a0f01324ee087459e112ebb7224f646c0b5023f5e79e9956/httpx-0.28.1.tar.gz"
+    sha256 "75e98c5f16b0f35b567856f597f06ff2270a374470a5c2392242528e3e3e42fc"
+  end
+
+  resource "idna" do
+    url "https://files.pythonhosted.org/packages/f5/08/8eea9d4b8302028f3abb2c0813953f7aec26d33b7a8960ed760e65ff29fa/idna-3.20.tar.gz"
+    sha256 "a7db850025b95ded1eae8a46181a1a6c56c92c96f0e2b005d9ff8dc0210cab44"
+  end
+
+  resource "msal" do
+    url "https://files.pythonhosted.org/packages/bb/85/747d28986a44b715cc51cf57aa021c8fd94e9614064261ceec77320e8b0b/msal-1.39.0.tar.gz"
+    sha256 "6ab7de335e6d7f5717e2c7e1dbf86e4dda2f6acf3c56773b78dc53ebc6395b5f"
+  end
+
+  resource "pycparser" do
+    url "https://files.pythonhosted.org/packages/cb/27/eeb9f307bf07060f3d9f9aa0fb8c15b01bdfded0a941e4b2719c7f94cacd/pycparser-3.12.tar.gz"
+    sha256 "f03387877eab82ce01bbdfd0ba7252ee55a90b1c708d5129e2ce915475cf1db6"
+  end
+
+  resource "PyJWT" do
+    url "https://files.pythonhosted.org/packages/43/ea/5194e52748b0da83d71e082d75496eaec6e58f419f5e184786ded517e6a9/pyjwt-2.15.1.tar.gz"
+    sha256 "4f259e80cdfb6b3fc18a7de51fd1ef9ec79652f25019bae68975ca2468a34df8"
+  end
+
+  resource "requests" do
+    url "https://files.pythonhosted.org/packages/ac/c3/e2a2b89f2d3e2179abd6d00ebd70bff6273f37fb3e0cc209f48b39d00cbf/requests-2.34.2.tar.gz"
+    sha256 "f288924cae4e29463698d6d60bc6a4da69c89185ad1e0bcc4104f584e960b9ed"
+  end
+
+  resource "typing-extensions" do
+    url "https://files.pythonhosted.org/packages/f6/cc/6253133b5bb138fc3306cebfbda2c520f545d36b5be2c7255cc528bb45d6/typing_extensions-4.16.0.tar.gz"
+    sha256 "dc983d19a509c94dba722ee6abd33940f7c05a89e243c47e907eb4db6f1a43e5"
+  end
+
+  resource "urllib3" do
+    url "https://files.pythonhosted.org/packages/e3/05/b17359e1cefb4f909b5e40b1b90a496d987258916dbbf88e842c729f510e/urllib3-2.8.0.tar.gz"
+    sha256 "63bf2ead4c879426ebf22ef2a781eeb4aa3b4ae798a0435506f8687fd5bb9b63"
+  end
+
+  # The sdists above build through PEP 517 backends (setuptools, flit-core,
+  # hatchling, maturin) that pip resolves in a build-isolated environment,
+  # which needs the network. Same trade-off homebrew-core's awscli and
+  # pom11/homebrew-hscc make for their pinned sdists.
+  allow_network_access! :build
+
+  def install
+    # The sdist extracts to micro_notify-{{VERSION}}/, so `buildpath` is the
+    # project root (pyproject.toml + src/).
+    odie "expected the release tarball to carry pyproject.toml at its root" unless (buildpath/"pyproject.toml").exist?
+
+    venv = virtualenv_create(libexec/"venv", python3, system_site_packages: false)
+    # Pinned deps first, each by its staged sdist (--no-deps under std_pip_args),
+    # then the project itself — whose console scripts (`micro-notify`,
+    # `mnotify`) are what pip_install_and_link symlinks into bin.
+    venv.pip_install resources
+    venv.pip_install_and_link buildpath
+  end
+
+  test do
+    # --version is argparse's eager version action: it prints
+    # `mnotify <version>` and exits 0 before any config, keychain or network
+    # access, so this proves the venv, both console scripts and the import
+    # chain without touching Microsoft at all.
+    assert_match version.to_s, shell_output("#{bin}/micro-notify --version")
+    assert_match version.to_s, shell_output("#{bin}/mnotify --version")
+    # The guardrails and the dry-run flag are the contract for agents; a build
+    # whose help lacks them is not the CLI this tap promises.
+    help_text = shell_output("#{bin}/mnotify mail send --help")
+    assert_match "--dry-run", help_text
+    assert_match "--to", help_text
+  end
+end
