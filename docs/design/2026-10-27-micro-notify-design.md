@@ -130,8 +130,13 @@ audit log and `counter.json` into a temp dir instead of the real HOME.
 
 ```
 mnotify setup                          interactive: tenant/client/sender, store cert or secret in keychain
-mnotify doctor [--send-test <addr>]    config ok, keychain items present, token acquired, token roles has
-                                        Mail.Send, each Teams target URL present; optional real test send
+mnotify doctor [--send-test <addr>]    config ok, keychain items present, token acquired; if the token's
+                                        roles claim is present it includes Mail.Send — an absent claim
+                                        after §6 step 3 is expected (Exchange app-RBAC is invisible to
+                                        the Entra claim) and reports `warn`, exit unchanged; an
+                                        unreadable claim or a read claim without Mail.Send stays a
+                                        fail (exit 4, fail-closed). *(amended 2026-10-29 per t_24a04813)*
+                                        Each Teams target URL present; optional real test send
 mnotify mail send --to a@example.com [--to ...] [--cc ...] [--bcc ...] --subject S
                    (--body TEXT | --body-file F | stdin) [--html] [--attach F ...] [--reply-to R]
                    [--dry-run] [--json]
