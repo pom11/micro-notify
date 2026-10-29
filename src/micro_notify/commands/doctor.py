@@ -209,10 +209,11 @@ def read_roles_claim(token: str) -> tuple[str, list[str]]:
     raw = claims.get("roles")
     if raw is None or raw == []:
         return CLAIM_ABSENT, []
-    if not isinstance(raw, list):
+    # A claim must be a list of strings. Anything else is a shape Entra does not
+    # produce, so it is not evidence of anything and must not be read as "no roles".
+    if not isinstance(raw, list) or not all(isinstance(role, str) for role in raw):
         return CLAIM_UNREADABLE, []
-    roles = [role for role in raw if isinstance(role, str)]
-    return (CLAIM_READ if roles else CLAIM_ABSENT), roles
+    return CLAIM_READ, list(raw)
 
 
 def mask_address(address: str) -> str:

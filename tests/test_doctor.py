@@ -434,6 +434,72 @@ def test_unreadable_token_still_fails_closed_after_the_change(
     # pinned here so a future 'treat anything unreadable as warn' fix trips on it.)
 
 
+def test_unreadable_token_with_send_test_sends_nothing(
+    mnotify_config, seeded_keychain, msal_stub, http_counter, capsys
+) -> None:
+    """Fail-closed means the run STOPS, not 'print red and carry on to a real send'.
+
+    An unreadable assertion is the one token state where we know nothing at all, so
+    reaching the POST would be a send with no verification behind it. The exit code
+    alone cannot prove this (the FAIL already set it), which is why the POST count and
+    the skipped lines are asserted here.
+    """
+    msal_stub("not-a-jwt-at-all")
+    http_counter.responses.append(httpx.Response(202))
+
+    assert run_doctor("--send-test", SEND_TARGET, "--json") == EXIT_AUTH
+    assert http_counter.requests == [], "an unreadable token must not reach the POST"
+    checks = {c["name"]: c for c in json.loads(capsys.readouterr().out)["checks"]}
+    assert checks["token"]["status"] == "fail"
+    assert checks["allow"]["status"] == "skipped"
+    assert checks["send-test"]["status"] == "skipped"
+    counter = load_config(mnotify_config).paths.counter_file
+    assert not counter.exists(), "a refused pre-flight must not spend daily budget"
+
+
+# --- The claim reader itself ------------------------------------------------
+# The tri-state lives here, so it is pinned at unit level too: an e2e test cannot
+# tell "the reader said absent" from "the reader said unreadable and the caller
+# happened to map it to the same line".
+def test_read_roles_claim_distinguishes_the_three_states() -> None:
+    from micro_notify.commands.doctor import (
+        CLAIM_ABSENT,
+        CLAIM_READ,
+        CLAIM_UNREADABLE,
+        read_roles_claim,
+    )
+
+    assert read_roles_claim(jwt_with_roles("Mail.Send", "User.Read")) == (
+        CLAIM_READ, ["Mail.Send", "User.Read"])
+    assert read_roles_claim(jwt_with_roles("User.Read")) == (CLAIM_READ, ["User.Read"])
+    assert read_roles_claim(jwt_without_roles()) == (CLAIM_ABSENT, [])
+    assert read_roles_claim(jwt_payload({"roles": []})) == (CLAIM_ABSENT, [])
+    for unreadable in ("not-a-jwt-at-all", "a.b", "a.b.c.d", ""):
+        assert read_roles_claim(unreadable) == (CLAIM_UNREADABLE, []), unreadable
+
+
+def test_read_roles_claim_rejects_a_shape_entra_cannot_produce() -> None:
+    """A `roles` claim that is not a list of strings is not evidence of anything."""
+    from micro_notify.commands.doctor import (
+        CLAIM_ABSENT,
+        CLAIM_UNREADABLE,
+        read_roles_claim,
+    )
+
+    assert read_roles_claim(jwt_payload({"roles": "Mail.Send"})) == (CLAIM_UNREADABLE, [])
+    assert read_roles_claim(jwt_payload({"roles": {"a": 1}})) == (CLAIM_UNREADABLE, [])
+    assert read_roles_claim(jwt_payload({"roles": [1, 2]})) == (CLAIM_UNREADABLE, [])
+    # A half-string claim is not a shape Entra produces either, and the code must not
+    # quietly drop the entry it could not read: that would turn a bogus token into a
+    # "no roles" answer, which is the one state allowed to reach --send-test.
+    assert read_roles_claim(jwt_payload({"roles": ["Mail.Send", 7]})) == (CLAIM_UNREADABLE, [])
+    # A payload that is valid JSON but not an object cannot carry claims at all.
+    not_a_dict = ".".join(["e30", "WyJhIiwgImIiXQ", "c2ln"])
+    assert read_roles_claim(not_a_dict) == (CLAIM_UNREADABLE, [])
+    # (and the trivially readable empty object is an absent claim, not garbage)
+    assert read_roles_claim(jwt_payload({})) == (CLAIM_ABSENT, [])
+
+
 def test_send_test_after_step_three_audits_one_sent_line(
     mnotify_config, seeded_keychain, msal_stub, http_counter, read_json_lines
 ) -> None:
