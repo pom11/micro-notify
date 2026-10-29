@@ -299,8 +299,15 @@ def test_error_message_never_suggests_a_send_happened(tmp_path, monkeypatch, cap
         # behaviour is pinned by tests/test_mail_cli.py; these pins only exist for stubs.
         # teams argvs dropped: commands/teams.py is implemented on wt/p4 (t_ba58663d) and its
         # behaviour is pinned by tests/test_teams_cli.py; these pins only exist for stubs.
-        (["setup"], "setup"),
-        (["doctor"], "doctor"),
+        # setup argv dropped: commands/setup.py is implemented on wt/p5 (t_5f4a5de4) and its
+        # behaviour is pinned by tests/test_setup.py; this pin only exists for stubs.
+        # doctor argv dropped: commands/doctor.py is implemented on wt/p5 (t_5f4a5de4) and its
+        # behaviour is pinned by tests/test_doctor.py; this pin only exists for stubs.
+        # Kept: bare `mnotify mail` with no action is the one remaining stub in build steps 1-5
+        # (mail.py's run() still raises not_implemented when args.mail_command is not "send").
+        # This list must not be empty: with no parameters pytest collects the test as a single
+        # skip, so the "stubs fail loudly" invariant would stop being exercised and still look green.
+        (["mail"], "mail"),
     ],
 )
 def test_stubbed_commands_exit_2_and_say_so(argv, owner, capsys) -> None:
@@ -315,9 +322,17 @@ def test_stubbed_commands_exit_2_and_say_so(argv, owner, capsys) -> None:
 
 
 def test_stub_never_reports_success(capsys) -> None:
+    # Retargeted from MAIL_SEND to bare `mail`: mail.send is implemented on wt/p3, so this
+    # only exercised a stub while P1's stubs were all that existed. Bare `mail` is the
+    # remaining stub, and it raises before any config read — the old argv reached the real
+    # config file, so the test passed only on a machine that had never run `mnotify setup`
+    # (with a config present it died reading stdin for the missing body).
+    # Goes through cli.DISPATCH, not module.run: the invariant is about the wiring cli.py
+    # installs, which is what an agent's `mnotify` invocation actually hits.
     with pytest.raises(MicroNotifyError) as excinfo:
-        cli.DISPATCH["mail"](parse(MAIL_SEND))
+        cli.DISPATCH["mail"](parse(["mail"]))
     assert excinfo.value.exit_code != EXIT_OK
+    assert capsys.readouterr().out == ""
 
 
 # --- Root behaviour --------------------------------------------------------
