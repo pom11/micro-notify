@@ -144,12 +144,14 @@ Expected at this point: `config` pass, `keychain` pass, `teams` pass (no targets
 yet is fine), and the token/`Mail.Send` checks pass once the consent from 1.4 has
 propagated. A failure names the check and prints a `fix:` hint.
 
-Keep this checkpoint **before** step 3: `doctor` proves the Entra grant is live by
-reading the `Mail.Send` role out of the token Entra issued, and step 3 deliberately
-removes that grant. After step 3 the role is gone from the token by design, so
-`doctor`'s `token` check goes red — see [3.3](#33-positive-re-test-the-scoped-mailbox-still-sends)
-for what to use instead. `doctor` is the step-1-and-2 verification tool; the send
-commands are the step-3 verification tool.
+This checkpoint is where you prove the Entra grant is live: `doctor` reads the
+`Mail.Send` role out of the token Entra issued, and while the consent from 1.4 still
+stands the line reads `token: pass`. Step 3 deliberately removes that grant, so
+**after** step 3 the `token` line turns yellow `warn` ("not verifiable from the
+token"), the run continues, and `mnotify doctor` still exits 0 — see
+[3.2](#32-remove-the-consent) for the captured output. `doctor` is the verification
+tool both before and after step 3; `mnotify mail send` stays the positive post-step-3
+test that a real message goes out.
 
 ---
 
@@ -271,27 +273,44 @@ admin consent** → remove consent for `Mail.Send`). Removing the *consent* is w
 matters; deleting the permission line as well also stops anyone re-consenting it by
 accident later, and nothing in `mnotify` needs it once the Exchange role exists.
 
-`mnotify doctor` reads the role claim from the token it acquires, so once the
-consent is gone it will report `Mail.Send` **missing** if you run it before the
-Exchange role has propagated. That is the check working, not a regression: the token
-is no longer tenant-wide.
+`mnotify doctor` reads the `roles` claim out of the token it acquires. That claim is
+what Entra fills from the tenant-wide consent you are about to delete, so once the
+consent is gone the claim is simply not in the token any more — and `doctor` reports
+that as a yellow `warn`, not as a failure. This is the captured output on a tenant
+*after* step 3 (it also prints with `--json`: `ok: true`, `exitCode: 0`,
+`checks[]` identical, `token.status == "warn"`; the warn line goes to stdout, only a
+`fail` goes to stderr):
 
-And once step 3 is *done*, that check stays red — permanently, and correctly. The
-`Mail.Send` role in the token is the Entra grant; the whole point of step 3 is that
-this grant no longer exists. From here on `mnotify doctor`'s `token` line reports
-"token acquired but its roles do not include Mail.Send" and doctor exits 4. **Do not
-"fix" that by re-granting the consent.** After step 3, verify the pipeline with the
-real send commands below (`mnotify mail send`, `mnotify doctor --send-test` is gated
-behind the same token check and will not reach the send once the consent is gone),
-and treat the red `token` line as the expected end state of a correctly scoped app.
+```text
+$ mnotify doctor          # tenant AFTER design §6 step 3
+config: pass — /Users/…/config.toml
+keychain: pass — present: graph.certificate_pem, graph.certificate_thumbprint
+teams: pass — no targets configured
+token: warn — token acquired; Mail.Send not verifiable from the token — its roles claim is absent or empty. Expected after design §6 step 3: the Exchange Online scoped Application Mail.Send role is invisible to the Entra roles claim. Prove the grant with `mnotify doctor --send-test <addr>`; do not re-grant the tenant-wide consent to silence this line
+allow: pass — 1 domain(s), 0 address(es)
+send-test: skipped
+$ echo exit=$?
+exit=0
+```
 
-What to run as your step-1/2 "doctor is green" milestone: **before** removing the
-consent, `mnotify doctor --send-test noreply@example.com` should pass end to end.
-That is the moment doctor is the right tool. After step 3, `config`, `keychain` and
-`teams` still pass; `token` fails, and because doctor stops at the first failure the
-`allow` check after it is reported `skipped` rather than run — that ordering is
-design §4's, and a red `token` line is the expected end state of a correctly scoped
-app.
+Green with one warn is the expected end state of a correctly scoped app: the run
+continues past the `token` line (`config`, `keychain`, `teams` and `allow` all still
+report), and `--send-test` is reachable. **Do not "fix" the warn line by re-granting
+the consent.** The warn says only that this one thing cannot be read from the token —
+the grant that matters now lives in Exchange Online application RBAC, which the Entra
+`roles` claim cannot see. Re-consenting `Mail.Send` tenant-wide would silence the
+line and undo step 3, which is the opposite of what you came here to do.
+
+The positive test after step 3 is a real send: `mnotify doctor --send-test
+noreply@example.com` (the same single guarded send 3.3 performs) or a plain
+`mnotify mail send`. Before you remove the consent, this same checkpoint is where the
+Entra grant gets proven: run `mnotify doctor --send-test noreply@example.com` while
+the consent is still in place and it should pass end to end, `token: pass` and all.
+
+What `token: fail` (exit 4) means *after* step 3 — a real fault, not the steady state:
+an `AADSTS…` detail is a credential problem (1.2/1.3), "roles claim could not be read"
+is a token shape Entra does not produce, and a `roles` list that names other roles but
+not `Mail.Send` means someone re-granted the tenant-wide consent — undo it.
 
 Propagate, then test: changes to application permissions and application RBAC are
 cached, and that cache is 30 minutes to 2 hours depending on how recently the app
@@ -311,10 +330,11 @@ mnotify mail send --to noreply@example.com \
 echo "exit=$?"
 ```
 
-Expect `exit=0` and a `sent` document carrying the Graph request-id. (You can still
-use `mnotify doctor --send-test noreply@example.com` for the same real send *before*
-step 3 removes the consent; after step 3 the doctor token check stops that run at
-exit 4, as just explained.) Then confirm from the audit log:
+Expect `exit=0` and a `sent` document carrying the Graph request-id. The equivalent
+one-command version is `mnotify doctor --send-test noreply@example.com` — the same
+single guarded send, and the re-test design §6 step 3 asks for: it is reachable after
+step 3 again, because the `warn` on the `token` line does not stop the run. Then
+confirm from the audit log:
 
 ```sh
 mnotify log --tail 3
@@ -496,13 +516,16 @@ mnotify setup --force --sender noreply@example.com --reply-to ops@example.com \
 
 ## Final verification
 
-Run these in order. (This block runs *after* step 3 removed the Entra consent, so
-`mnotify doctor` stops at its `token` check — it reports `Mail.Send` missing and
-skips the `allow` check after it. That is the correct end state; see 3.2. Verify
-sends with the `mail send` commands below, not with `--send-test`.)
+Run these in order. This block runs *after* step 3 removed the Entra consent, so
+`mnotify doctor` is expected **green with one `warn`** — the `token` line reporting
+"not verifiable from the token". That is the correct end state; see 3.2, and never
+re-grant the consent just to silence it. A `token: fail` here is a real problem: an
+`AADSTS…` detail means the credential, "could not be read" means an unexpected token
+shape, and a `roles` list naming other roles but not `Mail.Send` means someone
+re-granted the tenant-wide consent — undo it.
 
 ```sh
-# 1. config, keychain and teams pass; token reports Mail.Send missing (by design):
+# 1. config, keychain and teams pass; token reports warn "not verifiable" (by design):
 mnotify doctor
 
 # 2. exactly what would be sent, no network call:
@@ -535,13 +558,15 @@ Copy this into your ticket and tick it. Nothing here may be committed to the rep
 [ ] 1.2  mnotify setup --gen-cert ran on the agent machine (key in keychain)
 [ ] 1.3  public certificate uploaded to Entra; thumbprints match
 [ ] 1.4  Graph application permission Mail.Send + admin consent granted
-[ ] 1.6  mnotify doctor green (config, keychain, token+Mail.Send) — BEFORE step 3
+[ ] 1.6  mnotify doctor green (config, keychain, token+Mail.Send) — while the consent stands
 [ ] 2.1  New-ServicePrincipal created (AppId + Enterprise Object ID)
 [ ] 2.2  New-ManagementScope mnotify-noreply filters on the one sender mailbox
 [ ] 2.3  New-ManagementRoleAssignment "Application Mail.Send" -CustomResourceScope
 [ ] 2.4a Test-ServicePrincipalAuthorization -Resource noreply@…  -> InScope True
 [ ] 2.4b Test-ServicePrincipalAuthorization -Resource ops@…      -> InScope False
 [ ] 3.2  tenant-wide Entra Mail.Send consent REMOVED (this is the step people skip)
+[ ] 3.2b mnotify doctor -> exit 0, green with one warn (token); doctor --send-test
+         noreply@example.com delivers one message — never re-consent to silence the warn
 [ ] 3.3  mnotify mail send to the scoped mailbox -> exit 0 (consent already removed)
 [ ] 3.4  sender override to an out-of-scope mailbox -> HTTP 403, exit 5
 [ ] 4.1  one channel workflow per channel, URL stored via teams targets add
@@ -563,11 +588,13 @@ When Entra warns the credential is near expiry: run `mnotify setup --gen-cert
 `--allow-domain` values (it replaces the keychain items and rewrites the public
 certificate file), upload the new public certificate in Entra, verify the new
 thumbprint, then remove the old certificate from the app registration. Check the
-swap with `mnotify doctor`: after step 3 it stops at the `token` check either way, but
-the detail it prints tells you which half is wrong — an `AADSTS…` detail means the new
-certificate is not accepted (not uploaded, or the thumbprint pair is mismatched), while
-"roles do not include Mail.Send" means authentication worked and only the (intentional)
-Entra consent is missing. Confirm end to end with a real `mnotify mail send`, and keep
+swap with `mnotify doctor`: post-step-3 the `token` line is `warn` either way, so an
+`AADSTS…` detail is the only `token` failure a rotation problem produces — it means the
+new certificate is not accepted (not uploaded, or the thumbprint pair is mismatched).
+Any other `token: fail` — "roles claim could not be read", or a `roles` list naming
+other roles but not `Mail.Send` — is not a rotation problem: the first is an unexpected
+token shape, the second means the tenant-wide consent is back. Confirm end to end
+with a real `mnotify mail send`, and keep
 the old certificate until that succeeds — Entra accepts several at once.
 
 ## Where to look when something fails
@@ -578,7 +605,9 @@ the old certificate until that succeeds — Entra accepts several at once.
 | `mnotify doctor` fails at `config` (exit 2)                 | config unreadable or invalid; the fix hint names the path. `mnotify config show` prints it with secrets masked.                  |
 | `doctor` fails at `keychain` (exit 4)                       | a keychain account is missing — re-run `mnotify setup --gen-cert` (or `--auth secret`) on this Mac.                              |
 | `doctor` fails at `token` (exit 4), `AADSTS…`               | wrong tenant/client ID, the certificate is not uploaded, or it expired. Check 1.2/1.3.                                           |
-| `doctor` reports `Mail.Send` missing (exit 4)               | before step 3: grant admin consent (1.4). After step 3: **expected** — the Entra grant is gone by design, verify with `mnotify mail send` instead (3.3). |
+| `doctor` `token: warn` (exit 0), "not verifiable from the token"        | **Expected after step 3** — the Entra roles claim is absent by design and proves nothing about the Exchange scoped role. Prove the grant with `mnotify doctor --send-test <addr>` or `mnotify mail send` (3.3); **never** re-grant the tenant-wide consent to silence it. Before step 3: the consent has not propagated yet — 1.4. |
+| `doctor` `token: fail` (exit 4), "roles claim could not be read"        | the token is not a readable JWT — an unexpected shape for Entra to produce. Re-run `mnotify doctor`; if it persists, re-check 1.2/1.3 (credential pair) and open an issue with the doctor output (never a token).                                   |
+| `doctor` `token: fail` (exit 4), roles listed but no `Mail.Send`        | Entra answered authoritatively and the app does not hold `Mail.Send`. Before step 3: grant admin consent (1.4). After step 3 this is not the steady state — it means tenant-wide app roles are back without `Mail.Send`; undo the re-grant (3.2) and re-check.                                                            |
 | `doctor` fails at `teams` (exit 4)                          | a configured target has no URL in the keychain: `mnotify teams targets add <name> --kind <kind>`.                                |
 | send refused, exit 3                                        | a guardrail, by design. The message names the recipient or limit. Add the domain to `[allow]` or fix the recipient.              |
 | send refused, exit 6                                        | `limits.daily_max` reached for today (UTC). Raise it or wait for the counter to roll over at midnight UTC.                       |
