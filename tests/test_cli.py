@@ -322,9 +322,17 @@ def test_stubbed_commands_exit_2_and_say_so(argv, owner, capsys) -> None:
 
 
 def test_stub_never_reports_success(capsys) -> None:
+    # Retargeted from MAIL_SEND to bare `mail`: mail.send is implemented on wt/p3, so this
+    # only exercised a stub while P1's stubs were all that existed. Bare `mail` is the
+    # remaining stub, and it raises before any config read — the old argv reached the real
+    # config file, so the test passed only on a machine that had never run `mnotify setup`
+    # (with a config present it died reading stdin for the missing body).
+    # Goes through cli.DISPATCH, not module.run: the invariant is about the wiring cli.py
+    # installs, which is what an agent's `mnotify` invocation actually hits.
     with pytest.raises(MicroNotifyError) as excinfo:
-        cli.DISPATCH["mail"](parse(MAIL_SEND))
+        cli.DISPATCH["mail"](parse(["mail"]))
     assert excinfo.value.exit_code != EXIT_OK
+    assert capsys.readouterr().out == ""
 
 
 # --- Root behaviour --------------------------------------------------------
