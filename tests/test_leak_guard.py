@@ -41,7 +41,9 @@ ALLOWED_EMAIL_DOMAINS = frozenset({"example.com", "contoso.com"})
 # --- Patterns ----------------------------------------------------------------
 GUID_RE = re.compile(r"\b[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\b")
 PEM_KEY_RE = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
-EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)\b")
+# The TLD must be alphabetic: ``python@3.12`` is a Homebrew formula name that has
+# to appear in the tap formula (design §5), and a numeric TLD is not a real mailbox.
+EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,})\b")
 # The vendor's name in its own script (U+5FAE U+8F6F U+4FE1 U+606F). Written as code
 # points so this guard file stays free of it.
 VENDOR_WORD = re.compile("".join(chr(c) for c in (0x5FAE, 0x8F6F, 0x4FE1, 0x606F)))
@@ -211,6 +213,21 @@ def test_guard_detects_a_foreign_email_domain(address: str) -> None:
 
 def test_guard_allows_placeholder_email_domains() -> None:
     assert scan_text("--to noreply@example.com --cc ops@contoso.com") == []
+
+
+def test_guard_ignores_a_versioned_tool_reference() -> None:
+    """``python@3.12`` is a Homebrew formula name (tap formula, design §5), not a mailbox."""
+    assert scan_text('depends_on "python@3.12"') == []
+
+
+def test_guard_catches_a_mailbox_alongside_a_versioned_reference() -> None:
+    """The alpha-TLD rule must not cost detection: the mailbox still bites."""
+    address = foreign_address("ops", "real-tenant", "onmicrosoft", "com")
+    text = 'depends_on "python@3.12"\n' + f"--to {address}"
+    findings = [f for f in scan_text(text) if "e-mail" in f]
+    assert findings == [
+        "e-mail domain not in the placeholder set: real-tenant" + ".onmicrosoft.com"
+    ], findings
 
 
 def test_descriptive_host_mentions_are_not_findings() -> None:
