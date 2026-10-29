@@ -6,9 +6,31 @@ keychain item must not be followed by a Teams lookup. Each check prints one line
 when it fails, a fix hint that names the command or admin step that resolves it
 (design §6: the doctor mirrors the admin steps the operator is about to perform).
 
-Exits: 0 everything green · 2 config · 3 the guard would refuse every send (empty
-allowlist) · 4 auth (keychain item, token, or a token without ``Mail.Send``) ·
-5 remote (only via ``--send-test``).
+Exits: 0 everything green (or only warnings) · 2 config · 3 the guard would refuse
+every send (empty allowlist) · 4 auth (keychain item, token, or a token whose roles
+claim names other roles but not ``Mail.Send``) · 5 remote (only via ``--send-test``).
+
+``Mail.Send`` is checked against the ``roles`` claim of the token msal handed us, and
+that claim is what makes this check tri-state rather than pass/fail. Entra fills it
+from the app's **consented Entra app roles**; design §6 step 3 tells the operator to
+remove the tenant-wide ``Mail.Send`` consent and keep only the Exchange Online
+``Application Mail.Send`` **scoped** role, and a scoped role is not, and cannot be, a
+claim in this token. So on the hardened tenant the design mandates, an absent ``roles``
+claim is the *expected* state — treating it as a failure made ``mnotify doctor``
+unsatisfiable (exit 4 forever), skipped ``allow``, and put ``--send-test`` — §6 step 3's
+own verification command — out of reach (card t_24a04813). Hence:
+
+* claim present and listing ``Mail.Send``            -> ``pass``
+* claim present, readable, without ``Mail.Send``     -> ``fail`` exit 4 (authoritative:
+  the tenant-wide grant is there and the app does not hold it)
+* claim absent or empty, token readable              -> ``warn``, run continues; the
+  grant lives in Exchange app-RBAC, which this claim cannot see. The only proof that
+  the scoped role works is a real send, so ``--send-test`` must be reachable.
+* token not a readable JWT                           -> ``fail`` exit 4 (we cannot read
+  the assertion, so we refuse rather than assume)
+
+A ``warn`` never changes the exit code and never stops the run: it reports honestly that
+this one thing could not be verified, and lets the checks that *can* prove something run.
 
 What "no network without ``--send-test``" means here, precisely: doctor performs no
 data-plane request of its own. Check 4 *does* acquire a token — design §4 lists
@@ -53,14 +75,26 @@ NAME = "doctor"
 BUILD_STEP = "5"
 
 # Design §3.1 / §4: the app must hold Mail.Send, and it is the token's own claim
-# about itself, so it is read from the assertion msal just handed us.
+# about itself, so it is read from the assertion msal just handed us. The claim is
+# authoritative only when Entra put it there: after design §6 step 3 removes the
+# tenant-wide consent, the remaining grant is the Exchange Online *scoped* role,
+# which never appears in this claim — an absent claim is therefore "not verifiable",
+# not "not authorised" (see this module's docstring and card t_24a04813).
 REQUIRED_ROLE = "Mail.Send"
 ROLE_HINT = (
     "grant Microsoft Graph application permission Mail.Send, then grant admin consent "
     "in Entra (docs/ADMIN-SETUP.md, design §6 step 1)"
 )
+ROLE_UNVERIFIABLE = (
+    f"token acquired; {REQUIRED_ROLE} not verifiable from the token — its roles claim "
+    "is absent or empty. Expected after design §6 step 3: the Exchange Online scoped "
+    "Application Mail.Send role is invisible to the Entra roles claim. Prove the grant "
+    "with `mnotify doctor --send-test <addr>`; do not re-grant the tenant-wide consent "
+    "to silence this line"
+)
 
 PASS = "pass"
+WARN = "warn"
 FAIL = "fail"
 SKIPPED = "skipped"
 
@@ -88,9 +122,11 @@ def add_parser(subparsers: "argparse._SubParsersAction") -> None:
 class Report:
     """Collects check outcomes and prints them in the mode the caller asked for.
 
-    Passing lines go to stdout; a failure line and its fix hint go to stderr, so an
-    operator scanning a terminal sees red where red belongs, and ``--json`` stdout
-    stays a single parseable document.
+    Passing and warning lines go to stdout; a failure line and its fix hint go to
+    stderr, so an operator scanning a terminal sees red where red belongs, and
+    ``--json`` stdout stays a single parseable document. A ``warn`` records a thing
+    that could not be verified: unlike ``fail`` it never sets the exit code and never
+    stops the run (see :func:`check_token` for the one check that can produce one).
     """
 
     def __init__(self, machine: bool) -> None:
@@ -133,27 +169,51 @@ class Report:
 
 
 # --- Helpers -----------------------------------------------------------------
-def token_roles(token: str) -> list[str]:
-    """The ``roles`` claim inside a bearer token's payload.
+# The three states of the ``roles`` claim, named rather than encoded as None/[]
+# tricks: the difference between "the claim is empty" and "the claim could not be
+# read at all" is the entire behaviour of check 4.
+CLAIM_READ = "read"
+CLAIM_ABSENT = "absent"
+CLAIM_UNREADABLE = "unreadable"
+
+
+def read_roles_claim(token: str) -> tuple[str, list[str]]:
+    """``(state, roles)`` for the ``roles`` claim inside a bearer token's payload.
 
     The token is a JWT msal just issued for exactly the scopes we asked for, so its
-    own payload is the cheapest authoritative answer and it costs no extra request.
-    A token we cannot decode yields an empty list, which makes the check fail closed
-    rather than assume the permission is there.
+    own payload is the cheapest answer available and it costs no extra request.
+
+    Three states, because they mean three different things to the operator:
+
+    * ``CLAIM_READ`` — the payload decoded and the claim carries entries. Entra
+      wrote them from the app's consented app roles: authoritative.
+    * ``CLAIM_ABSENT`` — the payload decoded and the claim is missing or empty.
+      This is exactly what a token looks like once design §6 step 3 removed the
+      tenant-wide consent; it says nothing either way about the Exchange Online
+      scoped role, so the caller reports it as not verifiable.
+    * ``CLAIM_UNREADABLE`` — not a decodable JWT (or a claim shape Entra does not
+      produce). The assertion cannot be read, so the caller must fail closed
+      rather than assume the permission is there.
     """
     try:
         _, payload, _ = token.split(".", 2)
     except ValueError:
-        return []
+        return CLAIM_UNREADABLE, []
     try:
         padded = payload + "=" * (-len(payload) % 4)
         claims = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
     except (ValueError, UnicodeDecodeError, TypeError):
-        return []
+        return CLAIM_UNREADABLE, []
     if not isinstance(claims, dict):
-        return []
-    roles = claims.get("roles")
-    return [role for role in roles if isinstance(role, str)] if isinstance(roles, list) else []
+        return CLAIM_UNREADABLE, []
+    raw = claims.get("roles")
+    if raw is None or raw == []:
+        return CLAIM_ABSENT, []
+    # A claim must be a list of strings. Anything else is a shape Entra does not
+    # produce, so it is not evidence of anything and must not be read as "no roles".
+    if not isinstance(raw, list) or not all(isinstance(role, str) for role in raw):
+        return CLAIM_UNREADABLE, []
+    return CLAIM_READ, list(raw)
 
 
 def mask_address(address: str) -> str:
@@ -250,7 +310,15 @@ def check_teams(report: Report, config: Config) -> bool:
 
 
 def check_token(report: Report, config: Config) -> bool:
-    """4. token acquisition works and the token's roles include Mail.Send -> exit 4."""
+    """4. token acquisition works, and the roles claim is read -> exit 4 on real faults.
+
+    Tri-state on purpose (module docstring): an unreadable assertion or a claim that
+    names other roles without ``Mail.Send`` is a failure the operator must fix; an
+    absent claim is only *not verifiable*, because after design §6 step 3 that is what
+    a correctly hardened tenant's token looks like. A warn keeps the run going — the
+    grant that matters then lives in Exchange app-RBAC, and the only evidence that it
+    works is the ``--send-test`` this check must therefore not block.
+    """
     try:
         token = acquire_token(config.mail)
     except AuthError as exc:
@@ -258,7 +326,20 @@ def check_token(report: Report, config: Config) -> bool:
                       hint="check the app registration and the stored credential (design §6 step 1)",
                       exit_code=EXIT_AUTH)
         return False
-    roles = token_roles(token)
+    state, roles = read_roles_claim(token)
+    if state == CLAIM_UNREADABLE:
+        report.record(
+            "token",
+            FAIL,
+            f"token acquired but its roles claim could not be read, so {REQUIRED_ROLE} "
+            "cannot be verified",
+            hint=ROLE_HINT,
+            exit_code=EXIT_AUTH,
+        )
+        return False
+    if state == CLAIM_ABSENT:
+        report.record("token", WARN, ROLE_UNVERIFIABLE)
+        return True
     if REQUIRED_ROLE not in roles:
         report.record(
             "token",
@@ -379,11 +460,19 @@ def run(args: argparse.Namespace) -> int:
 __all__ = [
     "BUILD_STEP",
     "CHECK_ORDER",
+    "CLAIM_ABSENT",
+    "CLAIM_READ",
+    "CLAIM_UNREADABLE",
+    "FAIL",
     "NAME",
+    "PASS",
     "REQUIRED_ROLE",
     "ROLE_HINT",
+    "ROLE_UNVERIFIABLE",
+    "SKIPPED",
+    "WARN",
     "add_parser",
     "mask_address",
+    "read_roles_claim",
     "run",
-    "token_roles",
 ]
