@@ -522,6 +522,10 @@ def _send_chat(args: argparse.Namespace, config, target) -> int:
     a digest, the recipient field carries the *alias* rather than a conversation
     id, and no token or chat id appears in any message.
     """
+    # First thing: an app-mode config cannot serve this target at all, so even
+    # the dry-run preview (which performs no HTTP) must refuse rather than
+    # preview a send the credentials could never make.
+    require_delegated_mode(config)
     if args.to:
         raise UsageError(
             f"--to is only valid for dm targets; '{target.name}' is a chat target "
