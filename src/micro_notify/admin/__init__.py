@@ -18,6 +18,16 @@ Exchange scoped role, B4 Teams targets, B5 the ``admin bootstrap`` command itsel
     :func:`~micro_notify.admin.preflight.run_preflight` and
     :func:`~micro_notify.admin.preflight.plan_installs`.
 
+``admin/entra.py``
+    :func:`~micro_notify.admin.entra.ensure_entra_app` — the idempotent app
+    registration + service principal step, returning
+    :class:`~micro_notify.admin.entra.EntraProvisioning` (``app_id``,
+    ``sp_object_id``, ``created``). Its two ``find_*`` functions are exported so a
+    read-only command (``doctor``) can ask "does it exist?" without any chance of
+    creating one; ``create_app`` / ``create_service_principal`` are deliberately
+    **not** re-exported here, because calling one directly skips the find-first
+    rule that keeps a re-run from registering a second application.
+
 Two rules every module here inherits from the package root:
 
 * nothing in this package prompts, installs, writes a config entry or logs a
@@ -28,6 +38,13 @@ Two rules every module here inherits from the package root:
 
 from __future__ import annotations
 
+from .entra import (
+    EntraError,
+    EntraProvisioning,
+    ensure_entra_app,
+    find_app_id,
+    find_service_principal_id,
+)
 from .preflight import (
     CHECK_ORDER,
     FAIL,
@@ -54,12 +71,17 @@ __all__ = [
     "CommandError",
     "CommandRunner",
     "DryRunRunner",
+    "EntraError",
+    "EntraProvisioning",
     "FAIL",
     "OK",
     "PreflightReport",
     "SubprocessRunner",
     "WARN",
     "CheckResult",
+    "ensure_entra_app",
+    "find_app_id",
+    "find_service_principal_id",
     "get_runner",
     "plan_installs",
     "run_json",

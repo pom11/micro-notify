@@ -170,7 +170,7 @@ class EntraProvisioning:
             return f"created app registration {self.display_name} (service principal already existed)"
         if self.sp_created:
             return f"created service principal for the existing app {self.display_name}"
-        return f"app registration and service principal for {self.display_name} already exist"
+        return f"found existing app registration and service principal for {self.display_name}"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -361,21 +361,27 @@ def _as_entries(payload: Any, label: str) -> list[Mapping[str, Any]]:
     """A ``list`` command's payload as a list of objects.
 
     ``az`` answers a list command with a JSON array, and an empty array is the
-    normal "not found" answer. A bare object (older az, or a one-element response)
-    is accepted as a one-item list; anything else means the response is not
-    something this step can read, and guessing would decide an application id.
+    normal "not found" answer. That is the only accepted shape, and the strictness
+    is the point: a Graph-style envelope (``{"value": [...]}``), a ``null`` or a
+    list of scalars would otherwise yield "zero matches" — and "zero matches" is the
+    one answer this module reacts to by **creating a second application**. Anything
+    this step cannot read therefore raises, and a caller sees exit 2 instead of a
+    duplicate app registration in the tenant.
     """
-    if payload is None:
-        return []
-    if isinstance(payload, Mapping):
-        return [payload]
     if isinstance(payload, list):
         entries: list[Mapping[str, Any]] = []
         for item in payload:
-            if isinstance(item, Mapping):
-                entries.append(item)
+            if not isinstance(item, Mapping):
+                raise EntraError(
+                    f"`{label}` printed a list containing {type(item).__name__}, "
+                    "not application objects"
+                )
+            entries.append(item)
         return entries
-    raise EntraError(f"`{label}` did not print a list of objects")
+    raise EntraError(
+        f"`{label}` did not print a list of objects "
+        f"(got {type(payload).__name__}); refusing to treat an unreadable answer as 'not found'"
+    )
 
 
 def _single(payload: Any, label: str) -> Mapping[str, Any]:
