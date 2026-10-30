@@ -1074,6 +1074,23 @@ def test_a_repeated_error_reason_is_reported_once() -> None:
 
 
 # --- Structure of the generated PowerShell ---------------------------------
+def test_the_disconnect_is_guarded_by_the_connection_flag_and_not_a_constant() -> None:
+    """The finally block must actually reach the disconnect when a session exists.
+
+    A guard that is always false would keep the ``finally`` and the
+    ``Disconnect-ExchangeOnline`` line — so a parser-level test on a canned
+    transcript stays green — while leaving an authenticated Exchange Online session
+    on the tenant after every failed run. The flag it checks has to be the one the
+    script sets only after the connect check passed.
+    """
+    text = script().text
+    block = text[text.index("} finally {"):]
+    assert "if ($MnotifyConnected) {" in block
+    assert block.index("if ($MnotifyConnected) {") < block.index("Disconnect-ExchangeOnline")
+    flag_set = text.index("$MnotifyConnected = $true")
+    assert text.index("Connect-ExchangeOnline -Device") < flag_set < text.index("} finally {")
+
+
 def test_the_generated_script_is_structurally_balanced() -> None:
     """Cheap proxy for 'PowerShell can parse this': every brace, bracket and paren
     the generator emits has to close, and the try/catch/finally must nest."""
