@@ -55,6 +55,18 @@ from ..teams import (
 )
 from . import print_json, read_text_argument  # shared seam
 
+# D3 (chat targets) — appended as new lines so every import line above stays
+# byte-identical: this file is append-only for the delegated phase.
+from ..config import KIND_CHAT, MAIL_MODE_DELEGATED, mask_chat_id  # noqa: E402
+from ..teams import (  # noqa: E402
+    build_chat_payload,
+    get_my_chats,
+    new_attachment_id,
+    post_chat_message,
+    require_delegated_mode,
+    validate_chat_id,
+)
+
 NAME = "teams"
 BUILD_STEP = "4"
 
@@ -130,6 +142,36 @@ def add_parser(subparsers: "argparse._SubParsersAction") -> None:
     remove.add_argument("name", metavar="NAME", help="target name to remove")
     remove.add_argument("--json", action="store_true", help="machine-readable result on stdout")
 
+    # --- chats (D3: delegated Graph chat targets; appended, no edits above) ---
+    chats = teams_sub.add_parser(
+        "chats",
+        help="list and register Teams chats for `kind = chat` targets (delegated)",
+        description=(
+            "Register chat targets from the signed-in person's Teams chats "
+            "(Graph /me/chats; requires `mnotify login`)."
+        ),
+    )
+    chats_sub = chats.add_subparsers(dest="chats_command", metavar="<action>")
+
+    chats_list = chats_sub.add_parser("list", help="list chats (id masked in human output)")
+    chats_list.add_argument("--json", action="store_true", help="machine-readable result on stdout")
+
+    chats_add = chats_sub.add_parser("add", help="register a chat target by alias")
+    chats_add.add_argument("name", metavar="NAME", help="target alias used by `teams send`")
+    chats_add.add_argument(
+        "chat_id",
+        metavar="CHAT_ID",
+        nargs="?",
+        default=None,
+        help="Teams conversation id (19:...@thread.v2); omit with --pick",
+    )
+    chats_add.add_argument(
+        "--pick",
+        action="store_true",
+        help="list the chats and choose one by number instead of pasting an id",
+    )
+    chats_add.add_argument("--json", action="store_true", help="machine-readable result on stdout")
+
 
 def run(args: argparse.Namespace) -> int:
     """Execute ``mnotify teams ...`` (build step 4)."""
@@ -138,6 +180,8 @@ def run(args: argparse.Namespace) -> int:
         return _send(args)
     if action == "targets":
         return _targets(args)
+    if action == "chats":
+        return _chats(args)
     raise UsageError("a teams action is required: send | targets (see `mnotify teams --help`)")
 
 
@@ -230,6 +274,12 @@ def _send(args: argparse.Namespace) -> int:
     # config (design §4 send order: config -> guard -> (dry-run stop) -> POST -> audit)
     config = load_config()
     target = resolve_target(config, args.target)
+
+    # D3: a chat target is a Graph operation, not a webhook — its whole flow
+    # (usage checks, guard, POST, audit) lives in _send_chat. Added as a new
+    # branch so the channel/dm path below stays byte-identical.
+    if target.kind == KIND_CHAT:
+        return _send_chat(args, config, target)
 
     # Usage-level checks, all before any guardrail or network work.
     if target.kind == KIND_DM and not args.to:
@@ -354,6 +404,233 @@ def _body_field(body_text: str) -> dict:
     what was sent without re-deriving it from the card structure.
     """
     return {"body": body_text}
+
+
+# --- chats: list | add  (D3; delegated Graph — appended block) ----------------
+def _chats(args: argparse.Namespace) -> int:
+    action = getattr(args, "chats_command", None)
+    if action == "list":
+        return _chats_list(args)
+    if action == "add":
+        return _chats_add(args)
+    raise UsageError("a chats action is required: list | add")
+
+
+def _chats_list(args: argparse.Namespace) -> int:
+    """``mnotify teams chats list`` — Graph ``GET /me/chats`` for this identity.
+
+    Human output prints topic + type + a masked id; ``--json`` prints the id in
+    full, because a chat id is config data rather than a secret (a Workflows
+    webhook URL would be the opposite case and is never printed at all).
+    """
+    config = load_config()
+    chats = get_my_chats(config=config)
+    rows = [
+        {
+            "id": str(chat.get("id", "")),
+            "topic": str(chat.get("topic") or ""),
+            "type": str(chat.get("chatType") or ""),
+            "last_modified": str(chat.get("lastModifiedDateTime") or ""),
+        }
+        for chat in chats
+    ]
+    if getattr(args, "json", False):
+        print_json({"ok": True, "outcome": "ok", "chats": rows})
+        return EXIT_OK
+    if not rows:
+        print("no chats visible to the signed-in identity")
+        return EXIT_OK
+    for row in rows:
+        topic = row["topic"] or "(no topic)"
+        print(f"{topic:<40} {row['type']:<12} {mask_chat_id(row['id'])}")
+    return EXIT_OK
+
+
+def _pick_chat(config) -> str:
+    """Interactive ``--pick``: list the chats, read a number, return that chat id.
+
+    The id is printed unmasked here on purpose — the operator is choosing the
+    exact conversation to store, and the value is config data, not a secret.
+    """
+    chats = get_my_chats(config=config)
+    if not chats:
+        raise UsageError(
+            "no chats visible to the signed-in identity (nothing to pick; "
+            "sign in with `mnotify login` as a person who is in the chat)"
+        )
+    print(f"chats visible to the signed-in identity ({len(chats)}):")
+    for index, chat in enumerate(chats, start=1):
+        topic = str(chat.get("topic") or "(no topic)")
+        chat_type = str(chat.get("chatType") or "")
+        print(f"{index:>3}  {topic:<40} {chat_type:<12} {chat.get('id', '')}")
+    raw = input("chat number to store: ").strip()
+    if not raw.isdigit() or not (1 <= int(raw) <= len(chats)):
+        raise UsageError(
+            f"'{raw}' is not one of 1..{len(chats)} (nothing was stored)"
+        )
+    return str(chats[int(raw) - 1].get("id", ""))
+
+
+def _chats_add(args: argparse.Namespace) -> int:
+    """``mnotify teams chats add ALIAS <chatId> | --pick``.
+
+    Writes through the config layer only (``with_team_target`` + ``write_config``)
+    — no TOML is touched here — and stores no keychain account: a chat target has
+    no webhook URL (D1a already keeps ``keychain_accounts()`` from claiming one).
+    """
+    _validate_target_name(args.name)
+    config = load_config()
+    # Chat registration is itself a Graph operation when it needs the list, and
+    # in every case it creates a target that only delegated mode can send to, so
+    # the gate runs before anything is written.
+    require_delegated_mode(config, action="chat targets")
+    if args.pick and args.chat_id:
+        raise UsageError("--pick chooses the chat from the list; pass the id or --pick, not both")
+    if args.pick:
+        chat_id = _pick_chat(config)
+    elif args.chat_id:
+        chat_id = args.chat_id
+    else:
+        raise UsageError("pass a CHAT_ID or --pick (nothing was stored)")
+    chat_id = validate_chat_id(chat_id, where=f"chat id for target '{args.name}'")
+
+    write_config(with_team_target(config, args.name, KIND_CHAT, chat_id))
+    if getattr(args, "json", False):
+        print_json(
+            {
+                "ok": True,
+                "outcome": "ok",
+                "target": args.name,
+                "kind": KIND_CHAT,
+                "chat_id": chat_id,
+            }
+        )
+    else:
+        print(
+            f"teams target '{args.name}' (chat) saved; chat id "
+            f"{mask_chat_id(chat_id)} (config only, no keychain account)"
+        )
+    return EXIT_OK
+
+
+# --- send: chat target (delegated Graph; appended block) ----------------------
+def _send_chat(args: argparse.Namespace, config, target) -> int:
+    """One chat send: card -> Graph chatMessage attachment -> audit.
+
+    Same design §4 order as the webhook path (config -> guard -> dry-run stop ->
+    POST -> audit) and the same content-free audit contract: the body travels as
+    a digest, the recipient field carries the *alias* rather than a conversation
+    id, and no token or chat id appears in any message.
+    """
+    if args.to:
+        raise UsageError(
+            f"--to is only valid for dm targets; '{target.name}' is a chat target "
+            "(the chat id comes from the config)"
+        )
+    if not target.chat_id:
+        # Reachable only for a hand-edited config; load_config validates this too.
+        raise UsageError(
+            f"teams target '{target.name}' is a chat target with no chat_id "
+            "(re-register it with `mnotify teams chats add`)"
+        )
+
+    if args.card_file:
+        if args.title or args.fact or args.link or args.link_title or args.text or args.text_file:
+            raise UsageError(
+                "--card-file posts the file verbatim and cannot be combined with "
+                "--to/--title/--text/--text-file/--fact/--link/--link-title"
+            )
+        card = load_card_file(args.card_file)
+        body_text = json.dumps(card, ensure_ascii=False, sort_keys=True)
+    else:
+        text = read_text_argument(
+            args.text, args.text_file, flag="--text", file_flag="--text-file"
+        )
+        if not text.strip():
+            raise UsageError("empty message: pass --text / --text-file / stdin")
+        card = build_card(
+            text=text,
+            title=args.title,
+            facts=parse_facts(args.fact),
+            link=args.link,
+            link_title=args.link_title,
+        )
+        body_text = text
+
+    # Guardrail before any network call (design §3.3). A chat has no addressable
+    # recipient list — the alias is a configured target, not a stranger to be
+    # allowlisted — so the daily cap and counter are what apply here, exactly as
+    # for a channel post.
+    verdict = guard.check(config)
+    if verdict.status != guard.OK:
+        _audit_chat(config, args, target, audit.REFUSED, body_text)
+        refusal = DailyCapReached if verdict.status == guard.CAP_REACHED else GuardRefusal
+        raise refusal(verdict.reason)
+
+    payload = build_chat_payload(card, attachment_id=new_attachment_id())
+
+    if args.dry_run:
+        _print_chat_dry_run(target, payload, json_mode=args.json)
+        _audit_chat(config, args, target, audit.DRY_RUN, body_text)
+        return EXIT_OK
+
+    try:
+        result = post_chat_message(config=config, chat_id=target.chat_id, payload=payload)
+    except RemoteError:
+        _audit_chat(config, args, target, audit.FAILED, body_text)
+        raise
+    guard.record_send(config)
+    _audit_chat(config, args, target, audit.SENT, body_text)
+    if args.json:
+        print_json(
+            {
+                "ok": True,
+                "outcome": "sent",
+                "target": target.name,
+                "kind": KIND_CHAT,
+                "recipients": [target.name],
+                "status": result.status,
+            }
+        )
+    else:
+        print(
+            f"teams chat message sent to '{target.name}' "
+            f"({mask_chat_id(target.chat_id)}) (HTTP {result.status})"
+        )
+    return EXIT_OK
+
+
+def _audit_chat(config, args: argparse.Namespace, target, outcome: str, body_text: str) -> None:
+    """One audit line for a chat send: alias as recipient, body as digest only."""
+    audit.record(
+        config,
+        channel=audit.CHANNEL_TEAMS,
+        outcome=outcome,
+        recipients=[target.name],
+        target=target.name,
+        title=args.title,
+        **_body_field(body_text),
+    )
+
+
+def _print_chat_dry_run(target, payload: dict, *, json_mode: bool) -> None:
+    """Print the exact Graph body; the chat id appears only in masked form."""
+    label = mask_chat_id(target.chat_id)
+    if json_mode:
+        print_json(
+            {
+                "ok": True,
+                "outcome": "dry_run",
+                "kind": KIND_CHAT,
+                "target": target.name,
+                "chat_id": label,
+                "recipients": [target.name],
+                "payload": payload,
+            }
+        )
+        return
+    print(f"dry run — would POST a chatMessage attachment to chat {label}")
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
 
 def _print_dry_run(kind: str, url_label: str, payload: dict, upn: str | None, *, json_mode: bool) -> None:
