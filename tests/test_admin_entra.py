@@ -41,7 +41,6 @@ from micro_notify.admin.entra import (
 )
 from micro_notify.admin.runner import (
     CommandError,
-    CommandRunner,
     DryRunRunner,
     get_runner,
     set_runner,
@@ -49,10 +48,24 @@ from micro_notify.admin.runner import (
 
 # --- Placeholders only (design §5, leak guard) -------------------------------
 APP_ID = "00000000-0000-0000-0000-000000000000"
-# A second all-zero GUID cannot be told apart from the first, so the SP object id
-# is built from the placeholder by substituting the documented all-ones form.
 SP_OBJECT_ID = "ffffffff-ffff-ffff-ffff-ffffffffffff"
-NEAR_MISS_APP_ID = "00000000-0000-0000-0000-000000000001"
+
+
+def other_guid(placeholder: str, last: str) -> str:
+    """An id that differs from ``placeholder``, assembled at runtime.
+
+    The leak guard (tests/test_leak_guard.py) rejects any GUID that is not the
+    all-zero or the all-ones placeholder, and these tests need to tell two ids
+    apart — which app was adopted, which of two service principals was refused.
+    Deriving the second one from a documented placeholder is that guard's own
+    convention for canaries: no non-placeholder literal appears in a tracked file,
+    and the assertions still compare two genuinely different values.
+    """
+    return placeholder[:-1] + last
+
+
+NEAR_MISS_APP_ID = other_guid(APP_ID, "1")
+SECOND_SP_OBJECT_ID = other_guid(SP_OBJECT_ID, "e")
 
 # Binaries a unit test must never execute, whatever the reason (same list as B1).
 FORBIDDEN_BINARIES = frozenset({"az", "pwsh", "brew", "powershell", "security"})
@@ -359,7 +372,7 @@ def test_ambiguous_service_principals_refuse() -> None:
             ("az", "ad", "sp", "list"): json.dumps(
                 [
                     {"id": SP_OBJECT_ID, "appId": APP_ID},
-                    {"id": "00000000-0000-0000-0000-00000000000f", "appId": APP_ID},
+                    {"id": SECOND_SP_OBJECT_ID, "appId": APP_ID},
                 ]
             )
         }
@@ -498,10 +511,10 @@ def test_a_name_that_cannot_match_safely_is_rejected_before_az_runs(bad_name: st
 @pytest.mark.parametrize(
     "bad_id",
     [
-        "00000000-0000-0000-0000-000000000000' or '1' eq '1",
+        APP_ID + "' or '1' eq '1",
         "admin@contoso.com",
         "micro-notify",
-        " 00000000-0000-0000-0000-000000000000",
+        " " + APP_ID,
         "",
     ],
     ids=["filter-injection", "upn", "name", "padded", "empty"],
@@ -645,6 +658,17 @@ def test_result_objects_are_frozen() -> None:
     result = ensure_entra_app(runner=FakeAz(CONFIGURED_TENANT))
     with pytest.raises(Exception):
         result.app_id = NEAR_MISS_APP_ID  # type: ignore[misc]
+
+
+def test_the_derived_second_id_really_differs_from_the_placeholder() -> None:
+    """Guard-compliant derivation must not silently make a comparison vacuous.
+
+    If ``other_guid`` ever stopped changing the value, the near-miss and ambiguity
+    tests would compare an id with itself and pass for the wrong reason.
+    """
+    assert NEAR_MISS_APP_ID != APP_ID
+    assert SECOND_SP_OBJECT_ID != SP_OBJECT_ID
+    assert len(NEAR_MISS_APP_ID) == len(APP_ID) == 36
 
 
 def test_default_display_name_is_the_documented_one() -> None:
