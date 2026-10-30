@@ -293,12 +293,18 @@ def run(args: argparse.Namespace) -> int:
         raise
 
     # --- 6. audit the success, then spend the daily budget ------------------
+    # A delegated send fills result.sender with the identity the token names
+    # (amendment 2026-10-30); an app-only send leaves it None and the config's
+    # sender is the answer, exactly as before. One expression, no mode branch:
+    # for every valid delegated config the two values are already equal, because
+    # graph.send_mail refuses a mismatch before the POST.
+    sender = result.sender or config.mail.sender
     guard_module.record_send(config)
     _audit(
         config,
         outcome=audit_module.SENT,
         recipients=recipients,
-        sender=config.mail.sender,
+        sender=sender,
         subject=args.subject,
         body=body,
         attachments=sized,
@@ -314,7 +320,7 @@ def run(args: argparse.Namespace) -> int:
         )
     else:
         where = f" (Graph request-id {result.request_id})" if result.request_id else ""
-        print(f"sent: {len(recipients)} recipient(s) for {config.mail.sender}{where}")
+        print(f"sent: {len(recipients)} recipient(s) for {sender}{where}")
     return EXIT_OK
 
 
