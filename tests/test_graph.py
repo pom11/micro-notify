@@ -118,7 +118,7 @@ class TestBuildSendPayloadText:
             "content": "the pipeline is red",
         }
         assert payload["message"]["toRecipients"] == [
-            {"recipient": {"emailAddress": {"address": "alice@example.com"}}}
+            {"emailAddress": {"address": "alice@example.com"}}
         ]
         assert payload["saveToSentItems"] is True
 
@@ -157,13 +157,13 @@ class TestCcBccArrays:
 
         message = payload["message"]
         assert message["toRecipients"] == [
-            {"recipient": {"emailAddress": {"address": "alice@example.com"}}}
+            {"emailAddress": {"address": "alice@example.com"}}
         ]
         assert message["ccRecipients"] == [
-            {"recipient": {"emailAddress": {"address": "carbon@example.com"}}}
+            {"emailAddress": {"address": "carbon@example.com"}}
         ]
         assert message["bccRecipients"] == [
-            {"recipient": {"emailAddress": {"address": "blind@contoso.com"}}}
+            {"emailAddress": {"address": "blind@contoso.com"}}
         ]
 
     def test_multiple_recipients_keep_their_order(self) -> None:
@@ -172,7 +172,7 @@ class TestCcBccArrays:
         )
 
         addresses = [
-            r["recipient"]["emailAddress"]["address"]
+            r["emailAddress"]["address"]
             for r in payload["message"]["toRecipients"]
         ]
         assert addresses == ["one@example.com", "two@example.com"]
@@ -196,7 +196,7 @@ class TestReplyTo:
         )
 
         assert payload["message"]["replyTo"] == [
-            {"recipient": {"emailAddress": {"address": "human@contoso.com"}}}
+            {"emailAddress": {"address": "human@contoso.com"}}
         ]
 
     def test_no_reply_to_means_the_key_is_absent(self) -> None:
