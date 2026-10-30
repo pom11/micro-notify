@@ -112,7 +112,26 @@ def get(account: str, *, runner: Runner | None = None) -> str:
         raise KeychainError("account must be a non-empty string")
     args = [SECURITY_BINARY, "find-generic-password", "-s", SERVICE, "-a", account, "-w"]
     result = _run(args) if runner is None else runner(args, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT)
-    return _check(result, account, "read").rstrip("\n")
+    return _decode_hex_dump(_check(result, account, "read").rstrip("\n"))
+
+
+def _decode_hex_dump(raw: str) -> str:
+    """Undo security(1)'s hex dump of values with non-printable bytes.
+
+    ``find-generic-password -w`` prints a value containing a newline (a PEM
+    private key) as one lowercase hex string instead of the text. Decode only
+    when the result is valid UTF-8 that itself contains a newline, which is the
+    reason security(1) hex-dumped it; a secret that merely looks like hex (an
+    uppercase certificate thumbprint) never decodes to that and is returned
+    unchanged.
+    """
+    if len(raw) % 2 or not raw or any(c not in "0123456789abcdef" for c in raw):
+        return raw
+    try:
+        decoded = bytes.fromhex(raw).decode("utf-8")
+    except ValueError:
+        return raw
+    return decoded if "\n" in decoded else raw
 
 
 def set_secret(account: str, value: str, *, runner: Runner | None = None) -> None:
