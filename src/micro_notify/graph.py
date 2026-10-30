@@ -35,7 +35,9 @@ ATTACH_CAP_EXCEEDS = "total attachment size"
 # Design section 3.1: one scope for app-only Graph access.
 GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
-AUTHORITY_TEMPLATE = "https://login.microsoftonline.com/{tenant_id}/v2.0"
+# msal appends /v2.0/.well-known/openid-configuration itself; a /v2.0 suffix
+# here doubles it and tenant discovery 404s.
+AUTHORITY_TEMPLATE = "https://login.microsoftonline.com/{tenant_id}"
 
 
 @dataclass(frozen=True)
@@ -45,7 +47,8 @@ class Attachment:
 
 
 def _recipient(address: str) -> dict:
-    return {"recipient": {"emailAddress": {"address": address}}}
+    # Graph recipient resource: {"emailAddress": {"address": ...}} with no wrapper.
+    return {"emailAddress": {"address": address}}
 
 
 def build_send_payload(
@@ -115,13 +118,19 @@ def acquire_token(mail: MailConfig) -> str:
     the client-credentials flow only runs on a cold cache. Any msal error
     (``invalid_client``, ``AADSTS...``) becomes :class:`AuthError` -> exit 4.
     """
-    app = msal.ConfidentialClientApplication(
-        client_id=mail.client_id,
-        # Evaluated before the constructor runs: a missing keychain item raises
-        # here, so msal is never constructed with half a credential.
-        client_credential=_client_credential(mail),
-        authority=AUTHORITY_TEMPLATE.format(tenant_id=mail.tenant_id),
-    )
+    # Evaluated before the constructor runs: a missing keychain item raises
+    # here, so msal is never constructed with half a credential.
+    credential = _client_credential(mail)
+    try:
+        app = msal.ConfidentialClientApplication(
+            client_id=mail.client_id,
+            client_credential=credential,
+            authority=AUTHORITY_TEMPLATE.format(tenant_id=mail.tenant_id),
+        )
+    except ValueError as exc:
+        # msal raises ValueError when tenant discovery fails (bad tenant id,
+        # bad authority, no network) — an auth failure, not a crash.
+        raise AuthError(f"Graph authority discovery failed ({exc})") from exc
     result = app.acquire_token_silent([GRAPH_SCOPE], account=None)
     if not result:
         result = app.acquire_token_for_client([GRAPH_SCOPE])

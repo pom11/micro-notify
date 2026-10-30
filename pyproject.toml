@@ -11,6 +11,9 @@ requires-python = ">=3.12"
 license = { text = "MIT" }
 dependencies = [
     "msal>=1.28",
+    # Certificate auth signs a JWT client assertion; recent msal no longer
+    # pulls cryptography in, so a pip/uv install could not sign it.
+    "cryptography>=42",
     "httpx>=0.27",
 ]
 

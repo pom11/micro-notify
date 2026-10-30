@@ -688,7 +688,7 @@ def test_send_test_payload_addresses_only_the_flag_recipient(
     assert run_doctor("--send-test", SEND_TARGET) == EXIT_OK
     body = json.loads(http_counter.requests[0].content.decode("utf-8"))
     assert body["message"]["toRecipients"] == [
-        {"recipient": {"emailAddress": {"address": SEND_TARGET}}}
+        {"emailAddress": {"address": SEND_TARGET}}
     ]
 
 

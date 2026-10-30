@@ -65,6 +65,31 @@ def test_get_builds_the_documented_argv_and_returns_stdout() -> None:
     assert runner.kwargs[0]["text"] is True
 
 
+def test_get_decodes_the_hex_dump_security_prints_for_multiline_values() -> None:
+    """security(1) -w prints a value containing a newline (a PEM key) as hex."""
+    # Multi-line canary; deliberately not a PEM header (the leak guard scans tests).
+    pem = "CANARY-KEY-LINE-1\nCANARYPRIVATEKEYBODYNOTAREALKEY\nCANARY-KEY-END\n"
+    runner = RecordingRunner([completed(0, pem.encode().hex() + "\n")])
+    secrets.set_runner(runner)
+    try:
+        assert secrets.get("graph.certificate_pem") == pem
+    finally:
+        secrets.set_runner(None)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["0123456789ABCDEF0123456789ABCDEF01234567", "deadbeef", "abc", "c0ffee00"],
+)
+def test_get_leaves_hex_looking_single_line_secrets_alone(value: str) -> None:
+    runner = RecordingRunner([completed(0, value + "\n")])
+    secrets.set_runner(runner)
+    try:
+        assert secrets.get("graph.certificate_thumbprint") == value
+    finally:
+        secrets.set_runner(None)
+
+
 def test_get_passes_no_shell_and_no_env_carrying_the_value() -> None:
     runner = RecordingRunner([completed(0, "v\n")])
     secrets.set_runner(runner)
