@@ -47,7 +47,8 @@ class Attachment:
 
 
 def _recipient(address: str) -> dict:
-    return {"recipient": {"emailAddress": {"address": address}}}
+    # Graph recipient resource: {"emailAddress": {"address": ...}} with no wrapper.
+    return {"emailAddress": {"address": address}}
 
 
 def build_send_payload(

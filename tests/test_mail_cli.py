@@ -65,7 +65,7 @@ def seed_cert(keychain) -> None:
 
 
 def addresses(recipients: list[dict]) -> list[str]:
-    return [r["recipient"]["emailAddress"]["address"] for r in recipients]
+    return [r["emailAddress"]["address"] for r in recipients]
 
 
 # --- Scriptable transport ---------------------------------------------------
