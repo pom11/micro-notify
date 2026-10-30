@@ -208,7 +208,7 @@ Module internals, card styling, CLI help wording, test layout, retry/backoff on 
 
 ## Amendment 2026-10-30 — delegated (as-a-person) mode
 
-Status: APPROVED by operator 2026-10-30. **Append-only.** Sections 1–9 above stand exactly as written and
+Status: Amendment direction approved by operator 2026-10-30; binding seams decided by orch. **Append-only.** Sections 1–9 above stand exactly as written and
 are not rewritten here. Where this text and a section above disagree, this amendment wins **only** for the
 delegated mode defined below; app-only behaviour is unchanged. *(amended 2026-10-30 per t_589877bf)*
 
@@ -219,7 +219,7 @@ Section 2 sets out one auth stance: app-only, certificate-backed, sending from `
 
 ```toml
 [mail]
-mode = "delegated"     # default "app-only"; "delegated" = send as the signed-in person
+mode = "delegated"     # default "app"; "delegated" = send as the signed-in person
 ```
 
 | | app-only (sections 1–9, unchanged) | delegated (this amendment) |
@@ -295,14 +295,19 @@ flow, which Entra classes as a *public client* flow, so that switch has to be **
 The switch belongs to the whole registration, and the operator runs both kinds of tenant configuration
 (the app-only one from §6 and the delegated one from here), so it is documented as a condition:
 
-| what the registration is used for | Allow public client flows |
+**One registration per tenant.** Bootstrap creates or reuses a single `micro-notify` registration in each
+tenant; delegated mode does not get its own app. `Allow public client flows` is therefore a **per-tenant
+setting**, not a per-registration choice: **Yes** in a tenant that runs delegated mode (required by the
+device-code flow), **No** in a tenant that runs app-only mode — and it is never flipped to Yes in an
+app-only tenant. Each tenant runs one mode, and the switch matches the mode.
+
+| what the tenant's registration is used for | Allow public client flows |
 | --- | --- |
-| app-only only (§6 as written) | **No** — keep it off; nothing in app-only mode needs it |
+| app-only (§6 as written) | **No** — keep it off; nothing in app-only mode needs it |
 | delegated mode (this amendment) | **Yes** — required; device-code sign-in fails closed without it |
 
-*(my call: keep these as two separate registrations rather than flipping one app to Yes, so an app-only
-deployment never carries an open public-client door. ADMIN-SETUP.md must present it as a choice the
-operator makes per tenant, not as a default, and it must state that the operator runs both.)*
+ADMIN-SETUP.md must present the switch as a per-tenant setting that follows the tenant's mode, not as a
+default to leave on.
 
 ### A.3 Constraints carried forward, unchanged
 
@@ -327,7 +332,7 @@ app-only send, and `guard.py` still runs **before** any token call or network ca
 
 - §3.4 keychain table gains one row: `graph.delegated_token_cache` | msal delegated token cache (access +
   refresh token) — a secret, `config show` prints presence only.
-- §3.4 config gains one key: `[mail] mode = "app-only" | "delegated"`, default `app-only`, so every
+- §3.4 config gains one key: `[mail] mode = "app" | "delegated"`, default `app`, so every
   existing config file keeps working untouched.
 - §4 CLI gains two commands. `mnotify login` — device-code sign-in: shows the code and URL once, writes the
   cache to the keychain, then prints the signed-in `upn` (never a token). `mnotify logout` — deletes that
