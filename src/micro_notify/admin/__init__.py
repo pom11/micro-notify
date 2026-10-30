@@ -28,6 +28,19 @@ Exchange scoped role, B4 Teams targets, B5 the ``admin bootstrap`` command itsel
     **not** re-exported here, because calling one directly skips the find-first
     rule that keeps a re-run from registering a second application.
 
+``admin/exo.py``
+    :func:`~micro_notify.admin.exo.ensure_exchange_scope` — the idempotent
+    Exchange Online scoping step: it generates the one PowerShell script that
+    grants ``Application Mail.Send`` to the service principal inside a
+    sender-only management scope, runs it once through the pwsh seam, and refuses
+    to report success unless the scope is *proven* (sender ``InScope True``
+    through our scope, signed-in admin ``InScope False``).
+    :func:`~micro_notify.admin.exo.plan_commands` is its dry-run surface: the
+    planned argv plus the script text, written by nobody. ``build_script`` and the
+    file/parse helpers stay module-level rather than being re-exported here, so a
+    caller cannot run the script while skipping the verification that
+    ``ensure_exchange_scope`` wraps around it.
+
 Two rules every module here inherits from the package root:
 
 * nothing in this package prompts, installs, writes a config entry or logs a
@@ -44,6 +57,11 @@ from .entra import (
     ensure_entra_app,
     find_app_id,
     find_service_principal_id,
+)
+from .exo import (
+    ExchangeError,
+    ExchangeProvisioning,
+    ensure_exchange_scope,
 )
 from .preflight import (
     CHECK_ORDER,
@@ -73,6 +91,8 @@ __all__ = [
     "DryRunRunner",
     "EntraError",
     "EntraProvisioning",
+    "ExchangeError",
+    "ExchangeProvisioning",
     "FAIL",
     "OK",
     "PreflightReport",
@@ -80,6 +100,7 @@ __all__ = [
     "WARN",
     "CheckResult",
     "ensure_entra_app",
+    "ensure_exchange_scope",
     "find_app_id",
     "find_service_principal_id",
     "get_runner",
