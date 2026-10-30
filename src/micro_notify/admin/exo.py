@@ -993,7 +993,14 @@ def parse_pwsh_output(
         if outcome == OUTCOME_CREATED:
             return StepOutcome(name=name, created=True, found=count_int)
         if outcome == OUTCOME_EXISTS:
-            return StepOutcome(name=name, created=False, found=max(count_int, 1))
+            # `exists` with a zero count is a transcript the script cannot produce,
+            # so it is reported rather than quietly repaired: one of the two is a
+            # lie, and "found it already" is the answer a re-run depends on.
+            if count_int < 1:
+                failures.append(
+                    f"the {name} step reported 'exists' while finding nothing"
+                )
+            return StepOutcome(name=name, created=False, found=count_int)
         failures.append(f"the {name} step reported outcome {outcome!r}, not created or exists")
         return StepOutcome(name=name, created=False, found=0)
 

@@ -157,7 +157,10 @@ def pwsh_lines(
         ("management_scope", scope),
         ("role_assignment", role),
     ):
-        lines.append(event(event=name, outcome=outcome, found=0 if outcome == "created" else 1))
+        # The script reports the enumeration count: 0 when it created the object,
+        # at least 1 when it found one. A `found` of 0 alongside `exists` is a
+        # transcript the script cannot produce, so the fake never emits one.
+        lines.append(event(event=name, outcome=outcome, found=1 if outcome == "exists" else 0))
     lines.append(
         event(
             event="authz",
@@ -1089,6 +1092,43 @@ def test_the_disconnect_is_guarded_by_the_connection_flag_and_not_a_constant() -
     assert block.index("if ($MnotifyConnected) {") < block.index("Disconnect-ExchangeOnline")
     flag_set = text.index("$MnotifyConnected = $true")
     assert text.index("Connect-ExchangeOnline -Device") < flag_set < text.index("} finally {")
+
+
+def test_exists_with_a_zero_count_is_reported_not_repaired() -> None:
+    """'Found it already' with a count of nothing is a transcript the script cannot
+    produce. Repairing it silently would let a step that actually found nothing
+    report exists - and a re-run's whole purpose is to trust that answer."""
+    lines = [ln for ln in pwsh_lines() if '"event":"management_scope"' not in ln]
+    lines.insert(-1, event(event="management_scope", outcome="exists", found=0))
+    result = parse_pwsh_output(capture_of(lines).lines, script=script())
+    assert result.ok is False
+    assert any("'exists' while finding nothing" in f for f in result.failures)
+    assert result.management_scope.found == 0  # reported as it came in
+
+
+def test_os_open_itself_is_asked_for_0600_not_just_the_final_chmod(
+    temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mode that closes the race is the one passed to ``os.open``, not the one
+    chmod sets afterwards. Between creation and chmod the file already holds the
+    tenant's object ids; ``O_EXCL`` creates it with this mode atomically, so a
+    loosened argument leaves a world-readable window that a final-mode assertion
+    cannot see — the later chmod makes the end state look correct.
+    """
+    seen: list[tuple[bool, int]] = []
+    real_open = os.open
+
+    def spy(path: Any, flags: int, mode: int = 0o777) -> int:
+        seen.append((bool(flags & (os.O_CREAT | os.O_EXCL)), mode))
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(exo.os, "open", spy)
+    path = write_script_file(script())
+    try:
+        creat_excl_modes = [m for excl, m in seen if excl]
+        assert creat_excl_modes == [0o600], [oct(m) for m in creat_excl_modes]
+    finally:
+        os.unlink(path)
 
 
 def test_the_generated_script_is_structurally_balanced() -> None:
