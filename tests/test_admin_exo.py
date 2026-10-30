@@ -51,6 +51,7 @@ from micro_notify.admin.exo import (
     plan_commands,
     run_pwsh,
     scope_name_for,
+    supports_streaming,
     write_script_file,
 )
 from micro_notify.admin.runner import STDERR_QUOTE_LIMIT, set_runner
@@ -609,6 +610,46 @@ def test_a_capturing_runner_still_feeds_the_device_code_line_to_the_sink() -> No
     assert DEVICE_CODE_LINE in echo.lines
     assert capture.device_code_seen is True
     assert result.returncode == 0
+
+
+def test_a_capturing_runner_warns_before_the_wait_not_after() -> None:
+    """An operator watching a silent terminal during a browser sign-in cannot tell
+    a hung process from a slow one. The fallback runner says up front that the
+    prompt will arrive late; the line still arrives either way."""
+    fake = FakePwsh()
+    echo = Echo()
+    capture = exo._RunCapture()
+    run_pwsh(["pwsh", "-File", "x.ps1"], capture, runner=fake, echo=echo)
+
+    assert echo.lines[0].startswith("mnotify:") and "instead of streaming" in echo.lines[0]
+    assert DEVICE_CODE_LINE in echo.lines  # still not swallowed
+    assert echo.lines.index(DEVICE_CODE_LINE) > 0
+
+
+def test_a_streaming_runner_is_never_warned_at() -> None:
+    """The warning is about a limitation the streaming path does not have."""
+    echo = Echo()
+    run_pwsh(["pwsh", "-File", "x.ps1"], exo._RunCapture(), runner=StreamingFakePwsh(), echo=echo)
+    assert not [ln for ln in echo.lines if "instead of streaming" in ln]
+
+
+def test_supports_streaming_reports_the_capability_of_the_installed_runner() -> None:
+    assert supports_streaming(FakePwsh()) is False
+    assert supports_streaming(StreamingFakePwsh()) is True
+    set_runner(StreamingFakePwsh())
+    assert supports_streaming() is True
+    set_runner(FakePwsh())
+    assert supports_streaming() is False
+
+
+def test_the_warning_goes_to_the_sink_not_into_the_parsed_lines() -> None:
+    """The heads-up is ours, not pwsh's: it must not end up in the transcript the
+    parser reads."""
+    capture = exo._RunCapture()
+    echo = Echo()
+    run_pwsh(["pwsh", "-File", "x.ps1"], capture, runner=FakePwsh(), echo=echo)
+    assert not [ln for ln in capture.lines if "instead of streaming" in ln]
+    assert any("instead of streaming" in ln for ln in echo.lines)
 
 
 def test_machine_readable_lines_are_parsed_not_re_printed() -> None:

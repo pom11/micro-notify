@@ -577,6 +577,18 @@ class _RunCapture:
             self.echoed.append(text)
 
 
+def supports_streaming(runner: CommandRunner | None = None) -> bool:
+    """Whether the installed runner can hand back lines as they arrive.
+
+    B5 can ask this **before** starting the step. It matters: a capturing runner
+    holds all output until pwsh exits, and the device-code flow waits for a human
+    to open a browser — so on a runner without streaming the operator would see
+    nothing at all for the whole wait. :func:`run_pwsh` warns through ``echo`` when
+    that is the case rather than hanging silently.
+    """
+    return callable(getattr(runner or get_runner(), "run_streaming", None))
+
+
 def run_pwsh(
     argv: Sequence[str],
     capture: _RunCapture,
@@ -589,9 +601,11 @@ def run_pwsh(
 
     A runner that offers ``run_streaming`` gets the ``on_line`` callback and the
     device-code prompt appears while pwsh waits. Anything else (including B1's
-    :class:`~micro_notify.admin.runner.SubprocessRunner`) gets ``run()`` and its
-    captured output is fed through the same sink afterwards — later, but never
-    dropped.
+    :class:`~micro_notify.admin.runner.SubprocessRunner`, which captures) gets
+    ``run()`` and its captured output is fed through the same sink afterwards —
+    later, but never dropped. Because "later" is after a human-scale wait, the
+    fallback says so out loud first: an operator watching a silent terminal during
+    a sign-in cannot tell a hung process from a slow one.
     """
     active = runner or get_runner()
     streamer = getattr(active, "run_streaming", None)
@@ -602,6 +616,12 @@ def run_pwsh(
             timeout=timeout,
         )
 
+    if echo is not None:
+        echo(
+            "mnotify: this pwsh runner captures output instead of streaming it, so "
+            "the device-code line will appear only after the sign-in finishes. "
+            "Nothing is wrong - open the page and enter the code when it appears."
+        )
     result = active.run([str(a) for a in argv])
     for line in _split(getattr(result, "stdout", None)):
         capture.feed(line, echo=echo)
@@ -1167,5 +1187,6 @@ __all__ = [
     "plan_commands",
     "run_pwsh",
     "scope_name_for",
+    "supports_streaming",
     "write_script_file",
 ]
