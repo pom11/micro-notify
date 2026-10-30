@@ -9,11 +9,16 @@ The key set below is the whole cross-module contract. Later modules read these
 attributes and must not need a new key; if one is missing that is a blocker on
 the scaffold card, not an edit to this file.
 
-    [mail]    tenant_id, client_id, sender, auth, default_reply_to
+    [mail]    tenant_id, client_id, sender, auth, mode, default_reply_to
     [allow]   domains = [], addresses = []      (empty => refuse everything)
     [limits]  max_recipients, daily_max, max_attach_mb
     [paths]   audit, state_dir                  (defaults under ~/Library)
-    [teams.targets.<name>]  kind = "channel" | "dm"
+    [teams.targets.<name>]  kind = "channel" | "dm" | "chat", chat_id (chat only)
+
+``mode`` and the ``chat`` target kind are the delegated-phase (as-a-person)
+schema declared up front (design amendment 2026-10-30, D1a) so later D-cards
+read these seams instead of editing this file. ``mode = "app"`` is the default:
+configs written before the amendment parse unchanged.
 
 :func:`load_config` raises :class:`ConfigError` (exit 2) on anything unusable.
 :func:`write_config` is the writer used by ``mnotify setup`` /
@@ -39,9 +44,20 @@ AUTH_CERTIFICATE = "certificate"
 AUTH_SECRET = "secret"
 AUTH_MODES = (AUTH_CERTIFICATE, AUTH_SECRET)
 
+# [mail] mode: "app" is today's app-only behaviour (design section 2); "delegated"
+# is the as-a-person mode added by the 2026-10-30 amendment. Declared here so the
+# delegated-phase cards (D1b..D4) never edit this file.
+MAIL_MODE_APP = "app"
+MAIL_MODE_DELEGATED = "delegated"
+MAIL_MODES = (MAIL_MODE_APP, MAIL_MODE_DELEGATED)
+
 KIND_CHANNEL = "channel"
 KIND_DM = "dm"
-TARGET_KINDS = (KIND_CHANNEL, KIND_DM)
+KIND_CHAT = "chat"
+TARGET_KINDS = (KIND_CHANNEL, KIND_DM, KIND_CHAT)
+# Kinds whose address lives in the config file (chat ids are not secrets; webhook
+# URLs stay keychain-only, design section 3.4).
+KINDS_WITH_CHAT_ID = (KIND_CHAT,)
 
 # Design section 3.3 / 3.4 defaults.
 DEFAULT_MAX_RECIPIENTS = 20
@@ -55,6 +71,24 @@ DEFAULT_STATE_DIR = "~/Library/Application Support/mnotify"
 # mode tight even when the caller does not ask for it.
 CONFIG_FILE_MODE = 0o600
 CONFIG_DIR_MODE = 0o700
+
+
+def mask_chat_id(chat_id: str) -> str:
+    """Reduce a Teams chat id to its last four characters for display.
+
+    Chat ids are not secrets (design amendment 2026-10-30 keeps them in the
+    config file), but ``mnotify config show`` prints an identifier in reduced
+    form the same way it already reduces other display-only identifiers, so a
+    terminal transcript or CI log does not carry a full conversation address.
+    A value with four or fewer characters has nothing safe left to show and
+    becomes the marker alone.
+    """
+    value = (chat_id or "").strip()
+    if not value:
+        return ""
+    if len(value) <= 4:
+        return "***"
+    return f"***{value[-4:]}"
 
 
 class ConfigError(UsageError):
@@ -79,6 +113,9 @@ class MailConfig:
     sender: str
     auth: str = AUTH_CERTIFICATE
     default_reply_to: str = ""
+    # Last field on purpose: every existing call site builds this positionally up
+    # to ``default_reply_to``, and an older config carries no ``mode`` at all.
+    mode: str = MAIL_MODE_APP
 
     def keychain_accounts(self) -> tuple[str, ...]:
         """Keychain accounts this mail config requires (design section 3.4).
@@ -122,6 +159,10 @@ class PathsConfig:
 class TeamTarget:
     name: str
     kind: str
+    # A Teams chat id (``19:...@thread.v2``). NOT a secret: unlike a Workflows
+    # webhook URL it carries no signature, so it lives in the config file
+    # (design amendment 2026-10-30). Empty for channel/dm targets.
+    chat_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -140,16 +181,30 @@ class Config:
         return None
 
     def keychain_accounts(self) -> tuple[str, ...]:
-        """Every keychain account this config expects, mail first, then teams."""
+        """Every keychain account this config expects, mail first, then teams.
+
+        Only webhook-backed kinds (channel/dm) carry a keychain account: a chat
+        target addresses the conversation through ``chat_id`` in this file and
+        sends via the delegated token, so requiring a ``teams:<name>`` secret for
+        it would be a phantom credential (design amendment 2026-10-30).
+        """
         names = list(self.mail.keychain_accounts())
-        names.extend(f"teams:{target.name}" for target in self.teams_targets)
+        names.extend(
+            f"teams:{target.name}"
+            for target in self.teams_targets
+            if target.kind not in KINDS_WITH_CHAT_ID
+        )
         return tuple(names)
 
     def as_dict(self) -> dict[str, Any]:
         """Plain-data view for ``mnotify config show``.
 
-        There are no secret fields in the config schema (design section 3.4), so
-        this is safe to print verbatim.
+        No key here holds a secret value (design section 3.4). The one key that
+        carries an address the operator may not want echoed in full — a Teams
+        chat id — is emitted already reduced to its last four characters, so
+        every consumer of this view (``config show`` human and ``--json``) is
+        masked without having to know the key exists. Use :attr:`teams_targets`
+        (or :meth:`target`) when the real chat id is needed.
         """
         return {
             "mail": {
@@ -157,6 +212,7 @@ class Config:
                 "client_id": self.mail.client_id,
                 "sender": self.mail.sender,
                 "auth": self.mail.auth,
+                "mode": self.mail.mode,
                 "default_reply_to": self.mail.default_reply_to,
             },
             "allow": {
@@ -173,7 +229,14 @@ class Config:
                 "state_dir": str(self.paths.state_dir),
             },
             "teams": {
-                "targets": {t.name: {"kind": t.kind} for t in self.teams_targets},
+                "targets": {
+                    t.name: (
+                        {"kind": t.kind, "chat_id": mask_chat_id(t.chat_id)}
+                        if t.chat_id
+                        else {"kind": t.kind}
+                    )
+                    for t in self.teams_targets
+                },
             },
         }
 
@@ -235,12 +298,21 @@ def _load_mail(data: Mapping[str, Any]) -> MailConfig:
     if auth not in AUTH_MODES:
         raise ConfigError(f"{where} auth must be one of: {', '.join(AUTH_MODES)}")
     reply_to = _require_str(table, "default_reply_to", where).strip() if "default_reply_to" in table else ""
+    # Absent `mode` is not a validation failure: every config written before the
+    # delegated amendment is an app-mode config, and it must parse unchanged.
+    mode = table.get("mode", MAIL_MODE_APP)
+    if not isinstance(mode, str):
+        raise ConfigError(f"{where} key 'mode' must be a string")
+    mode = mode.strip().lower()
+    if mode not in MAIL_MODES:
+        raise ConfigError(f"{where} mode must be one of: {', '.join(MAIL_MODES)}")
     return MailConfig(
         tenant_id=tenant_id,
         client_id=client_id,
         sender=sender,
         auth=auth,
         default_reply_to=reply_to,
+        mode=mode,
     )
 
 
@@ -290,12 +362,22 @@ def _load_teams(data: Mapping[str, Any]) -> tuple[TeamTarget, ...]:
     for name, table in targets.items():
         if not isinstance(table, dict):
             raise ConfigError(f"[teams.targets.{name}] must be a table")
-        kind = _require_str(table, "kind", f"[teams.targets.{name}]").strip().lower()
+        where = f"[teams.targets.{name}]"
+        kind = _require_str(table, "kind", where).strip().lower()
         if kind not in TARGET_KINDS:
-            raise ConfigError(
-                f"[teams.targets.{name}] kind must be one of: {', '.join(TARGET_KINDS)}"
-            )
-        loaded.append(TeamTarget(name=name, kind=kind))
+            raise ConfigError(f"{where} kind must be one of: {', '.join(TARGET_KINDS)}")
+        chat_id = table.get("chat_id", "")
+        if not isinstance(chat_id, str):
+            raise ConfigError(f"{where} key 'chat_id' must be a string")
+        chat_id = chat_id.strip()
+        # The chat address lives in the config file (it is not a secret), so a
+        # chat target without one is unusable; a channel/dm carrying one means
+        # the operator addressed the wrong thing.
+        if kind in KINDS_WITH_CHAT_ID and not chat_id:
+            raise ConfigError(f"{where} kind '{kind}' requires a non-empty chat_id")
+        if kind not in KINDS_WITH_CHAT_ID and chat_id:
+            raise ConfigError(f"{where} chat_id is only valid for kind {', '.join(KINDS_WITH_CHAT_ID)}")
+        loaded.append(TeamTarget(name=name, kind=kind, chat_id=chat_id))
     return tuple(sorted(loaded, key=lambda t: t.name))
 
 
@@ -359,6 +441,7 @@ def render_toml(config: Config) -> str:
         f"client_id = {_quote(config.mail.client_id)}",
         f"sender = {_quote(config.mail.sender)}",
         f"auth = {_quote(config.mail.auth)}",
+        f"mode = {_quote(config.mail.mode)}",
         f"default_reply_to = {_quote(config.mail.default_reply_to)}",
         "",
         "[allow]",
@@ -376,6 +459,10 @@ def render_toml(config: Config) -> str:
     ]
     for target in config.teams_targets:
         lines += ["", f"[teams.targets.{target.name}]", f"kind = {_quote(target.kind)}"]
+        if target.chat_id:
+            # A chat id is config data (design amendment 2026-10-30), not a keychain
+            # secret: it is written and read back verbatim.
+            lines.append(f"chat_id = {_quote(target.chat_id)}")
     return "\n".join(lines) + "\n"
 
 
@@ -408,12 +495,25 @@ def write_config(config: Config, path: str | os.PathLike[str] | None = None) -> 
 
 
 # --- Team-target mutation helpers (used by P4 `teams targets ...`) ---------
-def with_team_target(config: Config, name: str, kind: str) -> Config:
-    """Return a copy of ``config`` with target ``name`` set to ``kind``."""
+def with_team_target(config: Config, name: str, kind: str, chat_id: str = "") -> Config:
+    """Return a copy of ``config`` with target ``name`` set to ``kind``.
+
+    ``chat_id`` is carried verbatim (it is config data, not a secret) for kinds
+    that take one — see :data:`KINDS_WITH_CHAT_ID`. Callers that address a chat
+    pass it here so the target round-trips through :func:`write_config` and
+    :func:`load_config`.
+    """
     if kind not in TARGET_KINDS:
         raise ConfigError(f"team target kind must be one of: {', '.join(TARGET_KINDS)}")
+    chat_id = (chat_id or "").strip()
+    if kind in KINDS_WITH_CHAT_ID and not chat_id:
+        raise ConfigError(f"team target kind '{kind}' requires a non-empty chat_id")
+    if kind not in KINDS_WITH_CHAT_ID and chat_id:
+        raise ConfigError(
+            f"team target chat_id is only valid for kind {', '.join(KINDS_WITH_CHAT_ID)}"
+        )
     targets = [t for t in config.teams_targets if t.name != name]
-    targets.append(TeamTarget(name=name, kind=kind))
+    targets.append(TeamTarget(name=name, kind=kind, chat_id=chat_id))
     return _replace_targets(config, sorted(targets, key=lambda t: t.name))
 
 
@@ -447,7 +547,12 @@ __all__ = [
     "DEFAULT_MAX_RECIPIENTS",
     "DEFAULT_STATE_DIR",
     "KIND_CHANNEL",
+    "KIND_CHAT",
     "KIND_DM",
+    "KINDS_WITH_CHAT_ID",
+    "MAIL_MODES",
+    "MAIL_MODE_APP",
+    "MAIL_MODE_DELEGATED",
     "TARGET_KINDS",
     "AllowConfig",
     "Config",
@@ -458,6 +563,7 @@ __all__ = [
     "TeamTarget",
     "config_path",
     "load_config",
+    "mask_chat_id",
     "parse_config",
     "render_toml",
     "with_team_target",
