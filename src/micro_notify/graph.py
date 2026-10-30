@@ -28,13 +28,20 @@ import msal
 
 from . import AuthError, GuardRefusal, RemoteError
 from . import secrets
-from .config import AUTH_SECRET, MailConfig
+from .config import AUTH_SECRET, MAIL_MODE_DELEGATED, ConfigError, MailConfig
 
 ATTACH_CAP_EXCEEDS = "total attachment size"
 
 # Design section 3.1: one scope for app-only Graph access.
 GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+# Design amendment 2026-10-30 (delegated mode): the signed-in person's own mailbox,
+# addressed as ``/me``. The Graph sendMail doc lists ``POST /me/sendMail`` and
+# ``POST /users/{id | userPrincipalName}/sendMail`` as the two forms of the same
+# action, and the ``/me`` form has no sender in it at all — Graph resolves the sender
+# from the token. A delegated send therefore *cannot* be a send-as-other, whichever
+# way the config file is written.
+DELEGATED_SENDMAIL_URL = f"{GRAPH_BASE}/me/sendMail"
 # msal appends /v2.0/.well-known/openid-configuration itself; a /v2.0 suffix
 # here doubles it and tenant discovery 404s.
 AUTHORITY_TEMPLATE = "https://login.microsoftonline.com/{tenant_id}"
@@ -155,10 +162,17 @@ _GRAPH_CODE_CHARS = re.compile(r"^[A-Za-z][A-Za-z0-9_.]{0,63}$")
 
 @dataclass(frozen=True)
 class SendResult:
-    """What the caller needs for the design section 4 JSON and the audit line."""
+    """What the caller needs for the design section 4 JSON and the audit line.
+
+    ``sender`` is ``None`` on the app-only path — there the sender is always
+    ``[mail] sender`` and the caller already has it. A delegated send fills it with
+    the identity the token names (amendment 2026-10-30), which is the only value
+    that may be reported as the sender of that message.
+    """
 
     status_code: int
     request_id: str | None
+    sender: str | None = None
 
 
 class GraphRemoteError(RemoteError):
@@ -217,6 +231,41 @@ def _failure_detail(response: httpx.Response, request_id: str | None) -> str:
     return ", ".join(parts)
 
 
+def _delegated_send(mail: MailConfig) -> tuple[str, str]:
+    """The delegated mode's (token, sender) pair — amendment 2026-10-30.
+
+    Two rules, both resolved here rather than in the command so the send path is
+    the only place that knows them:
+
+    * the sender is **always** the identity the token names. ``delegation.whoami``
+      reads the keychain cache only, so this costs no round trip; if ``[mail]
+      sender`` is set and is not that identity, the request is refused as a
+      config error (exit 2) — a delegated ``/me/sendMail`` has no sender to put in
+      the URL, so Graph would silently send as the signed-in person and the
+      operator's config would be a lie. When ``sender`` is unset the token's UPN
+      simply is the sender.
+    * the token is the delegated one, from :func:`delegation.get_delegated_token`
+      (silent refresh, exit 4 plus ``run mnotify login`` when it cannot produce
+      one). Never the cert/secret client-credentials token.
+
+    Compared case-insensitively: a UPN's case is not meaningful to Entra, and an
+    operator who typed the address in another case has not asked for a different
+    mailbox.
+    """
+    # Function-local import: delegation.py imports this module for the authority
+    # template, so a module-level import here would be a cycle. Same shape as
+    # doctor's late import of the mail command, and it keeps both seams patchable.
+    from . import delegation
+
+    identity = delegation.whoami()
+    configured = (mail.sender or "").strip()
+    if configured and configured.lower() != identity.upn.lower():
+        raise ConfigError(
+            f"no send-as-other; remove sender or login as {identity.upn}"
+        )
+    return delegation.get_delegated_token(), identity.upn
+
+
 def send_mail(
     *,
     mail: MailConfig,
@@ -227,9 +276,22 @@ def send_mail(
 
     ``transport`` is the seam tests use (``httpx.MockTransport``); production
     leaves it None. The token is acquired once — retries reuse it.
+
+    Two modes, one payload builder and one retry policy (amendment 2026-10-30):
+
+    * ``mode = "app"`` (the default): ``POST /users/{sender}/sendMail`` with the
+      client-credentials token. Unchanged.
+    * ``mode = "delegated"``: ``POST /me/sendMail`` with the signed-in person's
+      token. Nothing but the URL, the token source and where the sender comes from
+      differs — see :func:`_delegated_send`.
     """
-    token = acquire_token(mail)
-    url = f"{GRAPH_BASE}/users/{quote(mail.sender, safe='')}/sendMail"
+    sender: str | None = None
+    if mail.mode == MAIL_MODE_DELEGATED:
+        token, sender = _delegated_send(mail)
+        url = DELEGATED_SENDMAIL_URL
+    else:
+        token = acquire_token(mail)
+        url = f"{GRAPH_BASE}/users/{quote(mail.sender, safe='')}/sendMail"
     headers = {
         "authorization": f"Bearer {token}",
         "content-type": "application/json; charset=utf-8",
@@ -248,7 +310,9 @@ def send_mail(
             request_id = response.headers.get("request-id")
             if response.status_code in SUCCESS_STATUSES:
                 return SendResult(
-                    status_code=response.status_code, request_id=request_id
+                    status_code=response.status_code,
+                    request_id=request_id,
+                    sender=sender,
                 )
             if not _retryable(response.status_code) or attempt == MAX_TRIES - 1:
                 raise GraphRemoteError(
