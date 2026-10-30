@@ -60,8 +60,11 @@ DELEGATED_SCOPES: tuple[str, ...] = (
 )
 
 # The single keychain account holding the serialised cache (A.2 / A.4). The value
-# of this constant is fixed by the orchestrator and must never be renamed.
-ACCOUNT_DELEGATED_CACHE = "graph.delegated_token_cache"
+# lives in secrets.py — the file that names every keychain account — and is re-exported
+# here because delegation.py is its only reader and `from micro_notify.delegation
+# import ACCOUNT_DELEGATED_CACHE` is what the commands and the docs quote. One literal,
+# two names; renaming it means amending A.4 first.
+ACCOUNT_DELEGATED_CACHE = secrets.ACCOUNT_DELEGATED_CACHE
 
 # What an operator who is stuck has to do. Kept as one constant so every refusal
 # names the same remedy.
