@@ -87,6 +87,8 @@ def read_text_argument(
 
 # Imported last, for the reason stated in the module docstring.
 from . import config_cmd, doctor, log, mail, setup, teams  # noqa: E402
+# Appended by the delegated-auth card (D1b): three subcommands, one module each.
+from . import login, logout, whoami  # noqa: E402
 
 # Order here is the order in `mnotify --help`.
 COMMAND_MODULES: tuple[ModuleType, ...] = (
@@ -96,6 +98,9 @@ COMMAND_MODULES: tuple[ModuleType, ...] = (
     doctor,
     log,
     config_cmd,
+    login,
+    logout,
+    whoami,
 )
 
 
