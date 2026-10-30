@@ -22,8 +22,9 @@ import time
 import msal
 import pytest
 
-from micro_notify import EXIT_AUTH, AuthError, delegation
-from micro_notify.config import MAIL_MODE_DELEGATED, MailConfig
+from micro_notify import EXIT_AUTH, AuthError, delegation, secrets
+from micro_notify.config import MAIL_MODE_DELEGATED, MailConfig, load_config
+from micro_notify.delegation import ACCOUNT_DELEGATED_CACHE
 from micro_notify.secrets import SERVICE
 
 # Placeholders only (design section 5): zero-GUIDs, contoso.com/example.com.
@@ -278,6 +279,30 @@ def test_cache_account_is_the_one_the_amendment_named() -> None:
     """A.4 fixes the keychain account name; doctor and docs cite it verbatim."""
     assert delegation.ACCOUNT_DELEGATED_CACHE == "graph.delegated_token_cache"
     assert SERVICE == "mnotify"
+
+
+def test_the_account_literal_lives_in_secrets_and_is_re_exported() -> None:
+    """One literal for the account name: secrets.py owns it, delegation re-exports it.
+
+    secrets.py is the file that names every keychain account (its docstring table is
+    the design section 3.4 list), so a second copy of the string here would be a
+    rename hazard — two places to change, one of which doctor could drift from.
+    """
+    assert secrets.ACCOUNT_DELEGATED_CACHE == "graph.delegated_token_cache"
+    assert delegation.ACCOUNT_DELEGATED_CACHE is secrets.ACCOUNT_DELEGATED_CACHE
+
+
+def test_app_only_configs_do_not_report_the_delegated_cache_as_missing() -> None:
+    """A machine that never signs in delegationally has nothing missing.
+
+    So the delegated account is deliberately *not* part of Config.keychain_accounts():
+    adding it would make `config show` and app-only `doctor` shout MISSING at every
+    existing install. The delegated presence check belongs to doctor's delegated-mode
+    checks (D4), reached only when [mail] mode says so.
+    """
+    config = load_config()
+    assert ACCOUNT_DELEGATED_CACHE not in config.keychain_accounts()
+    assert ACCOUNT_DELEGATED_CACHE not in config.mail.keychain_accounts()
 
 
 # --- login -------------------------------------------------------------------
