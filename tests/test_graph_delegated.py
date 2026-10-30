@@ -611,6 +611,12 @@ def audit_lines(cfg: Config) -> list[dict]:
     ]
 
 
+def foreign(local: str, *labels: str) -> str:
+    """A recipient outside the placeholder domains, assembled at runtime (as in
+    tests/test_mail_cli.py) so this tracked file carries no foreign address."""
+    return local + "@" + ".".join(labels) + "." + "net"
+
+
 class TestMailCommandInDelegatedMode:
     def test_success_is_audited_under_the_token_upn_and_spends_one_budget(
         self, delegated_cli_config, delegated, app_tripwire, mail_transport,
@@ -646,7 +652,7 @@ class TestMailCommandInDelegatedMode:
         sent = mail_transport()
 
         exit_code = cli.main(
-            ["mail", "send", "--to", "bob@notallowed.example", "--subject", "hi",
+            ["mail", "send", "--to", foreign("bob", "external"), "--subject", "hi",
              "--body", BODY_CANARY]
         )
 
@@ -731,17 +737,21 @@ class TestMailCommandInDelegatedMode:
 
     def test_dry_run_in_delegated_mode_needs_no_sign_in_and_reads_nothing(
         self, delegated_cli_config, app_tripwire, mail_transport, fake_keychain,
-        capsys,
+        capsys, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """--dry-run stops before the mode branch: no token, no whoami, no keychain
         (design §4), and the printed document is the exact payload (§3.1 shape)."""
         cfg = delegated_cli_config()
-        spy = DelegationStub()
         sent = mail_transport()
+
+        def forbidden(*_args, **_kwargs):
+            raise AssertionError("dry-run must not consult the delegated identity")
+
+        monkeypatch.setattr(delegation, "whoami", forbidden)
+        monkeypatch.setattr(delegation, "get_delegated_token", forbidden)
 
         assert cli.main(SEND + ["--dry-run"]) == EXIT_OK
 
-        assert spy.calls == 0 and spy.whoami_calls == []
         assert sent.calls == 0
         assert fake_keychain.audit == []
         printed = json.loads(capsys.readouterr().out)
@@ -765,6 +775,32 @@ class TestMailCommandInDelegatedMode:
         assert document["outcome"] == "sent"
         assert document["requestId"] == REQUEST_ID
         assert document["recipients"] == ["someone@example.com"]
+
+    def test_reported_sender_is_the_token_identity_not_the_config_value(
+        self, delegated_cli_config, delegated, app_tripwire, mail_transport,
+        fake_keychain, capsys, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Defensive pin on the direction of the fallback: whatever ``[mail] sender``
+        says, the sender written to the audit line and printed is the one
+        :func:`graph.send_mail` reports for the message that was actually sent."""
+        from micro_notify.commands import mail as mail_command
+
+        cfg = delegated_cli_config(sender="noreply@example.com")
+        mail_transport(ok202())
+        monkeypatch.setattr(
+            mail_command,
+            "send_mail",
+            lambda **_kwargs: graph.SendResult(
+                status_code=202, request_id=REQUEST_ID, sender=OTHER_PERSON
+            ),
+        )
+
+        assert cli.main(SEND) == EXIT_OK
+
+        assert audit_lines(cfg)[0]["sender"] == OTHER_PERSON
+        captured = capsys.readouterr()
+        assert OTHER_PERSON in captured.out
+        assert "noreply@example.com" not in captured.out
 
     def test_app_mode_cli_behaviour_is_unchanged(
         self, delegated_cli_config, msal_stub, cert_keychain, mail_transport,

@@ -8,7 +8,9 @@ Three separable pieces, so the pieces a test can exercise without the others:
   module attributes (never ``from ... import``) so the shared ``fake_keychain``
   fixture intercepts, and a failure names the *account*, never a value (§3).
 * :func:`send_mail` — one POST to ``/users/{sender}/sendMail`` with the retry
-  policy of design section 9.
+  policy of design section 9. In mail mode ``delegated`` (amendment 2026-10-30)
+  the same payload instead goes to ``/me/sendMail`` with the signed-in person's
+  token — see :func:`_delegated_send`; the app-only path below is unchanged.
 
 The msal and httpx imports are module-level attributes (``graph.msal``,
 ``graph.httpx``) precisely so tests can patch them at the call site.
