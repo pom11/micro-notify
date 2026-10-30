@@ -313,7 +313,7 @@ class TestCertificateToken:
             "thumbprint": CANARY_THUMBPRINT,
         }
         assert msal_stub.apps[0]["authority"] == (
-            "https://login.microsoftonline.com/" + PLACEHOLDER_TENANT + "/v2.0"
+            "https://login.microsoftonline.com/" + PLACEHOLDER_TENANT
         )
         # Read through the secrets module attributes so fake_keychain intercepts.
         assert seeded_keychain.audit == [
@@ -387,6 +387,26 @@ class TestTokenFailurePaths:
 
         assert excinfo.value.exit_code == EXIT_AUTH
         assert ACCOUNT_CERT_THUMBPRINT in excinfo.value.message
+        assert CANARY_PEM_BODY not in excinfo.value.message
+
+    def test_authority_discovery_failure_is_exit_4_not_a_traceback(
+        self, seeded_keychain, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """msal raises ValueError from its constructor when tenant discovery
+        fails (seen live with a doubled /v2.0 authority); that is an auth error."""
+
+        def _discovery_fails(**kwargs):
+            raise ValueError("OIDC Discovery failed. HTTP status: 404")
+
+        monkeypatch.setattr(
+            graph.msal, "ConfidentialClientApplication", _discovery_fails
+        )
+
+        with pytest.raises(AuthError) as excinfo:
+            graph.acquire_token(mail_config())
+
+        assert excinfo.value.exit_code == EXIT_AUTH
+        assert "discovery" in excinfo.value.message
         assert CANARY_PEM_BODY not in excinfo.value.message
 
     def test_missing_client_secret_is_exit_4_naming_the_account_only(
