@@ -374,10 +374,17 @@ def test_dry_run_runner_serves_longest_matching_prefix_response() -> None:
 
 
 def test_dry_run_runner_records_stdin_without_echoing_it() -> None:
+    """A secret belongs on stdin, and a dry run must not launder it into argv.
+
+    The PEM-looking value is assembled at runtime so this tracked file carries no
+    private-key header (the leak guard, design §5); the guard's own convention is
+    that positive-detection canaries are built by concatenation.
+    """
+    header = "-----BEGIN " + "PRIVATE KEY" + "-----"
     dry = DryRunRunner()
-    dry.run(["pwsh", "-Command", "x"], stdin="-----BEGIN PRIVATE KEY-----")
-    assert dry.stdin_payloads == ["-----BEGIN PRIVATE KEY-----"]
-    assert "BEGIN PRIVATE KEY" not in repr(dry.calls)
+    dry.run(["pwsh", "-Command", "x"], stdin=header)
+    assert dry.stdin_payloads == [header]
+    assert "PRIVATE KEY" not in repr(dry.calls)
 
 
 def test_dry_run_runner_can_script_a_failure() -> None:
