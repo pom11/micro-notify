@@ -88,6 +88,7 @@ def read_text_argument(
 # Imported last, for the reason stated in the module docstring.
 from . import config_cmd, doctor, log, mail, setup, teams  # noqa: E402
 from . import login, logout, whoami  # noqa: E402  # D1b: appended line, so this file stays deletion-free
+from . import admin  # noqa: E402  # B5: appended line, so this file stays deletion-free
 
 # Order here is the order in `mnotify --help`.
 COMMAND_MODULES: tuple[ModuleType, ...] = (
@@ -100,6 +101,7 @@ COMMAND_MODULES: tuple[ModuleType, ...] = (
     login,
     logout,
     whoami,
+    admin,
 )
 
 

@@ -616,3 +616,235 @@ the old certificate until that succeeds — Entra accepts several at once.
 | send **succeeds** for a mailbox outside the scope           | the tenant-wide Entra consent is still granted, or its cache has not expired. Step 3 is not finished.                             |
 | Teams post fails, exit 5, `HTTP 404`/`410`                  | the workflow was deleted or its URL rotated: recreate it and re-run `mnotify teams targets add`.                                  |
 | Teams post fails, exit 4, "no webhook URL stored"           | the target exists in config but its keychain account does not — `mnotify teams targets add <name> --kind <kind>`.                 |
+
+## The automated path — `mnotify admin bootstrap`
+
+Everything in steps 1 to 3 above is also runnable as one command:
+
+```sh
+mnotify admin bootstrap \
+  --sender noreply@example.com \
+  --allow-domain example.com
+```
+
+The manual path stays the reference, and this section does not replace it: read the
+steps you are about to automate, especially [2.4](#24-prove-the-scope-with-the-test-cmdlet)
+and [3.1](#31-why-this-step-exists). The command is the same procedure in the same
+order, with the portal clicks and the PowerShell pasting removed; what it *cannot*
+automate is named at the end of this section, and none of it is hidden.
+
+Run `mnotify admin bootstrap --help` for the flags, and read
+[`docs/design/…-design.md`](design/2026-10-27-micro-notify-design.md) §6 for why the
+order below is fixed.
+
+### The steps, in order
+
+| # | Step | What happens | Fails with |
+| - | ---- | ------------ | ---------- |
+| 1 | `preflight` | B1's six read-only checks: `az` on PATH, `az account show` (tenant id/name, signed-in UPN), `memberOf` role check, `pwsh` on PATH, `ExchangeOnlineManagement` present, sender mailbox resolvable. Nothing is written. | exit 2, naming each failing check |
+| 2 | `entra-app` | 1.1: find the `micro-notify` app registration **by exact display name**, create it only if absent; same for its service principal. | exit 2 on ambiguity (two same-named apps) |
+| 3 | `certificate` | 1.2 + 1.3: generate the key pair (private key to the keychain), upload the public half with `--append --end-date`, then **read the thumbprint back** from the app and compare it with the local one. | exit 2 on mismatch, exit 4 on a keychain problem |
+| 4 | `exchange-scope` | 2.1–2.4: one generated PowerShell script run through `pwsh`, doing service principal → management scope → role assignment → the `Test-ServicePrincipalAuthorization` proof for both mailboxes. | exit 2 if the proof does not hold |
+| 5 | `config` | Writes `[mail]` (`tenant_id`, `client_id`, `sender`, `auth = "certificate"`) and `[allow]` — the same keys `mnotify setup` writes. | exit 2 if the existing file says something else |
+| 6 | `doctor` | `mnotify doctor`, delegated, not re-implemented. | doctor's own exit code |
+
+Order is the contract, and step 5 deliberately comes last: the config advertises a
+capability (send as this mailbox) that only exists once step 4 has *proven* it. A
+config written before the proof would describe a tenant that cannot honour it, and
+`doctor` would still go green on the file alone.
+
+### Run the dry run first
+
+```sh
+mnotify admin bootstrap --sender noreply@example.com --allow-domain example.com --dry-run
+```
+
+It prints every `az` / `pwsh` command the real run would issue, one per line, executes
+nothing, and exits 0. From a fresh tenant:
+
+```
+# dry run: every line below is a command that WOULD run; nothing is executed
+az account show
+az account tenant list
+az rest --method GET --uri https://graph.microsoft.com/v1.0/me/memberOf
+pwsh -NoProfile -NonInteractive -Command Get-Module -ListAvailable ExchangeOnlineManagement | Select-Object -First 1 -ExpandProperty Version
+az ad user show --id noreply@example.com
+preflight: dryrun — read-only probes recorded, none executed
+az ad app list --display-name micro-notify
+az ad app create --display-name micro-notify --sign-in-audience AzureADMyOrg
+az ad sp list --filter appId eq '00000000-0000-0000-0000-000000000000'
+az ad sp create --id 00000000-0000-0000-0000-000000000000
+entra-app: dryrun — would report: created app registration and service principal micro-notify
+az ad app credential reset --id 00000000-0000-0000-0000-000000000000 --cert @<public-certificate-path> --append --end-date <certificate-not-after>
+certificate: dryrun — planned the upload; no key generated and nothing written to the keychain
+pwsh -NoProfile -NonInteractive -File <generated-script-path>
+…(the whole generated script is printed, so you can read it before you run it)…
+exchange-scope: dryrun — planned the script; no file written or run
+config: dryrun — no config file written
+doctor: skipped — nothing was changed, so nothing to verify
+```
+
+Two things a dry run cannot know, and says so instead of inventing:
+
+- **The ids are placeholders.** `<public-certificate-path>`, `<generated-script-path>`,
+  `<certificate-not-after>`, and the all-zero GUIDs are the documented stand-ins. On a
+  fresh tenant the plan shows the *creates*, because the canned answers say "not
+  found"; against a configured tenant it shows the reads that would find the objects.
+- **`doctor` is reported `skipped`, not green.** Nothing was changed, so there is
+  nothing to verify. A dry run reports a plan; it does not grade your tenant.
+
+The dry run also works with no `az`, no `pwsh` and no network — that is the point of
+reading the plan before you install anything.
+
+### The one step that needs you
+
+Step 4 signs in to Exchange Online with the **device code flow**, and `mnotify` does
+not do it for you:
+
+```
+mnotify: connecting to Exchange Online (device-code sign-in).
+To sign in, use a web browser to open the page https://example.com/devicelogin and enter the code WXYZ123 to authenticate.
+```
+
+Open that page, type the code, wait. The line above is printed the moment `pwsh`
+emits it, not when the script finishes: the real CLI runs `pwsh` through a streaming
+runner, because the sign-in is a wait and a prompt held back until the process exits
+is a prompt nobody can act on. If some other capturing runner is in effect, the
+command says so up front — so a silent screen is a waiting browser, not a dead
+process. `az login` and `Connect-ExchangeOnline` are never run on your behalf.
+
+### Flags
+
+| Flag | Meaning |
+| ---- | ------- |
+| `--sender ADDR` | required. The one mailbox the app may send from (1.1, 2.2) |
+| `--allow-domain DOMAIN` | repeatable. Written to `[allow]`. **The bootstrap refuses to finish with an empty allowlist** — with no allowed recipient every send exits 3, so a "successful" setup would be a broken one |
+| `--control-mailbox ADDR` | the negative control for 2.4. Must not be the sender. Default: the address `az` is signed in as |
+| `--install-missing` | offer to `brew install` what pre-flight found missing (`azure-cli`, `powershell`). Needs a `y` at a prompt; **refused outright with no terminal** |
+| `--force-config` | overwrite an existing config file that says something different |
+| `--dry-run` | print the plan, execute nothing, exit 0 |
+| `--json` | one machine-readable summary on stdout |
+| `--send-test ADDR` | one real test mail at the end, through the normal mail path (spends one unit of the daily cap) |
+
+About `--control-mailbox`: step 2.4 only proves the scope is narrow if a *second*
+mailbox comes back `InScope False`. An address that does not resolve also answers
+False, so the command resolves it to a real user mailbox first, and it refuses a
+sender/control pair that are the same mailbox. If `az` is signed in as the sender,
+pass `--control-mailbox` explicitly.
+
+### What it refuses, and with which exit code
+
+| Situation | Result |
+| --------- | ------ |
+| no `--allow-domain` at all (or `--allow-domain ""`) | exit 2 **before the first probe**, with the fix on the command line |
+| pre-flight failed | exit 2 naming each failing check (and `--install-missing` in the hint when a formula would fix it) |
+| `--install-missing` with no terminal | exit 2 saying so; `brew` is never reached |
+| you answer `n` (or EOF, or a closed pipe) | exit 2, nothing installed, nothing provisioned |
+| two app registrations named `micro-notify` | exit 2 naming the object ids; it never picks one |
+| the 2.4 proof does not hold | exit 2 — and the config is **not** written |
+| `--sender` equals `--control-mailbox` | exit 2 before anything is written |
+| existing config holds a different sender/allowlist | exit 2 unless `--force-config` |
+| `doctor` fails afterwards | doctor's own exit code (4 keychain/token, 3 guard, 5 remote, 6 daily cap) |
+
+### Re-running it is the normal thing to do
+
+The command looks before it creates at every step, so a re-run on a configured tenant
+reports `exists` for all of them and exits 0:
+
+```
+preflight: exists — all checks already pass
+entra-app: exists — found existing app registration and service principal for micro-notify
+certificate: exists — certificate AABBCCDDEEFF… is already uploaded; valid until 2099-01-01T00:00:00Z
+exchange-scope: exists — already present: service principal, scope mnotify-noreply and the Application Mail.Send assignment; scope verified for noreply@example.com
+config: exists — /Users/you/.config/mnotify/config.toml (unchanged)
+doctor: exists — checks green
+```
+
+"Exists" means no bytes were written, not a rewrite: the config file is left alone —
+including its modification time — when it already says what this run would say, and no
+certificate is generated, so the keychain is untouched. It is also safe after a
+partial failure: objects created before the failure are found, not duplicated.
+
+A rewrite that *is* needed keeps more than `mnotify setup --force` does. `bootstrap`
+owns `[mail]` and `[allow]` only; `[paths]`, the Teams targets **and `[limits]`** are
+carried over from the file that is there. `setup --force` resets `[limits]` to the
+defaults; a bootstrap re-run is routine maintenance, and quietly dropping your raised
+`daily_max` back to 200 during a run that only meant to re-check the tenant would be
+an unannounced downgrade.
+
+### `--json`
+
+```sh
+mnotify admin bootstrap --sender noreply@example.com --allow-domain example.com --json
+```
+
+stdout holds exactly one JSON document; the device-code line, `pwsh`'s output and
+doctor's own report are routed to stderr so the document stays parseable:
+
+```json
+{
+  "ok": true,
+  "exitCode": 0,
+  "steps": [
+    {"name": "preflight", "outcome": "exists", "detail": "all checks already pass"},
+    {"name": "entra-app", "outcome": "exists", "detail": "found existing app registration and service principal for micro-notify"},
+    {"name": "certificate", "outcome": "exists", "detail": "certificate AABBCCDDEEFF00112233445566778899AABBCCDD is already uploaded; valid until 2099-01-01T00:00:00Z"},
+    {"name": "exchange-scope", "outcome": "exists", "detail": "already present: service principal, scope mnotify-noreply and the Application Mail.Send assignment; scope verified for noreply@example.com"},
+    {"name": "config", "outcome": "exists", "detail": "/Users/you/.config/mnotify/config.toml (unchanged)"},
+    {"name": "doctor", "outcome": "exists", "detail": "checks green"}
+  ],
+  "sender": "noreply@example.com",
+  "allowDomains": ["example.com"],
+  "tenantId": "00000000-0000-0000-0000-000000000000",
+  "appId": "00000000-0000-0000-0000-000000000000",
+  "spObjectId": "ffffffff-ffff-ffff-ffff-ffffffffffff",
+  "thumbprint": "AABBCCDDEEFF00112233445566778899AABBCCDD",
+  "scopeName": "mnotify-noreply",
+  "controlMailbox": "admin@contoso.com",
+  "configPath": "/Users/you/.config/mnotify/config.toml",
+  "doctorExit": 0
+}
+```
+
+`outcome` is one of `created` (this run made the object), `exists` (it was already
+there; this run changed nothing), `dryrun` (planned and printed, not performed) or
+`skipped` (the step confirmed nothing — `doctor` reports `skipped` when it is not
+green, and its own report above the summary names the failing check). `ok: false` plus
+a non-zero `exitCode` means the same thing the exit code means: nothing here can read
+as success when it was not.
+
+### What this command never does
+
+- **It never grants an API permission and never grants admin consent.** Nothing in the
+  `az` calls it makes touches `requiredResourceAccess`, `appRoles` or a consent grant —
+  a tenant-wide grant is exactly what [3.1](#31-why-this-step-exists) exists to get rid
+  of, and a command that opened that door while claiming to narrow it would be the
+  failure mode this whole procedure is written against. If your tenant needs the
+  permission *declared* (1.4) before the Exchange role has force, do 1.4 by hand and
+  re-run the bootstrap: it is idempotent, and the re-run reports `exists` everywhere.
+- **It never signs you in.** No `az login`, no `Connect-ExchangeOnline`. The device-code
+  prompt is yours.
+- **It never installs silently.** `brew` runs only behind a `y` at a prompt naming the
+  formulae, and the flag is refused when there is no terminal to ask at.
+- **It never prints a secret.** No private key, no token, no webhook URL reaches
+  stdout, stderr, the config file or the `--json` document. What it prints is account
+  names, tenant ids, thumbprints and mailbox addresses — the values this document asks
+  you to verify by eye.
+- **`--dry-run` changes nothing at all** — not the tenant, not the keychain, not a file.
+  The two steps with a local half that bypasses the command runner (the key generation,
+  the temporary `.ps1`) refuse a recording runner by design and print their published
+  plan instead; replacing your private key during a run that promised to change nothing
+  is the bug that rule prevents.
+
+### After it finishes, still yours to do
+
+| Step | Why the command cannot do it |
+| ---- | ---------------------------- |
+| 1.4 / 3.2 | declaring and then removing the tenant-wide consent is a decision about your tenant's permissions, made in the portal by a human with the right to grant it |
+| 2.4's real proof (3.3, 3.4) | `doctor` can read the config and the keychain, but only a **real send** proves the scoped Exchange grant. `--send-test` is the shortest way to run 3.3; 3.4 (a mailbox outside the scope must be refused) still needs you to change the sender by hand |
+| Step 4 — Teams targets | each webhook URL is a secret typed at a hidden prompt: `mnotify teams targets add <name> --kind channel\|dm` |
+| Step 5 — the mailbox license | a licence assignment is a billing action |
+
+Finish with [Final verification](#final-verification). Expect `token: warn` there — as
+that section says, an absent roles claim is what a correctly hardened tenant's token
+looks like, and it is not a failure.
