@@ -100,17 +100,22 @@ class FakeAdminCli:
     def __init__(self, responses: dict[tuple[str, ...], str] | None = None) -> None:
         self.responses: dict[tuple[str, ...], str] = dict(responses or {})
         self.returncodes: dict[tuple[str, ...], int] = {}
+        self.stderr_messages: dict[tuple[str, ...], str] = {}
         self.calls: list[list[str]] = []
         self.stdin_payloads: list[str | None] = []
 
     # --- configuration ---------------------------------------------------
-    def set(self, prefix: tuple[str, ...], stdout: str, returncode: int = 0) -> None:
+    def set(
+        self, prefix: tuple[str, ...], stdout: str, returncode: int = 0, stderr: str = ""
+    ) -> None:
         self.responses[prefix] = stdout
         self.returncodes[prefix] = returncode
+        self.stderr_messages[prefix] = stderr
 
     def remove(self, prefix: tuple[str, ...]) -> None:
         self.responses.pop(prefix, None)
         self.returncodes.pop(prefix, None)
+        self.stderr_messages.pop(prefix, None)
 
     # --- CommandRunner ---------------------------------------------------
     def run(self, argv: Any, *, stdin: str | None = None) -> subprocess.CompletedProcess:
@@ -128,7 +133,7 @@ class FakeAdminCli:
             args,
             self.returncodes.get(best, 0),
             self.responses[best],
-            "",
+            self.stderr_messages.get(best, ""),
         )
 
     @property
@@ -394,6 +399,99 @@ def test_a_pwsh_that_cannot_list_modules_is_reported_not_swallowed(installed: An
     result = check_exchange_module(runner=cli)
     assert result.status == FAIL
     assert "exit 1" in result.detail
+
+
+# --- Live-run BUG 3: the probe must never reach the report as a Format-Table ---
+# On a real machine the probe used to let the ``System.Version`` object hit pwsh's
+# default formatter, so the operator saw the literal ANSI table:
+#   Major Minor Build Revision
+#   ----- ----- ----- --------
+#   3     10    1     -1
+# which the old parser collapsed into the single echoed line
+#   ExchangeOnlineManagement Major Minor Build Revision ----- 3 10 1 -1
+VERSION_TABLE_OUTPUT = (
+    "Major Minor Build Revision\n"
+    "----- ----- ----- --------\n"
+    "3     10    1     -1\n"
+)
+
+
+def test_a_powershell_version_table_is_rendered_as_a_clean_version(installed: Any) -> None:
+    """The reducer: the exact shape the operator saw must come out as ``3.10.1``."""
+    cli = healthy_cli(*GLOBAL)
+    cli.set(("pwsh", "-NoProfile"), VERSION_TABLE_OUTPUT)
+    result = check_exchange_module(runner=cli)
+    assert (result.name, result.status) == (CHECK_EXO_MODULE, OK)
+    assert result.detail == f"{EXO_MODULE} 3.10.1"
+
+
+def test_exchange_module_probe_asks_pwsh_to_render_the_version_as_text(installed: Any) -> None:
+    """The root cause is on the pwsh side: an unrendered Version object arrives
+    as a table, so the command itself must stringify it."""
+    cli = healthy_cli(*GLOBAL)
+    check_exchange_module(runner=cli)
+    command = cli.calls[-1][-1]
+    assert f"Get-Module -ListAvailable {EXO_MODULE}" in command
+    assert "ToString" in command  # Format-Table is what the fix removes
+    assert "Import-Module" not in command
+
+
+def test_multiple_installed_versions_report_the_highest_deterministically(installed: Any) -> None:
+    cli = healthy_cli(*GLOBAL)
+    cli.set(("pwsh", "-NoProfile"), "2.0.4\n3.10.1\n")  # lowest first on purpose
+    result = check_exchange_module(runner=cli)
+    assert result.status == OK
+    assert result.detail == f"{EXO_MODULE} 3.10.1"
+
+
+def test_multiple_versions_inside_a_table_also_report_the_highest(installed: Any) -> None:
+    cli = healthy_cli(*GLOBAL)
+    cli.set(
+        ("pwsh", "-NoProfile"),
+        "Major Minor Build Revision\n"
+        "----- ----- ----- --------\n"
+        "2     0     4     -1\n"
+        "3     10    1     -1\n",
+    )
+    result = check_exchange_module(runner=cli)
+    assert result.status == OK
+    assert result.detail == f"{EXO_MODULE} 3.10.1"
+
+
+def test_unparseable_probe_output_falls_back_to_installed_not_a_raw_echo(installed: Any) -> None:
+    """The check's real answer is presence; a version it cannot read must not be
+    echoed into the report the way the table was."""
+    cli = healthy_cli(*GLOBAL)
+    cli.set(("pwsh", "-NoProfile"), "pwsh: The term 'Get-Module' is not recognized\n")
+    result = check_exchange_module(runner=cli)
+    assert result.status == OK
+    assert result.detail == f"{EXO_MODULE} installed"
+    assert "recognized" not in result.detail
+
+
+def test_the_exchange_check_detail_is_never_more_than_one_line(installed: Any) -> None:
+    cli = healthy_cli(*GLOBAL)
+    cli.set(("pwsh", "-NoProfile"), VERSION_TABLE_OUTPUT)
+    result = check_exchange_module(runner=cli)
+    assert "\n" not in result.detail
+    assert result.detail.count("\r") == 0
+
+
+def test_a_failing_pwsh_contributes_its_exit_code_not_its_stderr(installed: Any) -> None:
+    """pwsh's stderr is a multi-record error dump; the report line carries the
+    exit code and the fix hint, never the dump."""
+    cli = healthy_cli(*GLOBAL)
+    cli.set(
+        ("pwsh", "-NoProfile"),
+        "",
+        returncode=1,
+        stderr="ModuleNotFound : Could not load 'C:\\Users\\admin\\secret-cache'\n" * 3,
+    )
+    result = check_exchange_module(runner=cli)
+    assert result.status == FAIL
+    assert "exit 1" in result.detail
+    assert "secret-cache" not in result.detail
+    assert "\n" not in result.detail
 
 
 # --- Check 6: the sender mailbox -------------------------------------------
