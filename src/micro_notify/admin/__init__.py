@@ -51,6 +51,16 @@ Two rules every module here inherits from the package root:
 
 from __future__ import annotations
 
+from .certupload import (
+    CertUploadError,
+    CertificateProvisioning,
+    UploadedCredential,
+    certificate_end_date,
+    ensure_certificate_credential,
+    keychain_thumbprint,
+    list_uploaded_credentials,
+    verify_uploaded,
+)
 from .entra import (
     EntraError,
     EntraProvisioning,
@@ -86,6 +96,8 @@ from .runner import (
 
 __all__ = [
     "CHECK_ORDER",
+    "CertUploadError",
+    "CertificateProvisioning",
     "CommandError",
     "CommandRunner",
     "DryRunRunner",
@@ -97,16 +109,22 @@ __all__ = [
     "OK",
     "PreflightReport",
     "SubprocessRunner",
+    "UploadedCredential",
     "WARN",
     "CheckResult",
+    "certificate_end_date",
+    "ensure_certificate_credential",
     "ensure_entra_app",
     "ensure_exchange_scope",
     "find_app_id",
     "find_service_principal_id",
     "get_runner",
+    "keychain_thumbprint",
+    "list_uploaded_credentials",
     "plan_installs",
     "run_json",
     "run_preflight",
     "set_runner",
+    "verify_uploaded",
     "which",
 ]
