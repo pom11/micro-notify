@@ -35,6 +35,8 @@ from typing import Any
 import pytest
 
 from micro_notify import EXIT_OK, EXIT_USAGE, cli
+from micro_notify.admin import exo as exo_module
+from micro_notify.admin import runner as admin_runner
 from micro_notify.commands import admin as admin_cmd
 from micro_notify.config import (
     AUTH_CERTIFICATE,
@@ -1248,6 +1250,138 @@ def test_doctor_is_really_delegated_not_reimplemented(
 
     monkeypatch.setattr(graph.msal, "ConfidentialClientApplication", lambda **kw: _App())
     assert run_admin("bootstrap", "--sender", SENDER, "--allow-domain", DOMAIN) == EXIT_OK
+
+
+# ===========================================================================
+# The real-machine runner (streaming + per-kind timeouts)
+# ===========================================================================
+class SentinelRunner(admin_runner.SubprocessRunner):
+    """A SubprocessRunner *subclass*: proves the swap is narrow, not broad."""
+
+
+def test_the_plain_default_runner_is_replaced_by_the_streaming_one() -> None:
+    """The real CLI (nobody installed a runner) must get the streaming runner, or
+    the Exchange step's device-code prompt is held until pwsh exits: the operator
+    never reads the code, the sign-in never completes, and the step can never
+    finish on a real machine."""
+    from micro_notify.admin.runner import SubprocessRunner
+
+    admin_cmd.set_runner(None)
+    assert isinstance(admin_cmd.admin_runner.get_runner(), SubprocessRunner)
+
+    admin_cmd._use_streaming_runner()
+    try:
+        runner = admin_cmd.admin_runner.get_runner()
+        assert isinstance(runner, admin_cmd.StreamingRunner)
+        # The seam B4 declared, and the check B4 publishes: with this runner
+        # installed the Exchange step no longer warns about a capturing runner.
+        assert callable(getattr(runner, "run_streaming", None))
+        assert exo_module.supports_streaming() is True
+    finally:
+        admin_cmd.set_runner(None)
+
+
+def test_an_installed_fake_runner_is_never_replaced(
+    fake_cli: FakeAdminCli,
+) -> None:
+    """The swap must not bypass an installed fake: that would send the flow to a
+    real ``az`` in a process that believes it is talking to a placeholder tenant —
+    and it would make this command untestable."""
+    admin_cmd._use_streaming_runner()
+    assert admin_cmd.admin_runner.get_runner() is fake_cli
+
+
+def test_a_subclass_of_the_default_runner_is_left_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A subclass is somebody else's runner (B1 documents subclassing through the
+    seam), so the identity check is exact, not `isinstance`."""
+    sentinel = SentinelRunner()
+    admin_cmd.set_runner(sentinel)
+    admin_cmd._use_streaming_runner()
+    assert admin_cmd.admin_runner.get_runner() is sentinel
+
+
+def test_the_timeout_budget_follows_the_command_not_the_caller() -> None:
+    """pwsh waits on a human typing a code into a browser and brew installs real
+    packages; a 60 s probe budget fits neither. az keeps its 60 s."""
+    runner = admin_cmd.StreamingRunner()
+    assert runner._budget(["pwsh", "-NoProfile", "-File", "x.ps1"]) == exo_module.PWSH_TIMEOUT
+    assert runner._budget(["powershell", "-File", "x.ps1"]) == exo_module.PWSH_TIMEOUT
+    assert runner._budget(["brew", "install", "azure-cli"]) == admin_cmd.BREW_TIMEOUT
+    assert runner._budget(["az", "account", "show"]) == admin_cmd.SUBPROCESS_TIMEOUT
+
+
+def test_run_streaming_hands_the_prompt_over_before_the_process_ends(
+    tmp_path: Path,
+) -> None:
+    """The behavioural pin for the failure this runner exists to prevent.
+
+    The child prints a device-code-shaped line and then waits for a file that only
+    the sink can create: if the prompt reaches ``on_line`` while pwsh is still
+    running, the child exits and the call returns 0. If output is captured until
+    exit instead, the child never sees the file and the call can only end in the
+    timeout (exit 124). A capturing runner therefore *cannot* pass this test — which
+    is exactly what "capturing" costs on a real machine.
+    """
+    gate = tmp_path / "gate"
+    seen: list[str] = []
+
+    def sink(line: str) -> None:
+        seen.append(line)
+        if "enter the code" in line:
+            gate.write_text("the operator saw the code", encoding="utf-8")
+
+    # Written as a file rather than `-c` so the child's argv carries no code literal.
+    child = tmp_path / "child.py"
+    child.write_text(
+        "import pathlib, sys, time\n"
+        "gate = pathlib.Path(sys.argv[1])\n"
+        "print('To sign in, open the page and enter the code WXYZ123', flush=True)\n"
+        "deadline = time.monotonic() + 20\n"
+        "while not gate.exists() and time.monotonic() < deadline:\n"
+        "    time.sleep(0.05)\n"
+        "sys.exit(0 if gate.exists() else 3)\n",
+        encoding="utf-8",
+    )
+
+    result = admin_cmd.StreamingRunner().run_streaming(
+        [sys.executable, "-u", str(child), str(gate)], on_line=sink, timeout=30.0
+    )
+    assert seen and "enter the code" in seen[0]
+    assert gate.exists(), "the sink never saw the prompt while the child was running"
+    assert result.returncode == 0, "streaming fell back to capture: the child timed out"
+
+
+def test_run_streaming_collects_the_whole_transcript_and_exit_code() -> None:
+    """B4 still reads the transcript back to decide whether the scope holds, and
+    reads a missing returncode as failure — so both must survive streaming."""
+    result = admin_cmd.StreamingRunner().run_streaming(
+        [sys.executable, "-c", "print('one'); print('two'); raise SystemExit(0)"],
+        on_line=None,
+        timeout=30.0,
+    )
+    assert result.returncode == 0
+    assert result.stdout.split() == ["one", "two"]
+
+
+def test_run_streaming_reports_a_timeout_as_124_not_as_success() -> None:
+    """A sign-in nobody completed must not read as a green step."""
+    result = admin_cmd.StreamingRunner().run_streaming(
+        [sys.executable, "-c", "import time; print('waiting'); time.sleep(30)"],
+        on_line=None,
+        timeout=1.0,
+    )
+    assert result.returncode == admin_cmd.admin_runner.EXIT_TIMEOUT
+    assert "timed out" in (result.stderr or "")
+
+
+def test_run_streaming_surfaces_a_missing_binary_as_127() -> None:
+    """The pre-flight's 'not installed' wording depends on this, not on a crash."""
+    result = admin_cmd.StreamingRunner().run_streaming(
+        ["definitely-not-a-real-binary-9f3a"], on_line=None, timeout=5.0
+    )
+    assert result.returncode == admin_cmd.admin_runner.EXIT_NOT_FOUND
 
 
 # ===========================================================================
