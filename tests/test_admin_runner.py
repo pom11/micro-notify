@@ -405,10 +405,15 @@ def test_dry_run_runner_is_a_drop_in_for_run_json() -> None:
 
 
 # --- StreamingRunner (moved in from the command layer, card B7) --------------
-# These four are the class's own pins and they travel with the class: what is being
+# These are the class's own pins and they travel with the class: what is being
 # exercised is the mechanism in this module, not a call site. The call-site pins —
 # that the real CLI ends up with this runner installed and a dry run never does —
 # stay in tests/test_admin_cli.py, where the command is.
+#
+# The two tests marked (B7) did not exist before the move: mutation probes on the
+# relocated class found the property unpinned (a mutant that ignores an explicit
+# timeout survived; a mutant that drops the package-root re-export survived), so
+# they close a pre-existing gap rather than test new behaviour.
 def test_the_timeout_budget_follows_the_command_not_the_caller() -> None:
     """pwsh waits on a human typing a code into a browser and brew installs real
     packages; a 60 s probe budget fits neither. az keeps its 60 s."""
@@ -417,6 +422,41 @@ def test_the_timeout_budget_follows_the_command_not_the_caller() -> None:
     assert runner._budget(["powershell", "-File", "x.ps1"]) == exo_module.PWSH_TIMEOUT
     assert runner._budget(["brew", "install", "azure-cli"]) == BREW_TIMEOUT
     assert runner._budget(["az", "account", "show"]) == SUBPROCESS_TIMEOUT
+
+
+def test_an_explicit_timeout_beats_the_per_binary_budget(monkeypatch: Any) -> None:
+    """(B7) The per-kind budget is the *default*, never an override.
+
+    A caller that passes ``timeout=`` knows something ``argv`` cannot show, and a
+    runner that quietly swapped in its own 600 s for pwsh would hang exactly the call
+    that was bounded on purpose. Pinned the way this module pins SubprocessRunner's
+    own timeout plumbing: the exec is faked and the keyword is read back.
+    """
+    captured: dict[str, Any] = {}
+
+    def fake_run(run_args: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        captured["timeout"] = kwargs.get("timeout")
+        return subprocess.CompletedProcess(list(run_args), 0, "", "")
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    StreamingRunner().run(["pwsh", "-File", "x.ps1"], timeout=1.0)
+    assert captured["timeout"] == 1.0  # not exo's PWSH_TIMEOUT
+    StreamingRunner().run(["pwsh", "-File", "x.ps1"])
+    assert captured["timeout"] == exo_module.PWSH_TIMEOUT  # the default still applies
+
+
+def test_the_package_root_re_exports_the_streaming_runner() -> None:
+    """(B7) ``micro_notify.admin.StreamingRunner`` must exist.
+
+    The move added it to the package's ``__all__`` append-only, and the package root is
+    the surface the rest of the codebase reads (same rule as ``ensure_entra_app``). A
+    dropped re-export is invisible to every test that imports the module directly, so
+    it is pinned at the root instead.
+    """
+    from micro_notify import admin
+
+    assert admin.StreamingRunner is runner_module.StreamingRunner
+    assert "StreamingRunner" in admin.__all__
 
 
 def test_run_streaming_collects_the_whole_transcript_and_exit_code() -> None:
