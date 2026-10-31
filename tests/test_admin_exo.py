@@ -1178,9 +1178,10 @@ def test_the_generated_script_is_structurally_balanced() -> None:
     text = script().text
     for opener, closer in (("{", "}"), ("(", ")"), ("[", "]")):
         assert text.count(opener) == text.count(closer), f"unbalanced {opener}{closer}"
-    # exactly one try/catch/finally chain, plus the nested try that protects the
-    # disconnect - no more, or a block has escaped its guard
-    assert text.count("try {") == 2 and text.count("} catch {") == 2 and text.count("} finally {") == 1
+    # three try/catch pairs: the outer run, the per-attempt connect wrap (the retry
+    # cannot see a terminating error otherwise), and the disconnect guard - plus
+    # exactly one finally, no more, or a block has escaped its guard
+    assert text.count("try {") == 3 and text.count("} catch {") == 3 and text.count("} finally {") == 1
     assert text.index("try {") < text.index("} catch {") < text.index("} finally {")
     assert "\nif ($MnotifyOk) { exit 0 } else { exit 1 }" in text
 
@@ -1343,3 +1344,427 @@ def test_the_authz_check_to_dict_is_self_explanatory() -> None:
     assert payload["passed"] is True and payload["problem"] == ""
     assert payload["expected_in_scope"] is False and payload["in_scope"] is False
     assert isinstance(check, AuthzCheck)
+
+
+# ===========================================================================
+# BUG 4 (live run B6, 2026-10-31): the transient Connect-ExchangeOnline death
+#
+# The operator's device-code sign-in finished and the Exchange step died with
+# ``pwsh exited 1; the script threw: Error while copying content to a stream.``
+# and NO rows for the SP / scope / role-assignment / InScope checks. That
+# message is a known TRANSIENT Connect-ExchangeOnline network failure - the
+# tenant was fine - and two things were wrong with how it was handled: the
+# connect was never retried, and "could not verify because the session died" was
+# reported exactly like "verification FAILED (scope wrong)", which sends the
+# operator hunting a config problem that does not exist.
+#
+# The vocabulary the fix adds (``verified``, ``reason``, ``connect_attempts``,
+# ``connect_failures``, ``REASON_CONNECT_TRANSIENT``, ``REASON_CONNECT_FAILED``,
+# ``REASON_SCRIPT_DIED``, ``REASON_CHECK_UNANSWERED``,
+# ``TRANSIENT_CONNECT_SIGNATURES``, ``is_transient_connect_error``) is reached
+# through ``exo.`` rather than imported, so the red phase fails per-test on the
+# missing behaviour instead of once at import time.
+# ===========================================================================
+
+DEAD_CONNECT_ERROR = "Error while copying content to a stream"
+
+
+def legacy_death_lines() -> list[str]:
+    """The transcript the live run actually produced, before any retry existed.
+
+    Two machine lines and nothing else: the connect failure event, the exception
+    the outer catch printed, no check rows, no summary. Exit code 1.
+    """
+    return [
+        "mnotify: connecting to Exchange Online (device-code sign-in).",
+        "mnotify: open the page and enter the code below when prompted.",
+        DEVICE_CODE_LINE,
+        event(
+            event="failure",
+            step="connect",
+            reason="Connect-ExchangeOnline -Device did not establish a session",
+        ),
+        event(event="error", reason=DEAD_CONNECT_ERROR),
+    ]
+
+
+def failed_attempt(attempt: int, *, transient: bool, error: str = DEAD_CONNECT_ERROR) -> str:
+    """One reported connect attempt that did not establish a session."""
+    return event(
+        event="connect_attempt",
+        attempt=attempt,
+        outcome="failed",
+        transient=transient,
+        error=error,
+    )
+
+
+def ok_attempt(attempt: int) -> str:
+    """One reported connect attempt that did."""
+    return event(event="connect_attempt", attempt=attempt, outcome="ok")
+
+
+def retry_death_lines(*, attempts: int = 2, transient: bool = True) -> list[str]:
+    """The same death from a script that retries: one ``connect_attempt`` per failed
+    attempt, then the giving-up event, still with no check rows."""
+    lines = [
+        "mnotify: connecting to Exchange Online (device-code sign-in).",
+        DEVICE_CODE_LINE,
+    ]
+    for attempt in range(1, attempts + 1):
+        lines.append(failed_attempt(attempt, transient=transient))
+    lines.append(
+        event(
+            event="connect_failed",
+            attempts=attempts,
+            transient=transient,
+            error=DEAD_CONNECT_ERROR,
+        )
+    )
+    lines.append(event(event="error", reason="mnotify: connect"))
+    return lines
+
+
+def retry_recovered_lines() -> list[str]:
+    """Attempt 1 transient, attempt 2 succeeds: the checks then run for real."""
+    lines = [DEVICE_CODE_LINE, failed_attempt(1, transient=True), ok_attempt(2)]
+    lines += [ln for ln in pwsh_lines() if ln.startswith(EVENT_PREFIX)]
+    return lines
+
+
+# --- (a) today's parser cannot tell the two failures apart ------------------
+def test_a_session_that_died_is_reported_as_could_not_verify_not_as_a_failed_check() -> None:
+    """The live transcript, pinned as the card states it.
+
+    Before the fix this transcript is indistinguishable from a wrong-scope verdict:
+    both came back ``ok=False`` with a message beginning "could not be verified". The
+    distinguishable state is what the CLI needs.
+    """
+    result = parse_pwsh_output(legacy_death_lines(), script=script())
+    assert result.ok is False, "a session that died is never a pass"
+    assert result.verified is False, "the checks never ran, so nothing was verified"
+    assert result.reason == exo.REASON_CONNECT_TRANSIENT, (
+        "the death message is in the transient list, so the report says re-run"
+    )
+    # No connect_attempt line exists in this transcript: the script that produced it
+    # had no retry to report. The parser reports what it saw, not what it expects.
+    assert result.connect_attempts == 0 and result.connect_failures == 0
+    assert result.sender_check.in_scope is None and result.admin_check.in_scope is None
+
+
+def test_a_script_that_died_somewhere_else_reports_script_died_not_a_connect_death() -> None:
+    """``could-not-verify`` is one state with several reasons: a connect that never
+    established, and a script that threw further along (here the negative-control
+    guard) both leave the restriction unproven, but only one of them is "re-run and it
+    may work".
+    """
+    lines = [ln for ln in pwsh_lines() if '"control":"admin"' not in ln]
+    lines.insert(
+        len(lines) - 1,
+        event(event="failure", step="negative_control", reason="not a user mailbox"),
+    )
+    lines.insert(len(lines) - 1, event(event="error", reason="mnotify: negative_control"))
+    result = parse_pwsh_output(lines, script=script())
+    assert result.ok is False
+    assert result.verified is False
+    assert result.reason == exo.REASON_SCRIPT_DIED
+    assert any("negative_control" in f for f in result.failures)
+
+
+def test_a_died_session_and_a_wrong_scope_verdict_are_now_distinguishable() -> None:
+    """The misdirection the operator hit: one report for two different facts.
+
+    ``sender_in_scope=True`` through scope ``Organization`` is a verification that RAN
+    and FAILED (a tenant-wide grant); the live death is a verification that NEVER RAN.
+    Same exit code, different sentence - and only the first one means "fix the scope".
+    """
+    died = parse_pwsh_output(legacy_death_lines(), script=script())
+    wrong_scope = parse_pwsh_output(
+        capture_of(
+            pwsh_lines(
+                sender_in_scope="True",
+                rows_extra_sender=(authz_row("True", scope="Organization"),),
+            )
+        ).lines,
+        script=script(),
+    )
+    assert died.ok is False and wrong_scope.ok is False  # both fail closed
+    assert died.verified is False and died.reason != ""
+    assert wrong_scope.verified is True and wrong_scope.reason == ""
+    assert "tenant-wide" in wrong_scope.sender_check.problem
+
+
+def test_a_check_that_did_not_run_can_never_read_as_a_pass() -> None:
+    """The B4 class of bug, extended: a True row with the wrong scope fails, and so
+    does a check whose rows are absent, empty, null or unparseable. A missing answer is
+    not a False answer and is never a pass."""
+    shapes = {
+        "the session died": legacy_death_lines(),
+        "no rows at all": [
+            ln for ln in pwsh_lines() if '"control":"sender"' not in ln
+        ] + [event(event="authz", control="sender", resource=SENDER, rows=[])],
+        "rows of null": [
+            ln for ln in pwsh_lines() if '"control":"admin"' not in ln
+        ] + [event(event="authz", control="admin", resource=ADMIN_MAILBOX, rows=None)],
+        "no authz event": [ln for ln in pwsh_lines() if '"control":"admin"' not in ln],
+    }
+    for label, lines in shapes.items():
+        result = parse_pwsh_output(lines, script=script())
+        assert result.ok is False, label
+        # The anti-pattern is the whole verification reading green. A control that
+        # really did answer may still pass on its own - what must never happen is
+        # both reading as passed while one of them was never answered.
+        assert not (result.sender_check.passed and result.admin_check.passed), label
+        unanswered = [
+            check for check in (result.sender_check, result.admin_check)
+            if check.in_scope is None
+        ]
+        assert unanswered, label
+        assert all(not check.passed for check in unanswered), label
+        assert result.verified is False, f"{label}: an absent check must not read as verified"
+
+
+# --- (1) the retry: one named list, one retry, non-transient gives up at once
+def test_the_transient_signature_list_names_the_live_error_verbatim() -> None:
+    """The operator's exact message is in the constant, not paraphrased: a rewrite of
+    the sentence would stop the retry working on the failure it was written for."""
+    assert DEAD_CONNECT_ERROR in " ".join(exo.TRANSIENT_CONNECT_SIGNATURES)
+    assert exo.is_transient_connect_error(f"Connect-ExchangeOnline: {DEAD_CONNECT_ERROR}")
+
+
+@pytest.mark.parametrize(
+    "text, transient",
+    [
+        (f"pwsh exited 1 — {DEAD_CONNECT_ERROR}", True),
+        ("The term 'Connect-ExchangeOnline' is not recognized as a name of a cmdlet", False),
+        ("AADSTS50126: Error validating credentials due to invalid username or password", False),
+        ("Sign-in was canceled by the user", False),
+        ("AADSTS700016: Application with identifier was not found in the directory", False),
+        ("The operation has timed out", True),
+        ("Unable to connect to the remote server", True),
+        (
+            "The underlying connection was closed: Could not establish trust relationship",
+            True,
+        ),
+        ("An error occurred while sending the request", True),
+        ("", False),
+    ],
+)
+def test_the_transient_classifier_retries_network_hiccups_and_only_those(
+    text: str, transient: bool
+) -> None:
+    """A sign-in denial must fail immediately: a second device-code prompt cannot turn
+    a denied consent into an accepted one, and it costs the operator another sign-in."""
+    assert exo.is_transient_connect_error(text) is transient
+
+
+def test_the_generated_script_retries_the_connect_once_and_never_more_than_once() -> None:
+    """One call site, a loop bounded by an explicit attempt count of two.
+
+    ``Connect-ExchangeOnline -Device`` is a device-code prompt: a loop that could run
+    three times would ask a human to sign in three times, so the bound is pinned as the
+    literal the loop reads rather than as a comment.
+    """
+    text = script().text
+    call_sites = [
+        ln for ln in text.splitlines() if ln.strip().startswith("Connect-ExchangeOnline -Device")
+    ]
+    assert len(call_sites) == 1, (
+        "two call sites would mean two device-code prompts in one run"
+    )
+    assert "$MnotifyConnectTries = 2" in text
+    assert "$MnotifyAttempt -le $MnotifyConnectTries" in text, (
+        "the retry loop is not bounded by the attempt count"
+    )
+    loop_at = text.index("for ($MnotifyAttempt = 1;")
+    assert loop_at < text.index("Connect-ExchangeOnline -Device"), (
+        "the connect must sit inside the retry loop, not before it"
+    )
+    assert "Start-Sleep" in text[loop_at:], (
+        "an immediate re-attempt hits the same network blip"
+    )
+    # The retry branch must actually skip the give-up path: without `continue` a
+    # first failed attempt would emit the 'both attempts' failure and throw before
+    # attempt 2 ever ran - the retry would exist on paper only.
+    retry_branch = text[text.index("if ($MnotifyAttempt -lt $MnotifyConnectTries) {") :]
+    retry_branch = retry_branch[: retry_branch.index("        }")]
+    assert "continue" in retry_branch, "the retry branch must skip the give-up path"
+
+
+def test_the_powershell_classifier_checks_permanent_markers_before_transient_ones() -> None:
+    """AADSTS text carries network-shaped words, so a script that matched the
+    transient list first would re-prompt a refused sign-in. The Python classifier is
+    pinned by the parametrized matrix; this pins the script's copy of the same rule."""
+    text = script().text
+    fn = text[text.index("function Test-MnotifyTransient {") :]
+    fn = fn[: fn.index("\n}", fn.index("return $false"))]
+    permanent = fn.index("foreach ($MnotifyMarker in $MnotifyPermanent)")
+    transient = fn.index("foreach ($MnotifySignature in $MnotifyTransient)")
+    assert permanent < transient
+
+
+def test_the_connect_loop_is_followed_by_a_not_connected_belt() -> None:
+    """No write cmdlet may run on a session that was never established.
+
+    Every failing path in the loop throws, so the belt is unreachable today - which
+    is exactly why a pin is the only thing keeping it there: a future edit that
+    softens one throw (or adds a `break`) would otherwise route an unauthenticated
+    run straight into New-ServicePrincipal.
+    """
+    text = script().text
+    loop_end = text.index("Connect-ExchangeOnline -Device")
+    belt = text.index("if (-not $MnotifyConnected) {", loop_end)
+    finally_at = text.index("} finally {")
+    assert belt < finally_at, "the belt must sit inside the try, before the writes are reachable"
+    assert text.index("New-ServicePrincipal") > belt
+    segment = text[belt: belt + 300]
+    assert "throw" in segment, "the belt must stop the run, not log and continue"
+
+
+def test_the_generated_script_gives_up_without_a_second_sign_in_on_a_non_transient_error() -> None:
+    """Structural pin for "any NON-transient error fails immediately": the transient
+    test and its throw sit inside the loop, before the retry notice is reachable."""
+    text = script().text
+    loop_body = text[text.index("for ($MnotifyAttempt = 1;") :]
+    gate = loop_body.index("if (-not $MnotifyAttemptTransient) {")
+    throw = loop_body.index("throw", gate)
+    retry_notice = loop_body.index("retrying the connect once", gate)
+    assert gate < throw < retry_notice, (
+        "the non-transient path must throw before the retry notice is reachable"
+    )
+    # The reason reaches the parser twice over before the throw: the per-attempt
+    # line (emitted before the gate, for every failed attempt) and the giving-up
+    # line (emitted inside the gate, before the throw that ends the run).
+    assert "connect_attempt" in loop_body[:gate], (
+        "the failed attempt must be reported before the give-up gate"
+    )
+    assert gate < loop_body.index("connect_failed") < throw, (
+        "giving up on a non-transient error must still report why to the parser"
+    )
+
+
+def test_the_generated_script_emits_the_transient_list_from_the_one_python_constant() -> None:
+    """The list lives in Python once and is written into the script; a script holding
+    its own copy would drift from the classifier that labels the report."""
+    text = script().text
+    assert "$MnotifyTransient = @(" in text
+    for signature in exo.TRANSIENT_CONNECT_SIGNATURES:
+        assert f"'{signature}'" in text, signature
+    assert "Test-MnotifyTransient" in text
+
+
+# --- (2) could-not-verify: distinct report, same fail-closed -----------------
+def test_both_attempts_transient_reports_could_not_verify_and_still_fails_closed(
+    temp_dir: Path,
+) -> None:
+    """The card's case (c): non-zero, config NOT written, and a sentence that names the
+    session death rather than a scope problem."""
+    fake = FakePwsh(retry_death_lines(attempts=2), returncode=1)
+    with pytest.raises(ExchangeError) as excinfo:
+        ensure_exchange_scope(APP_ID, SP_OBJECT_ID, SENDER, ADMIN_MAILBOX, runner=fake)
+
+    carried = excinfo.value.result
+    assert carried is not None
+    assert carried.ok is False, "could-not-verify is STILL a bootstrap failure"
+    assert carried.verified is False
+    assert carried.reason == exo.REASON_CONNECT_TRANSIENT
+    assert carried.connect_attempts == 2 and carried.connect_failures == 2
+    assert excinfo.value.exit_code == 2, "still exit 2: distinct reporting, same safety"
+    assert list(temp_dir.iterdir()) == [], "the generated script must still be deleted"
+    assert DEAD_CONNECT_ERROR in excinfo.value.message, "the pwsh error must be quoted"
+    assert "re-run" in excinfo.value.message
+    assert "verification failed" not in excinfo.value.message
+    assert "NOT a scope" in excinfo.value.message
+
+
+def test_a_transient_death_json_is_self_reporting_for_the_command_layer() -> None:
+    """``--json`` must carry the distinction too: an agent reading the document gets
+    the same two facts the terminal shows, and ``ok`` stays false either way."""
+    result = parse_pwsh_output(retry_death_lines(attempts=2), script=script())
+    payload = result.to_dict()
+    assert payload["ok"] is False and payload["verified"] is False
+    assert payload["reason"] == exo.REASON_CONNECT_TRANSIENT
+    assert payload["could_not_verify"] is True
+    assert payload["connect_attempts"] == 2 and payload["connect_failures"] == 2
+    assert json.dumps(payload)
+
+
+def test_a_first_transient_that_recovered_is_a_green_run_with_the_retry_visible(
+    temp_dir: Path,
+) -> None:
+    """The card's case (b): attempt 1 transient, the script retried, attempt 2
+    connected, the checks ran. The result is ok, and the retry is visible in it so a
+    tenant that keeps being flaky is still diagnosable."""
+    fake = StreamingFakePwsh(retry_recovered_lines())
+    result = ensure_exchange_scope(
+        APP_ID, SP_OBJECT_ID, SENDER, ADMIN_MAILBOX, runner=fake
+    )
+    assert result.ok is True and result.verified is True and result.reason == ""
+    assert result.connect_attempts == 2 and result.connect_failures == 1
+    assert result.sender_check.passed and result.admin_check.passed
+    assert list(temp_dir.iterdir()) == []
+
+
+def test_a_non_transient_connect_death_names_the_reason_and_not_a_retry() -> None:
+    """A denied sign-in must not be dressed up as "the network hiccuped, re-run": the
+    reason says the connect failed, the attempts stop at one, and the error is quoted."""
+    result = parse_pwsh_output(
+        retry_death_lines(attempts=1, transient=False), script=script()
+    )
+    assert result.ok is False and result.verified is False
+    assert result.reason == exo.REASON_CONNECT_FAILED
+    assert result.connect_attempts == 1 and result.connect_failures == 1
+    assert result.connected is False
+
+
+def test_a_died_session_raises_the_could_not_verify_sentence_not_the_failed_one(
+    temp_dir: Path,
+) -> None:
+    """The other half of the misdirection fix, at the raise: the transcript the operator
+    actually got must produce the re-run sentence with the pwsh error quoted, and must
+    not read like a scope verdict."""
+    fake = FakePwsh(legacy_death_lines(), returncode=1)
+    with pytest.raises(ExchangeError) as excinfo:
+        ensure_exchange_scope(APP_ID, SP_OBJECT_ID, SENDER, ADMIN_MAILBOX, runner=fake)
+    message = excinfo.value.message
+    assert DEAD_CONNECT_ERROR in message
+    assert "could not be verified" in message
+    assert "re-run" in message
+    assert "verification failed" not in message
+    assert excinfo.value.result.verified is False
+
+
+def test_a_reported_connect_death_overrules_a_connected_claim() -> None:
+    """The belt on the belt: if the script says the connect gave up, the run is not
+    trusted even when the same transcript also claims a session.
+
+    A truthful script cannot emit both lines - `connected` only follows a successful
+    attempt - so a transcript carrying both is broken or forged, and either way the
+    checks after the death cannot be believed.
+    """
+    lines = [
+        event(event="connect_attempt", attempt=1, outcome="failed", transient=True, error=DEAD_CONNECT_ERROR),
+        event(event="connect_failed", attempts=2, transient=True, error=DEAD_CONNECT_ERROR),
+        event(event="connected"),  # contradicts the death above
+    ] + [ln for ln in pwsh_lines() if ln.startswith(EVENT_PREFIX)]
+    result = parse_pwsh_output(lines, script=script())
+    assert result.ok is False
+    assert result.verified is False, "a death the script itself reported wins"
+    assert result.reason == exo.REASON_CONNECT_TRANSIENT
+    assert any("connect giving up" in f for f in result.failures)
+
+
+def test_a_wrong_scope_still_uses_the_failed_verification_sentence(temp_dir: Path) -> None:
+    """The distinction cuts both ways: a scope that really is wrong must not be softened
+    into "could not verify, just re-run", because re-running cannot fix a tenant-wide
+    grant."""
+    fake = FakePwsh(
+        pwsh_lines(
+            sender_in_scope="True", rows_extra_sender=(authz_row("True", scope="Organization"),)
+        )
+    )
+    with pytest.raises(ExchangeError) as excinfo:
+        ensure_exchange_scope(APP_ID, SP_OBJECT_ID, SENDER, ADMIN_MAILBOX, runner=fake)
+    assert "verification failed" in excinfo.value.message
+    assert "could not be verified" not in excinfo.value.message
+    assert excinfo.value.result.verified is True

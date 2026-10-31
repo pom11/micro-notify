@@ -135,6 +135,85 @@ DEVICE_CODE_RE = re.compile(
     r"(?:enter the code|device code|to sign in, use a web browser)", re.IGNORECASE
 )
 
+# --- Why a verification did not come out proven (BUG 4, live run 2026-10-31) --
+#
+# The live bootstrap died *after* the device-code sign-in with pwsh exit 1 and
+# "Error while copying content to a stream" — a known transient
+# Connect-ExchangeOnline network failure, tenant healthy — and the report said
+# "scoping could not be verified", the same sentence a genuinely wrong scope
+# produces. Two different facts, one sentence, and the operator spent the
+# evening hunting a config problem that did not exist.
+#
+# ``verified`` answers the prior question — did the checks run at all? — and
+# ``reason`` says why they did not. Fail-closed is unchanged either way:
+# ``ok=False`` and exit 2 for every value here; only the *reporting* differs.
+REASON_CONNECT_TRANSIENT = "connect-transient"  # the network blipped: re-run
+REASON_CONNECT_FAILED = "connect-failed"        # re-running will not help
+REASON_SCRIPT_DIED = "script-died"              # threw before answering
+REASON_CHECK_UNANSWERED = "check-unanswered"    # a check came back 'Not Run'
+
+# The one list of what counts as a transient connect failure. The generated
+# script's retry gate and the Python-side classifier both read it, so the retry
+# decision and the report cannot drift apart. The first entry is the live B6
+# death, verbatim: paraphrasing it would silently disable the retry for the
+# exact failure the list was written for.
+TRANSIENT_CONNECT_SIGNATURES: tuple[str, ...] = (
+    "Error while copying content to a stream",
+    "The operation has timed out",
+    "Unable to connect to the remote server",
+    "Unable to read data from the transport connection",
+    "The underlying connection was closed",
+    "An error occurred while sending the request",
+    "A task was canceled",
+    "No such host is known",
+    "The request was aborted",
+    "Unable to load the service index for source",
+)
+
+# What a *non*-transient failure looks like: a consent or directory answer that a
+# second sign-in cannot change. Checked first, because AADSTS text can and does
+# carry network-shaped words ("The remote server returned an error"), and
+# re-prompting a device code for a refused consent costs the operator a second
+# sign-in to reach the same "no".
+_NONTRANSIENT_CONNECT_MARKERS: tuple[str, ...] = (
+    "aadsts",
+    "sign-in",
+    "sign in",
+    "signin",
+    "unauthorized",
+    "invalid_user_pass",
+    "access denied",
+    "authentication failed",
+)
+
+
+def is_transient_connect_error(text: str) -> bool:
+    """Whether a Connect-ExchangeOnline failure reads as a network hiccup worth one retry."""
+    if not text:
+        return False
+    folded = text.casefold()
+    if any(marker in folded for marker in _NONTRANSIENT_CONNECT_MARKERS):
+        return False
+    return any(signature.casefold() in folded for signature in TRANSIENT_CONNECT_SIGNATURES)
+
+
+def _transient_array() -> list[str]:
+    """The PowerShell literals for :data:`TRANSIENT_CONNECT_SIGNATURES` and the
+    non-transient markers.
+
+    Both lists live in Python once and are written into the script, so the retry
+    gate on the tenant and :func:`is_transient_connect_error` — the classifier that
+    labels the report — cannot disagree about what "transient" means.
+    """
+    def quoted(values: Iterable[str]) -> str:
+        return ", ".join("'" + value.replace("'", "''") + "'" for value in values)
+
+    return [
+        f"$MnotifyTransient = @({quoted(TRANSIENT_CONNECT_SIGNATURES)})",
+        f"$MnotifyPermanent = @({quoted(_NONTRANSIENT_CONNECT_MARKERS)})",
+    ]
+
+
 # A mailbox address: local part, one @, dotted host with an alphabetic TLD. This
 # character set has no quote, no dollar, no backtick, no space, no semicolon and
 # no newline, which is what lets the script put the value in a single-quoted
@@ -282,6 +361,86 @@ def _ps(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+# The connect, with one retry. Kept beside the generator rather than inline so the
+# block that has to stay structurally balanced is one readable unit.
+#
+# Why a nested try is needed: ``$ErrorActionPreference = 'Stop'`` is what makes a
+# ``Get-*`` failure a failure rather than a silent empty answer, and it also means a
+# Connect-ExchangeOnline that throws a *terminating* exception skips the ``$Error.Count``
+# check entirely and lands in the outer catch — which is exactly how the live B6 run
+# ended. A retry that cannot see a terminating error retries nothing, so the attempt is
+# wrapped and its exception message is what the transient gate reads.
+#
+# Why the retry is here and not in Python: every ``Connect-ExchangeOnline -Device`` is a
+# fresh device-code prompt for a human to type, so a second pwsh process would ask the
+# operator to sign in again for a failure that costs nothing to repeat in-process.
+_CONNECT_BLOCK: tuple[str, ...] = (
+    "    # --- 0. connect: the device-code prompt must reach the terminal now, not later.",
+    "    Write-MnotifyLine 'mnotify: connecting to Exchange Online (device-code sign-in).'",
+    "    Write-MnotifyLine 'mnotify: open the page and enter the code below when prompted.'",
+    # Two attempts, no more: each attempt is a device-code prompt for a human.
+    "    $MnotifyConnectTries = 2",
+    "    $MnotifyConnectError = ''",
+    "    for ($MnotifyAttempt = 1; $MnotifyAttempt -le $MnotifyConnectTries; $MnotifyAttempt++) {",
+    "        $MnotifyErrBefore = $Error.Count",
+    "        $MnotifyAttemptFailed = $false",
+    "        $MnotifyAttemptError = ''",
+    "        try {",
+    "            Connect-ExchangeOnline -Device -ShowBanner:$false *>&1 | ForEach-Object { Write-MnotifyLine \"$_\" }",
+    "        } catch {",
+    "            # The terminating form of the failure: the message is the only thing",
+    "            # that says which error it was, and it is the only thing we report.",
+    "            $MnotifyAttemptFailed = $true",
+    "            $MnotifyAttemptError = \"$($_.Exception.Message)\"",
+    "        }",
+    "        if ($Error.Count -gt $MnotifyErrBefore) {",
+    "            $MnotifyAttemptFailed = $true",
+    "            $MnotifyNewErrors = @($Error | Select-Object -Skip $MnotifyErrBefore | ForEach-Object { \"$_\" })",
+    "            $MnotifyAttemptError = \"$MnotifyAttemptError $($MnotifyNewErrors -join ' ')\"",
+    "        }",
+    "        if (-not $MnotifyAttemptFailed -and -not (Get-ConnectionInformation)) {",
+    "            # The cmdlet answered and no session exists: that is a failed connect",
+    "            # with no error text, not a successful one with an odd shape.",
+    "            $MnotifyAttemptFailed = $true",
+    "            $MnotifyAttemptError = \"$MnotifyAttemptError no Exchange Online session exists after the sign-in\"",
+    "        }",
+    "        if (-not $MnotifyAttemptFailed) {",
+    "            Write-MnotifyEvent @{ event = 'connect_attempt'; attempt = $MnotifyAttempt; outcome = 'ok' }",
+    "            $MnotifyConnected = $true",
+    "            break",
+    "        }",
+    "        $MnotifyAttemptTransient = Test-MnotifyTransient $MnotifyAttemptError",
+    "        Write-MnotifyEvent @{ event = 'connect_attempt'; attempt = $MnotifyAttempt; outcome = 'failed'; transient = $MnotifyAttemptTransient; error = $MnotifyAttemptError }",
+    "        $MnotifyConnectError = $MnotifyAttemptError",
+    "        if (-not $MnotifyAttemptTransient) {",
+    "            # A refused sign-in answers 'no' twice. Re-prompting costs the operator",
+    "            # another browser dance to reach the same answer, so it does not happen.",
+    "            Write-MnotifyEvent @{ event = 'connect_failed'; attempts = $MnotifyAttempt; transient = $false; error = $MnotifyAttemptError }",
+    "            Write-MnotifyEvent @{ event = 'failure'; step = 'connect'; reason = 'the sign-in was refused; retrying cannot change that answer' }",
+    "            $MnotifyOk = $false",
+    "            throw 'mnotify: connect (not transient)'",
+    "        }",
+    "        if ($MnotifyAttempt -lt $MnotifyConnectTries) {",
+    "            Write-MnotifyLine 'mnotify: the Exchange session dropped on a transient network error; retrying the connect once.'",
+    "            Start-Sleep -Seconds 3",
+    "            continue",
+    "        }",
+    "        Write-MnotifyEvent @{ event = 'connect_failed'; attempts = $MnotifyAttempt; transient = $true; error = $MnotifyAttemptError }",
+    "        Write-MnotifyEvent @{ event = 'failure'; step = 'connect'; reason = 'both connect attempts dropped the session; this is a transient network failure, not a scope problem' }",
+    "        $MnotifyOk = $false",
+    "        throw 'mnotify: connect'",
+    "    }",
+    "    if (-not $MnotifyConnected) {",
+    "        # The loop throws on every path that fails to connect; this is the belt that",
+    "        # keeps 'not connected' from reaching the write cmdlets if the loop changes.",
+    "        $MnotifyOk = $false",
+    "        throw 'mnotify: connect'",
+    "    }",
+    "    Write-MnotifyEvent @{ event = 'connected' }",
+)
+
+
+
 @dataclass(frozen=True)
 class ExchangeScript:
     """The generated script plus everything needed to run or print it.
@@ -372,6 +531,9 @@ def build_script(
         f"$MnotifyAdmin      = {_ps(checked_admin)}",
         f"$MnotifyScope      = {_ps(scope)}",
         f"$MnotifyRole       = {_ps(MANAGEMENT_ROLE)}",
+        # One transient-signature list, in Python, written into the script: the retry
+        # gate and the report classifier read the same words. See TRANSIENT_CONNECT_SIGNATURES.
+        *_transient_array(),
         "",
         "function Write-MnotifyLine {",
         "    param([string]$Text)",
@@ -387,23 +549,27 @@ def build_script(
         "    Write-MnotifyEvent @{ event = 'failure'; step = $Step; reason = $Reason }",
         "    throw \"mnotify: $Step\"",
         "}",
+        "function Test-MnotifyTransient {",
+        "    param([string]$Text)",
+        "    # One list, generated from TRANSIENT_CONNECT_SIGNATURES in Python: the",
+        "    # retry gate here and the report label there cannot drift apart. The",
+        "    # permanent markers are tested first - AADSTS text often carries",
+        "    # network-shaped words, and a refused sign-in must never be retried.",
+        "    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }",
+        "    foreach ($MnotifyMarker in $MnotifyPermanent) {",
+        "        if ($Text -like \"*$MnotifyMarker*\") { return $false }",
+        "    }",
+        "    foreach ($MnotifySignature in $MnotifyTransient) {",
+        "        if ($Text -like \"*$MnotifySignature*\") { return $true }",
+        "    }",
+        "    return $false",
+        "}",
         "$script:MnotifyPrefix = 'MNOTIFY:'",
         "$MnotifyConnected = $false",
         "$MnotifyOk = $true",
         "",
         "try {",
-        "    # --- 0. connect: the device-code prompt must reach the terminal now, not later.",
-        "    Write-MnotifyLine 'mnotify: connecting to Exchange Online (device-code sign-in).'",
-        "    Write-MnotifyLine 'mnotify: open the page and enter the code below when prompted.'",
-        "    $MnotifyErrBefore = $Error.Count",
-        "    Connect-ExchangeOnline -Device -ShowBanner:$false *>&1 | ForEach-Object { Write-MnotifyLine \"$_\" }",
-        "    if ($Error.Count -gt $MnotifyErrBefore -or -not (Get-ConnectionInformation)) {",
-        "        Write-MnotifyEvent @{ event = 'failure'; step = 'connect'; reason = 'Connect-ExchangeOnline -Device did not establish a session' }",
-        "        $MnotifyOk = $false",
-        "        throw 'mnotify: connect'",
-        "    }",
-        "    $MnotifyConnected = $true",
-        "    Write-MnotifyEvent @{ event = 'connected' }",
+        *_CONNECT_BLOCK,
         "",
         "    # --- 1. Get-before-New: the Exchange-side service principal object.",
         "    $MnotifySp = @(Get-ServicePrincipal | Where-Object { \"$($_.AppId)\" -eq $MnotifyAppId })",
@@ -634,6 +800,80 @@ def _split(text: str | None) -> list[str]:
     if not text:
         return []
     return text.splitlines()
+
+
+def _quote(text: str, limit: int = STDERR_QUOTE_LIMIT) -> str:
+    """One error line, whitespace-flattened and bounded, safe to put in a message.
+
+    The same bound ``admin/runner.py`` uses for stderr: enough for the cmdlet's own
+    diagnosis, short enough that a stack dump or a token blob cannot ride along into
+    the terminal or the ``--json`` document.
+    """
+    flat = " ".join(str(text or "").split())
+    if len(flat) > limit:
+        flat = flat[:limit].rstrip() + "..."
+    return flat
+
+
+# The operator-facing sentence for each could-not-verify reason. Distinct reporting,
+# same safety: every one of these still exits 2 and still leaves the config unwritten.
+# What differs is the next action the operator should take — which is exactly the thing
+# the live B6 run got wrong, and sent a healthy tenant being re-audited for a scope
+# problem that did not exist.
+COULD_NOT_VERIFY_HINTS: dict[str, str] = {
+    REASON_CONNECT_TRANSIENT: (
+        "the Exchange Online session dropped on a transient network error, so the "
+        "scope checks never ran. This is NOT a scope problem — re-run "
+        "`mnotify admin bootstrap`; a repeat of the same error means the network or "
+        "the Exchange endpoint, not this tenant's configuration"
+    ),
+    REASON_CONNECT_FAILED: (
+        "the Exchange Online sign-in was refused, so the scope checks never ran. "
+        "This is NOT a scope problem, and re-running will not change the answer — "
+        "fix the sign-in (account, consent, or the Exchange module) first"
+    ),
+    REASON_SCRIPT_DIED: (
+        "the verification script threw before it could test the scope, so the "
+        "restriction is unproven. This is NOT a scope problem — re-run, and read the "
+        "quoted PowerShell error if it repeats"
+    ),
+    REASON_CHECK_UNANSWERED: (
+        "the authorization checks were asked and did not answer ('Not Run', or no "
+        "rows), so the restriction is unproven. This is NOT a scope problem — re-run; "
+        "a check that did not answer can never be read as a pass"
+    ),
+}
+
+
+def _failure_message(provisioning: ExchangeProvisioning) -> str:
+    """The one sentence the bootstrap raises with, chosen by *state*, not by exit code.
+
+    Two shapes, because they describe different worlds. ``verified=True`` means the
+    checks ran and the answer was wrong: the scope really is broken and re-running is
+    a waste of a sign-in. ``verified=False`` means no check got an answer: the correct
+    advice is "re-run", and saying "verification failed" instead misdirects the
+    operator to the tenant's configuration.
+    """
+    detail = "; ".join(provisioning.failures)
+    if provisioning.verified:
+        return "Exchange Online scoping verification failed: " + (detail or "no reason reported")
+    hint = COULD_NOT_VERIFY_HINTS.get(
+        provisioning.reason,
+        "the scope checks never produced an answer, so nothing about the scope is proven",
+    )
+    message = "Exchange Online scoping could not be verified — " + hint
+    if provisioning.connect_attempts:
+        message += (
+            f" (connect attempts: {provisioning.connect_attempts}, "
+            f"failed: {provisioning.connect_failures})"
+        )
+    if provisioning.connect_error:
+        message += f"; pwsh reported: {provisioning.connect_error}"
+    if detail:
+        message += f". Details: {detail}"
+    return message
+
+
 
 
 def write_script_file(script: ExchangeScript) -> str:
@@ -871,6 +1111,15 @@ class ExchangeProvisioning:
     ``InScope True`` through our scope, and the admin control came back ``InScope
     False``. ``created`` is True when this run made at least one object, so a
     re-run on a configured tenant reports ``exists`` for every step and exits 0.
+
+    ``verified`` answers a question ``ok`` cannot: did the checks *run*? A tenant
+    whose session died mid-run and a tenant whose scope is genuinely wrong both
+    come back ``ok=False``, and telling them apart is the difference between
+    "re-run it" and "fix the scope" — the live B6 run was the first and was
+    reported like the second. ``reason`` names which state this is (see the
+    ``REASON_*`` constants); ``""`` means the checks answered and only the
+    verdict was wrong. ``ok`` is False for every state here: the distinction is
+    in the reporting, never in the safety.
     """
 
     sender: str
@@ -888,6 +1137,11 @@ class ExchangeProvisioning:
     device_code_surfaced: bool = False
     ok: bool = True
     failures: tuple[str, ...] = ()
+    verified: bool = True
+    reason: str = ""
+    connect_attempts: int = 0
+    connect_failures: int = 0
+    connect_error: str = ""
 
     @property
     def created(self) -> bool:
@@ -899,6 +1153,11 @@ class ExchangeProvisioning:
     @property
     def outcome(self) -> str:
         return OUTCOME_CREATED if self.created else OUTCOME_EXISTS
+
+    @property
+    def could_not_verify(self) -> bool:
+        """The verification never ran to an answer — still a failure, a different sentence."""
+        return not self.verified
 
     @property
     def steps(self) -> tuple[StepOutcome, ...]:
@@ -931,6 +1190,12 @@ class ExchangeProvisioning:
             "outcome": self.outcome,
             "detail": self.detail,
             "ok": self.ok,
+            "verified": self.verified,
+            "could_not_verify": self.could_not_verify,
+            "reason": self.reason,
+            "connect_attempts": self.connect_attempts,
+            "connect_failures": self.connect_failures,
+            "connect_error": self.connect_error,
             "steps": [step.to_dict() for step in self.steps],
             "checks": [self.sender_check.to_dict(), self.admin_check.to_dict()],
             "connected": self.connected,
@@ -938,6 +1203,7 @@ class ExchangeProvisioning:
             "device_code_surfaced": self.device_code_surfaced,
             "failures": list(self.failures),
         }
+
 
 
 def parse_pwsh_output(
@@ -999,8 +1265,64 @@ def parse_pwsh_output(
     if not disconnected:
         failures.append("the script exited without disconnecting Exchange Online")
 
+    # --- the connect, as reported per attempt (BUG 4) -----------------------
+    # The retried script reports every attempt; the parser counts what it SAW and
+    # never assumes what it expects: a transcript from before the retry (or from a
+    # script that died even earlier) carries no attempt lines, and inventing
+    # "attempt 1 of 2 failed" for it would report a retry that never happened.
+    connect_attempts = 0
+    connect_failures = 0
+    for attempt_event in by_event.get("connect_attempt", []):
+        connect_attempts += 1
+        if str(attempt_event.get("outcome") or "").strip().casefold() == "failed":
+            connect_failures += 1
+    connect_gave_up = by_event.get("connect_failed", [])
+    # The transient verdict for the death: the script's own label when it emitted
+    # one, otherwise the same classifier on the quoted error text. A death the
+    # script never reported as a connect failure keeps no verdict here — the
+    # reason below comes from where the script actually died.
+    connect_transient: bool | None = None
+    if connect_gave_up:
+        last = connect_gave_up[-1]
+        if isinstance(last.get("transient"), bool):
+            connect_transient = bool(last["transient"])
+        else:
+            connect_transient = is_transient_connect_error(str(last.get("error") or ""))
+
+    # Where the death was reported, and what text names it. The pre-retry script
+    # only ever said `step = 'connect'` plus one exception line, so both shapes
+    # have to yield the same diagnosis. The exception event is preferred over the
+    # failure event's reason because it carries the real pwsh error text; the
+    # operator gets it quoted, so the quote has to be the most specific line the
+    # transcript holds, not the generic one.
+    connect_failure_events = [
+        failure
+        for failure in by_event.get("failure", [])
+        if str(failure.get("step") or "").strip().casefold() == "connect"
+    ]
+    connect_died = bool(connect_gave_up) or bool(connect_failure_events)
+    error_texts = [str(error.get("reason") or "") for error in by_event.get("error", [])]
+    connect_error_text = str(connect_gave_up[-1].get("error") or "") if connect_gave_up else ""
+    if not connect_error_text:
+        connect_error_text = " ".join(t for t in error_texts if t)
+    if not connect_error_text and connect_failure_events:
+        connect_error_text = str(connect_failure_events[-1].get("reason") or "")
+    if connect_transient is None and connect_died:
+        connect_transient = is_transient_connect_error(
+            " ".join([connect_error_text, *error_texts])
+        )
+    if connect_died:
+        # The script itself says the connect gave up. Whatever else the transcript
+        # claims - even a `connected` line, which a truthful script never emits
+        # alongside this - the run reported its own death and cannot be trusted.
+        failures.append(
+            "the script reported the Exchange connect giving up, so this run "
+            "cannot be trusted"
+        )
+
     def one_step(name: str, event: str) -> StepOutcome:
         found = by_event.get(event, [])
+
         if not found:
             failures.append(f"no result was reported for the {name}")
             return StepOutcome(name=name, created=False, found=0)
@@ -1064,6 +1386,38 @@ def parse_pwsh_output(
         if check.problem:
             failures.append(check.problem)
 
+    # --- did the checks get to answer at all? (BUG 4) -----------------------
+    #
+    # ``ok`` says the proof did not hold; this says whether the proof RAN. A session
+    # that died and a scope that is genuinely wrong are different facts about the
+    # world and need different sentences, because only one of them is fixed by
+    # re-running. Fail-closed is identical for every reason below: ok stays False.
+    reported_controls = {
+        str(event.get("control") or "") for event in by_event.get("authz", [])
+    }
+    checks_ran = CONTROL_SENDER in reported_controls and CONTROL_ADMIN in reported_controls
+    answered = all(check.in_scope is not None for check in checks.values())
+    if not connected or connect_died:
+        # No session, or the connect gave up: nothing after it could have been proven,
+        # whatever else the transcript claims.
+        verified = False
+        reason = REASON_CONNECT_TRANSIENT if connect_transient else REASON_CONNECT_FAILED
+    elif not checks_ran:
+        # Connected, then the script threw before a control was tested: the
+        # restriction is unproven, and re-running may or may not help - the quoted
+        # exception is what the operator has to go on.
+        verified = False
+        reason = REASON_SCRIPT_DIED
+    elif not answered:
+        # Both controls were asked and at least one came back with no usable InScope
+        # ('Not Run', an empty row set, rows of null). The B4 rule, extended to the
+        # absent answer: a check that did not answer can never read as a pass.
+        verified = False
+        reason = REASON_CHECK_UNANSWERED
+    else:
+        verified = True
+        reason = ""
+
     ok = not failures
     return ExchangeProvisioning(
         sender=script.sender,
@@ -1081,7 +1435,13 @@ def parse_pwsh_output(
         device_code_surfaced=device_code_seen,
         ok=ok,
         failures=tuple(failures),
+        verified=verified,
+        reason=reason,
+        connect_attempts=connect_attempts,
+        connect_failures=connect_failures,
+        connect_error=_quote(connect_error_text),
     )
+
 
 
 # --- The step itself --------------------------------------------------------
@@ -1158,15 +1518,18 @@ def ensure_exchange_scope(
         )
 
     if not provisioning.ok:
-        raise ExchangeError(
-            "Exchange Online scoping could not be verified: "
-            + "; ".join(provisioning.failures),
-            result=provisioning,
-        )
+        # Distinct sentence for a state that never got to answer ("could not be
+        # verified — re-run", the quoted pwsh error included) versus a verification
+        # that ran and came back wrong ("verification failed", fix the scope). The
+        # exit code — 2, via ExchangeError — and the config-write refusal downstream
+        # are the same for both: the reporting differs, the safety does not.
+        raise ExchangeError(_failure_message(provisioning), result=provisioning)
     return provisioning
 
 
+
 __all__ = [
+    "COULD_NOT_VERIFY_HINTS",
     "DEVICE_CODE_RE",
     "EVENT_PREFIX",
     "ExchangeError",
@@ -1176,12 +1539,18 @@ __all__ = [
     "OUTCOME_CREATED",
     "OUTCOME_EXISTS",
     "PWSH_TIMEOUT",
+    "REASON_CHECK_UNANSWERED",
+    "REASON_CONNECT_FAILED",
+    "REASON_CONNECT_TRANSIENT",
+    "REASON_SCRIPT_DIED",
     "SERVICE_PRINCIPAL_DISPLAY_NAME",
     "StreamingCommandRunner",
+    "TRANSIENT_CONNECT_SIGNATURES",
     "AuthzCheck",
     "StepOutcome",
     "build_script",
     "ensure_exchange_scope",
+    "is_transient_connect_error",
     "parse_authz_rows",
     "parse_pwsh_output",
     "plan_commands",
