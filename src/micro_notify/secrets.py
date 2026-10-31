@@ -6,6 +6,7 @@ later cards never rename them:
     graph.certificate_pem        private key PEM (auth = "certificate")
     graph.certificate_thumbprint certificate thumbprint paired with the PEM
     graph.client_secret          client secret (auth = "secret")
+    graph.delegated_token_cache  msal delegated token cache (design amendment A.2)
     teams:<target>               Workflows webhook URL for <target> (a secret)
 
 Contract every caller relies on:
@@ -38,6 +39,13 @@ TEAMS_ACCOUNT_PREFIX = "teams:"
 ACCOUNT_CERT_PEM = "graph.certificate_pem"
 ACCOUNT_CERT_THUMBPRINT = "graph.certificate_thumbprint"
 ACCOUNT_CLIENT_SECRET = "graph.client_secret"
+# Design amendment 2026-10-30 A.2/A.4: the serialised msal delegated token cache
+# (access + refresh token). A secret in the same class as the private key: never on
+# disk, never printed. Owned by micro_notify.delegation, which is the only reader.
+# Deliberately absent from Config.keychain_accounts(): that list drives the presence
+# checks for app-only mode, and a machine that never signs in delegationally has
+# nothing missing. The delegated presence check is doctor's, in delegated mode only.
+ACCOUNT_DELEGATED_CACHE = "graph.delegated_token_cache"
 
 # Timeout for a keychain invocation; a hung security(1) must not hang the CLI.
 SUBPROCESS_TIMEOUT = 15.0
@@ -187,6 +195,7 @@ __all__ = [
     "ACCOUNT_CERT_PEM",
     "ACCOUNT_CERT_THUMBPRINT",
     "ACCOUNT_CLIENT_SECRET",
+    "ACCOUNT_DELEGATED_CACHE",
     "SECURITY_BINARY",
     "SERVICE",
     "SUBPROCESS_TIMEOUT",
