@@ -205,3 +205,151 @@ Each card: one PR, tests green, no real sends. Merge = orch after review.
 ## 9. Left to the builder
 Module internals, card styling, CLI help wording, test layout, retry/backoff on 429/5xx (respect
 `Retry-After`, max 3 tries).
+
+## Amendment 2026-10-30 — delegated (as-a-person) mode
+
+Status: Amendment direction approved by operator 2026-10-30; binding seams decided by orch. **Append-only.** Sections 1–9 above stand exactly as written and
+are not rewritten here. Where this text and a section above disagree, this amendment wins **only** for the
+delegated mode defined below; app-only behaviour is unchanged. *(amended 2026-10-30 per t_589877bf)*
+
+### A.1 Exception to section 2 — there are now two auth modes, not one
+
+Section 2 sets out one auth stance: app-only, certificate-backed, sending from `noreply@…`. That stays the
+**default**. This amendment adds a second, opt-in mode:
+
+```toml
+[mail]
+mode = "delegated"     # default "app"; "delegated" = send as the signed-in person
+```
+
+| | app-only (sections 1–9, unchanged) | delegated (this amendment) |
+| --- | --- | --- |
+| who signs in | nobody — certificate or secret | a real user, device-code flow |
+| mail sender | `sender`, the scoped `noreply@example.com` | the signed-in user's own mailbox |
+| Teams person target | the Workflows bot (§3.2) | **the person themselves**, via `ChatMessage.Send` |
+| Entra registration | our `micro-notify` app | the same app, with delegated permissions |
+
+Two facts forced this mode, and one of them decides *which* registration it signs in through:
+
+1. **The Azure CLI's first-party app cannot be borrowed.** The obvious shortcut for a delegated login is
+   a well-known public client that already exists — the Microsoft Azure CLI's own app. It is closed to us:
+   that app carries neither `Mail.Send` nor `ChatMessage.Send` in its permission list, and scopes cannot be
+   added to an app you do not own. A token from it can therefore never send mail or post a chat. Delegated
+   mode must ride **our** `micro-notify` registration, which we control and can grant delegated scopes to
+   (§A.4 adds the admin step).
+2. **Graph forbids app-only posting to a personal chat.** §3.2 already states `ChatMessage.Send` is
+   delegated-only. The application permission that does exist, `ChatMessage.Send.AsApp`, posts as the
+   *app* — never as a person — and the only app-only route into a personal (1:1) chat is the
+   migration/import API, which is a history-import path, not a notification path. So for a Teams message
+   that arrives as though a person typed it, **delegated is the only person-identity path**. Channel posts
+   keep using the Workflows webhook; delegated chat is additive, not a replacement.
+
+Section 2's non-goals and anti-goals stay in force. The anti-goal "a secret, token … printed … or written
+to the config" is **strengthened** here: the delegated token cache is a secret (§A.2). The anti-goal "the
+app registration can send as ANY mailbox" continues to bind app-only mode; in delegated mode the
+equivalent control is different and holds by construction — a delegated token can act only as the one
+identity that signed in and consented (§A.3).
+
+### A.2 Threat model for the delegated token
+
+In delegated mode **the cached token is the user's identity** for the scopes it was granted — not a
+capability we scoped down ourselves. Whoever holds that cache can, until the refresh token dies, send mail
+from a real person's mailbox and post chat messages in their name: their signature on it, their delegates
+seeing it, no trace back to this tool. It is handled with the same care as that person's password.
+
+Granted delegated scopes — exactly these five, nothing more:
+
+| scope | why it is needed |
+| --- | --- |
+| `Mail.Send` | `mnotify mail send` in delegated mode |
+| `ChatMessage.Send` | the person-identity Teams post (§A.1 reason 2) |
+| `Chat.ReadBasic` | read chat names/memberships so a named person can be matched to a 1:1 chat the user is already in |
+| `User.Read` | read the signed-in profile — who am I, and does it match what config claims |
+| `offline_access` | silent re-auth, so a cron send does not prompt a human every time |
+
+`offline_access` is what makes the cache dangerous: it holds a **long-lived refresh token**, not merely a
+short-lived access token. The §2 / §3.4 rules therefore apply to the cache as they do to a private key:
+
+- the cache lives in the **macOS keychain only** — service `mnotify`, account
+  `graph.delegated_token_cache` — through the same wrapper as §3.4 (`secrets.py`: value in argv of one
+  exec, never a shell string, errors naming the *account* only);
+- it is **never on disk**: not in `~/.config/mnotify`, not in the state dir, not beside `counter.json`,
+  and not at msal's own default cache path — the serialised token cache is persisted into that one keychain
+  item and nowhere else;
+- it is **never printed**: not by `doctor`, not by `config show` (presence only), not in `--json`, not in
+  an audit line, never in an exception message;
+- the promise stays tested (§7): no test may write a token-cache file, and the §5 leak guard keeps scanning
+  tracked files.
+
+**Revocation — two levels, and the docs must not blur them:**
+
+1. `mnotify logout` deletes the keychain item `graph.delegated_token_cache`. Immediate and local; enough
+   when the machine itself is trusted. It stops **this Mac** and reaches nothing else.
+2. Entra **revoke sessions** on the user (Entra ID → Users → *user* → Revoke sessions) is the **hard**
+   revoke: refresh tokens stop being redeemable tenant-wide. Add removal of the delegated consent
+   (`DelegatedPermissionGrant`) to end the mode permanently. `mnotify logout` alone is not a hard revoke
+   and must never be presented as one.
+
+**Conditional operator setting — `Allow public client flows`.** The delegated sign-in is a device-code
+flow, which Entra classes as a *public client* flow, so that switch has to be **Yes** for delegated use.
+The switch belongs to the whole registration, and the operator runs both kinds of tenant configuration
+(the app-only one from §6 and the delegated one from here), so it is documented as a condition:
+
+**One registration per tenant.** Bootstrap creates or reuses a single `micro-notify` registration in each
+tenant; delegated mode does not get its own app. `Allow public client flows` is therefore a **per-tenant
+setting**, not a per-registration choice: **Yes** in a tenant that runs delegated mode (required by the
+device-code flow), **No** in a tenant that runs app-only mode — and it is never flipped to Yes in an
+app-only tenant. Each tenant runs one mode, and the switch matches the mode.
+
+| what the tenant's registration is used for | Allow public client flows |
+| --- | --- |
+| app-only (§6 as written) | **No** — keep it off; nothing in app-only mode needs it |
+| delegated mode (this amendment) | **Yes** — required; device-code sign-in fails closed without it |
+
+ADMIN-SETUP.md must present the switch as a per-tenant setting that follows the tenant's mode, not as a
+default to leave on.
+
+### A.3 Constraints carried forward, unchanged
+
+Delegated mode buys identity, not latitude. These rules apply to a delegated send exactly as to an
+app-only send, and `guard.py` still runs **before** any token call or network call:
+
+- **The sender is always the signed-in identity.** No send-as-other, ever. In delegated mode the `[mail]
+  sender` key is ignored and the send goes to `/users/me/sendMail` (equivalently
+  `/users/<upn>/sendMail` where `<upn>` is the identity carried in the token); a request naming any other
+  mailbox is a config error (exit 2) raised before the network. The check compares the configured/asked-for
+  identity against the signed-in `upn`/`oid` from the token — it does not trust config.
+- `allow.domains`, `allow.addresses`, `limits.max_recipients`, `limits.daily_max`,
+  `limits.max_attach_mb`: same defaults, same `guard.py`, same exit codes (3 refused, 6 cap reached).
+- Audit: same JSONL line and the same **no-body** rule, which matters more here, because that log is the
+  only record of what a person's identity did through this tool. The line gains `mode = delegated` and the
+  signed-in `upn` next to the existing fields.
+- A Teams **channel** post still goes through the Workflows webhook (§3.2). Delegated chat is used only for
+  the person-identity case, and the chat it posts to must be a target the guard accepted.
+- Exit codes are unchanged (§4); a failed delegated sign-in is exit 4, same as an app-only auth failure.
+
+### A.4 Additive deltas (listed here; the sections above are left intact)
+
+- §3.4 keychain table gains one row: `graph.delegated_token_cache` | msal delegated token cache (access +
+  refresh token) — a secret, `config show` prints presence only.
+- §3.4 config gains one key: `[mail] mode = "app" | "delegated"`, default `app`, so every
+  existing config file keeps working untouched.
+- §4 CLI gains two commands. `mnotify login` — device-code sign-in: shows the code and URL once, writes the
+  cache to the keychain, then prints the signed-in `upn` (never a token). `mnotify logout` — deletes that
+  cache item; §A.2 says what that does and does not revoke.
+- §4 `doctor` in delegated mode: a delegated token carries `scp`, not `roles`, so the tri-state check reads
+  `scp` and requires `Mail.Send` in it — same pass/warn/fail shape, same exit codes; `roles` stays the
+  app-only check.
+- §6 gains an optional step 6 for a delegated tenant: grant the five delegated permissions of §A.2 to the
+  registration and consent them, set `Allow public client flows = Yes` per the table in §A.2, and record the
+  hard-revoke procedure. Nothing in steps 1–5 changes.
+- Placeholders for every delegated example in any doc: sender `me@contoso.com`; tenant and client IDs
+  `00000000-0000-0000-0000-000000000000`; chat id `19:00000000000000000000000000000000@thread.v2`. No real
+  tenant, domain, upn, chat id or token in a tracked file — the §5 leak guard applies unchanged.
+
+### A.5 Open question, recorded rather than guessed
+
+`Chat.ReadBasic` covers reading chats the user is already in. Whether posting a **first** message into a
+1:1 that does not yet exist needs a further delegated scope (`Chat.Create` / `Chat.ReadWrite`) is not
+settled by this amendment. The list deliberately stays at the five scopes in §A.2; if the first live test
+proves a sixth is required, it is added to §A.2 here, with a reason, before it appears in code.
