@@ -60,11 +60,11 @@ item, decoded in memory, never printed. What it reports is *presence*, *expiry t
 A.4 allows a diagnostic to say. The ``scp``/``target`` grant is authoritative here in
 a way the app-mode ``roles`` claim is not: it is the scope list the token itself was
 issued for, so a missing ``ChatMessage.Send`` is a real failure rather than a
-not-verifiable warning. The one state that is only a warning is an access token that
-has passed its expiry while a refresh token is still in the cache —
-``mnotify mail send`` refreshes that silently, and declaring it broken would make
-doctor unsatisfiable an hour after every login (the t_24a04813 lesson, applied to the
-new mode instead of re-litigated).
+not-verifiable warning. The states that are only a warning are the ones a refresh
+token can still answer for — an access token past its expiry, or none cached at all
+because msal pruned it — since ``mnotify mail send`` refreshes either silently, and
+declaring them broken would make doctor unsatisfiable an hour after every login (the
+t_24a04813 lesson, applied to the new mode instead of re-litigated).
 
 The optional test send is **delegated** to :func:`micro_notify.commands.mail.run`
 rather than re-implemented, so the guard, the daily-counter write and the audit line
@@ -159,7 +159,9 @@ def add_parser(subparsers: "argparse._SubParsersAction") -> None:
         help="check config, keychain, token and Teams targets",
         description=(
             "Report config validity, keychain presence, token acquisition, the "
-            "Mail.Send role and every Teams target URL. Checks print presence "
+            "Mail.Send role and every Teams target URL. In [mail] mode = delegated "
+            "the token checks are the cached sign-in's instead: expiry, the granted "
+            "scopes, and that the signed-in UPN is the sender. Checks print presence "
             "only — never a secret."
         ),
     )
@@ -346,10 +348,16 @@ def read_delegated_cache(state: str) -> DelegatedCache:
     ):
         entries = sections.get(credential_type) or sections.get(section) or {}
         if not isinstance(entries, dict):
-            continue
+            # A section that exists but is not a table of entries is not "no tokens"
+            # — it is a corrupt item, and the honest word for that is `readable=False`.
+            # Reporting "nobody is signed in" instead would send the operator to look
+            # for a sign-in window they already used.
+            return DelegatedCache(readable=False, scopes=(), expires_at=None, has_refresh_token=False)
         for entry in entries.values():
             if not isinstance(entry, dict):
-                continue
+                # Same reasoning: a cache whose entry is not an object is broken, not
+                # empty. msal's own shape is a table of objects.
+                return DelegatedCache(readable=False, scopes=(), expires_at=None, has_refresh_token=False)
             target = entry.get("target")
             if isinstance(target, str):
                 scopes.update(token for token in target.split() if token)
@@ -554,24 +562,28 @@ def read_delegated_state() -> DelegatedCache:
 
 
 def check_delegated_token(report: Report, cache: DelegatedCache) -> bool:
-    """4 (delegated mode). A usable access token is cached, and its expiry is reported.
+    """4 (delegated mode). Can this sign-in still produce a token? Report the expiry.
 
-    Two failure states and one warning state, split on the one question that decides
-    whether the run may continue — *can this sign-in still produce a token?*
+    One question decides whether the run may continue: *can this sign-in still
+    authenticate?* The refresh token is the answer to it, which is why every branch
+    below reads ``has_refresh_token`` rather than trusting the access token alone.
 
-    * nothing cached, or a cache that cannot be parsed -> ``fail`` exit 4. There is
-      nothing to refresh and no assertion to read; the remedy is a fresh sign-in.
-    * the cached access token has passed its expiry and **no refresh token** is cached
-      -> ``fail`` exit 4. The sign-in is dead: every delegated send would fail with
-      exit 4 anyway, so stopping here costs the operator nothing.
-    * expired but a refresh token *is* cached -> ``warn``, run continues. This is the
-      same shape as the app-mode absent-``roles``-claim warning (see this module's
-      docstring and card t_24a04813): the honest report is "could not be verified
-      without a network call", because :func:`micro_notify.delegation.get_delegated_token`
-      refreshes this silently, and a ``fail`` here would skip ``allow`` and put
-      ``--send-test`` — the only proof that a delegated install works — out of reach.
+    * cache cannot be parsed -> ``fail`` exit 4. Nothing can be asserted about it,
+      and the remedy is the same as for any broken sign-in.
+    * no access token **and** no refresh token -> ``fail`` exit 4. There is nothing to
+      send with and nothing to refresh; every delegated send would exit 4 anyway, so
+      stopping here costs the operator nothing.
+    * the access token is expired, or absent, **while a refresh token is cached** ->
+      ``warn``, run continues. :func:`micro_notify.delegation.get_delegated_token`
+      refreshes both of these silently — and the absent-access-token shape is
+      reachable rather than theoretical: msal prunes expired access tokens during
+      ``search()`` and the refresh path persists that pruning, so a cache that has
+      been through one failed silent refresh holds only a refresh token. Failing it
+      would be the t_24a04813 bug re-imported into the new mode: doctor unsatisfiable
+      an hour after every login, ``allow`` skipped, and ``--send-test`` — the only
+      proof that a delegated install works — made unreachable.
 
-    The expiry time is printed in every detail line so an operator can see how long
+    The expiry time is printed whenever it is known, so an operator can see how long
     they have; a token value never is (amendment A.4).
     """
     if not cache.readable:
@@ -583,17 +595,29 @@ def check_delegated_token(report: Report, cache: DelegatedCache) -> bool:
             exit_code=EXIT_AUTH,
         )
         return False
-    if cache.expires_at is None:
+    expires_at = cache.expires_at
+    if expires_at is None and not cache.has_refresh_token:
         report.record(
             "token",
             FAIL,
-            f"nobody is signed in — no access token cached in '{delegation.ACCOUNT_DELEGATED_CACHE}'",
+            f"nobody is signed in — '{delegation.ACCOUNT_DELEGATED_CACHE}' holds neither an "
+            "access token nor a refresh token, so no delegated send can authenticate",
             hint=delegation.LOGIN_HINT,
             exit_code=EXIT_AUTH,
         )
         return False
-    expiry = _expiry_text(cache.expires_at)
-    if cache.expires_at <= time.time():
+    if expires_at is None:
+        # No access token, but the refresh token says the sign-in is alive.
+        report.record(
+            "token",
+            WARN,
+            f"no unexpired access token is cached in '{delegation.ACCOUNT_DELEGATED_CACHE}'; "
+            f"a refresh token is cached so a send refreshes it silently — run "
+            f"{delegation.LOGIN_HINT} to refresh it now",
+        )
+        return True
+    expiry = _expiry_text(expires_at)
+    if expires_at <= time.time():
         if not cache.has_refresh_token:
             report.record(
                 "token",

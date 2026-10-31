@@ -18,8 +18,10 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+from datetime import datetime
 
 import httpx
+import msal
 import pytest
 
 from micro_notify import (
@@ -29,15 +31,26 @@ from micro_notify import (
     EXIT_REMOTE,
     EXIT_USAGE,
     cli,
+    delegation,
     graph,
 )
-from micro_notify.config import AUTH_SECRET, load_config, render_toml, write_config
+from micro_notify.config import (
+    AUTH_SECRET,
+    MAIL_MODE_APP,
+    MAIL_MODE_DELEGATED,
+    TeamTarget,
+    load_config,
+    render_toml,
+    write_config,
+)
 from micro_notify.secrets import (
     ACCOUNT_CERT_PEM,
     ACCOUNT_CERT_THUMBPRINT,
     ACCOUNT_CLIENT_SECRET,
+    ACCOUNT_DELEGATED_CACHE,
 )
-from conftest import placeholder_config
+from conftest import PLACEHOLDER_GUID, placeholder_config
+from test_delegation import fake_id_token
 
 CANARY_PEM_BODY = "CANARYPRIVATEKEYBODYNOTAREALKEY"
 CANARY_THUMBPRINT = "AABBCCDDEEFF00112233445566778899AABBCCDD"
@@ -784,3 +797,839 @@ def test_checks_after_the_first_failure_are_skipped_not_run(
     # Everything after the failure is skipped: teams, token, allow, send-test.
     assert [c["status"] for c in checks[2:]] == ["skipped"] * 4
     assert checks[2]["name"] == "teams"
+
+
+# =========================================================================
+# Delegated mode (design amendment 2026-10-30, D4)
+# =========================================================================
+# When ``[mail] mode = delegated`` the operator signed in as a person with
+# ``mnotify login``, so the app-only questions ("is the certificate in the
+# keychain", "does the client-credentials token carry the Mail.Send *role*") are the
+# wrong questions — a delegated install has neither, and asking would report a
+# missing credential the design deliberately does not use. These tests pin the
+# adapted check list, the four new delegated facts (presence, expiry, scopes,
+# identity) and the fact that ``--send-test`` routes through the D2 path.
+#
+# The msal token cache is REAL here (as in tests/test_delegation.py): a serialised
+# msal cache is seeded into the shared fake keychain, so what is being exercised is
+# the actual stored shape the doctor has to read, not a fixture-shaped approximation.
+# The two identity/token seams are patched where a real call would need the network:
+# ``delegation.get_delegated_token`` builds a ``PublicClientApplication`` (tenant
+# discovery), so the send-test tests stub exactly that one attribute and let the
+# keychain-only ``whoami`` run for real.
+
+PERSON = "person@contoso.com"
+OTHER_PERSON = "someoneelse@contoso.com"
+CANARY_DELEGATED = "DELEGATED-AT-CANARY-DO-NOT-PRINT"
+# A Teams chat id is config data, not a secret (amendment 2026-10-30); this one is
+# the documented fake shape.
+CHAT_ID = "19:" + "fakechat01" + "@thread.v2"
+
+
+def _b64url(value: dict) -> str:
+    raw = base64.urlsafe_b64encode(json.dumps(value).encode("utf-8"))
+    return raw.decode("ascii").rstrip("=")
+
+
+def delegated_state(
+    *,
+    scopes: tuple[str, ...] = None,
+    expires_in: int = 3599,
+    refresh_token: bool = True,
+    upn: str = PERSON,
+) -> str:
+    """A serialised msal cache holding one delegated sign-in, with scripted contents.
+
+    Populated through msal's own ``cache.add()`` — the entry point the library uses
+    internally — so the serialised shape (``target`` scope list, ``expires_on``, the
+    separate ``RefreshToken`` entry) is msal's and not our guess. The credential
+    values are canaries: every test that prints a report asserts they stay hidden.
+    """
+    cache = msal.SerializableTokenCache()
+    response = {
+        "token_type": "Bearer",
+        "scope": " ".join(delegation.DELEGATED_SCOPES if scopes is None else scopes),
+        "expires_in": str(expires_in),
+        "access_token": CANARY_DELEGATED,
+        "id_token": fake_id_token(upn),
+        "client_info": _b64url({"uid": "uid-1", "utid": PLACEHOLDER_GUID}),
+    }
+    if refresh_token:
+        response["refresh_token"] = "RT-CANARY-DO-NOT-PRINT"
+    cache.add(event={
+        "client_id": PLACEHOLDER_GUID,
+        "scope": list(delegation.DELEGATED_SCOPES if scopes is None else scopes),
+        "token_endpoint": "https://login.microsoftonline.com/x/oauth2/v2.0/token",
+        "response": {**response, "client_info": _b64url({"uid": "uid-1", "utid": PLACEHOLDER_GUID})},
+        "username": upn,
+        "actor": None,
+        "analyzer": None,
+        "resp_from_wsd": False,
+    })
+    return cache.serialize()
+
+
+def delegated_expiry_text(state: str) -> str:
+    """The same rendering ``doctor`` prints, derived from the seeded cache itself.
+
+    Read out of the serialised ``expires_on`` rather than recomputed from a test-side
+    clock, so the assertion cannot drift from the value under test.
+    """
+    for entry in json.loads(state).get("AccessToken", {}).values():
+        return datetime.fromtimestamp(float(entry["expires_on"])).isoformat(timespec="seconds")
+    raise AssertionError("seeded cache has no access token")
+
+
+def delegated_config_file(
+    config_file,
+    *,
+    mode: str = MAIL_MODE_DELEGATED,
+    sender: str = PERSON,
+    teams_targets=None,
+    allow=None,
+):
+    """Write a delegated-mode config (or override any of the three interesting parts)."""
+    from dataclasses import replace
+
+    config = placeholder_config(config_file.parent)
+    config = replace(config, mail=replace(config.mail, mode=mode, sender=sender))
+    if teams_targets is not None:
+        config = replace(config, teams_targets=teams_targets)
+    if allow is not None:
+        config = replace(config, allow=allow)
+    write_config(config, config_file)
+    return config_file
+
+
+def seed_delegated_sign_in(fake_keychain, **state_kwargs):
+    """Seed a delegated sign-in plus the webhook URLs the placeholder targets need.
+
+    The two Teams accounts are here because ``placeholder_config`` declares a channel
+    and a dm target and check 3 is mode-independent for those kinds; a test that is
+    about checks 4/5/6 must not trip on check 3 first. Tests that ARE about check 3
+    rewrite the targets and seed what they need themselves.
+    """
+    fake_keychain.seed(ACCOUNT_DELEGATED_CACHE, delegated_state(**state_kwargs))
+    fake_keychain.seed("teams:alerts", canary_webhook_url())
+    fake_keychain.seed("teams:dm", canary_webhook_url())
+    return fake_keychain
+
+
+@pytest.fixture
+def signed_in(fake_keychain):
+    """A live delegated sign-in: right scopes, unexpired, refreshable."""
+    return seed_delegated_sign_in(fake_keychain)
+
+
+@pytest.fixture
+def delegated_env(config_file, signed_in, monkeypatch):
+    """Delegated config + live sign-in + a stubbed delegated token, no app-mode stubs.
+
+    Returns the pieces a test needs: the fake keychain (for cache surgery) and the
+    recording stub for the one seam that would otherwise hit the network.
+    """
+    delegated_config_file(config_file)
+
+    class TokenStub:
+        def __init__(self) -> None:
+            self.calls: list[bool] = []
+
+        def get_delegated_token(self) -> str:
+            self.calls.append(True)
+            return CANARY_DELEGATED
+
+    stub = TokenStub()
+    # Only this one seam: `whoami` is keychain-only and runs for real, so the sender
+    # check is exercised against the same cached identity the send path uses (D2).
+    monkeypatch.setattr(delegation, "get_delegated_token", stub.get_delegated_token)
+    # And the app-only client must never be built in delegated mode.
+    monkeypatch.setattr(
+        graph.msal, "ConfidentialClientApplication",
+        lambda **_kw: (_ for _ in ()).throw(AssertionError("delegated mode built a cert client")),
+    )
+    return argparse.Namespace(keychain=signed_in, tokens=stub)
+
+
+def delegated_checks(capsys) -> list[dict]:
+    return json.loads(capsys.readouterr().out)["checks"]
+
+
+# --- The check list itself --------------------------------------------------
+def test_delegated_mode_reports_the_delegated_check_list_in_order(
+    delegated_env, capsys
+) -> None:
+    """The card's ordering: config -> keychain -> teams -> token -> scopes -> sender -> allow."""
+    assert run_doctor("--json") == EXIT_OK
+    checks = delegated_checks(capsys)
+    assert [c["name"] for c in checks] == [
+        "config", "keychain", "teams", "token", "scopes", "sender", "allow", "send-test",
+    ]
+    assert all(c["status"] == "pass" for c in checks[:-1]), checks
+
+
+def test_delegated_mode_replaces_the_roles_check_rather_than_adding_to_it(
+    delegated_env, capsys
+) -> None:
+    """A delegated install has no app-only roles claim to read: no phantom, no duplicate."""
+    assert run_doctor("--json") == EXIT_OK
+    names = [c["name"] for c in delegated_checks(capsys)]
+    assert names.count("token") == 1, "one token check, whichever mode this is"
+    assert len(names) == len(set(names)), f"duplicate check names: {names}"
+
+
+def test_app_mode_check_list_is_unchanged_even_with_a_cached_sign_in(
+    mnotify_config, seeded_keychain, msal_stub, http_counter, fake_keychain, capsys
+) -> None:
+    """App mode must not grow `scopes`/`sender` because a token cache happens to exist.
+
+    The branch keys on ``[mail] mode`` alone — an operator who signed in but left the
+    config at ``app`` gets exactly the report they got before the amendment.
+    """
+    seed_delegated_sign_in(fake_keychain)
+    msal_stub(jwt_with_roles("Mail.Send"))
+    assert run_doctor("--json") == EXIT_OK
+    assert [c["name"] for c in delegated_checks(capsys)] == [
+        "config", "keychain", "teams", "token", "allow", "send-test",
+    ]
+
+
+def test_check_names_is_the_report_shape_for_each_mode() -> None:
+    """Unit-level pin of the two lists, so an e2e rename cannot pass both ways."""
+    from micro_notify.commands.doctor import CHECK_ORDER, DELEGATED_CHECK_ORDER, check_names
+
+    assert check_names(False) == CHECK_ORDER
+    assert check_names(True) == DELEGATED_CHECK_ORDER
+    # Every shared name keeps its relative position; only the two new ones are added.
+    shared = [name for name in DELEGATED_CHECK_ORDER if name in CHECK_ORDER]
+    assert shared == list(CHECK_ORDER)
+    assert set(DELEGATED_CHECK_ORDER) - set(CHECK_ORDER) == {"scopes", "sender"}
+
+
+def test_json_document_shape_is_unchanged_in_delegated_mode(
+    delegated_env, capsys
+) -> None:
+    """The card's contract: the machine shape is the same checks list, mode or not."""
+    assert run_doctor("--json") == EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+    assert set(payload) == {"ok", "outcome", "exitCode", "checks"}
+    assert payload["ok"] is True and payload["exitCode"] == EXIT_OK
+    for entry in payload["checks"]:
+        assert entry["status"] in {"pass", "warn", "fail", "skipped"}
+        assert set(entry) <= {"name", "status", "detail"}
+
+
+# --- Check 2 (delegated): the token cache account ---------------------------
+def test_delegated_mode_without_a_sign_in_is_exit_4_naming_the_account(
+    config_file, fake_keychain, capsys
+) -> None:
+    delegated_config_file(config_file)
+    assert run_doctor() == EXIT_AUTH
+    err = capsys.readouterr().err
+    assert ACCOUNT_DELEGATED_CACHE in err
+    assert "mnotify login" in err, "the fix hint must name the command that creates it"
+
+
+def test_delegated_mode_does_not_demand_the_certificate_or_the_webhook_secrets(
+    config_file, fake_keychain, capsys
+) -> None:
+    """No phantom secrets: a delegated send reads neither the cert nor a client secret.
+
+    D1b declined to add the cache account to ``Config.keychain_accounts()`` for this
+    exact reason and left the presence check to this card; D2 proved the delegated
+    path never reads the certificate accounts. An empty keychain must therefore fail
+    on the *token cache* and name nothing else.
+    """
+    delegated_config_file(config_file)
+    assert run_doctor() == EXIT_AUTH
+    err = capsys.readouterr().err
+    assert ACCOUNT_DELEGATED_CACHE in err
+    assert ACCOUNT_CERT_PEM not in err, "delegated mode must not demand a certificate"
+    assert ACCOUNT_CLIENT_SECRET not in err
+
+
+def test_delegated_keychain_check_reports_presence_never_the_value(
+    config_file, fake_keychain, capsys
+) -> None:
+    """Presence, not contents: the canaries in the cache must not reach stdout."""
+    delegated_config_file(config_file)
+    seed_delegated_sign_in(fake_keychain)
+    assert run_doctor() == EXIT_OK
+    captured = capsys.readouterr()
+    blob = captured.out + captured.err
+    assert ACCOUNT_DELEGATED_CACHE in captured.out
+    for canary in (CANARY_DELEGATED, "RT-CANARY-DO-NOT-PRINT", "IDT-CANARY-DO-NOT-PRINT"):
+        assert canary not in blob
+    assert "eyJ" not in blob, "a JWT segment leaked into the report"
+
+
+# --- Check 4 (delegated): expiry -------------------------------------------
+def test_delegated_live_token_reports_the_expiry_time(
+    delegated_env, capsys
+) -> None:
+    state = delegated_state()
+    delegated_env.keychain.items[ACCOUNT_DELEGATED_CACHE] = state
+    assert run_doctor() == EXIT_OK
+    out = capsys.readouterr().out
+    assert delegated_expiry_text(state) in out, "the expiry time is the point of the check"
+
+
+def test_expired_token_without_a_refresh_token_fails_and_names_the_hint(
+    delegated_env, capsys
+) -> None:
+    """Dead sign-in: no access token, nothing to refresh -> exit 4 with the fix."""
+    state = delegated_state(expires_in=-100, refresh_token=False)
+    delegated_env.keychain.items[ACCOUNT_DELEGATED_CACHE] = state
+    assert run_doctor("--json") == EXIT_AUTH
+    checks = {c["name"]: c for c in delegated_checks(capsys)}
+    assert checks["token"]["status"] == "fail"
+    assert delegated_expiry_text(state) in checks["token"]["detail"], "report WHEN it expired"
+    assert checks["scopes"]["status"] == "skipped"
+    assert checks["sender"]["status"] == "skipped"
+    assert checks["allow"]["status"] == "skipped"
+
+
+def test_expired_token_without_a_refresh_token_says_what_to_do(
+    delegated_env, capsys
+) -> None:
+    state = delegated_state(expires_in=-100, refresh_token=False)
+    delegated_env.keychain.items[ACCOUNT_DELEGATED_CACHE] = state
+    assert run_doctor() == EXIT_AUTH
+    err = capsys.readouterr().err
+    assert "expired" in err.lower()
+    assert "mnotify login" in err, "the hint must name the command that fixes it"
+
+
+def test_expired_token_with_a_refresh_token_warns_and_the_run_continues(
+    delegated_env, capsys
+) -> None:
+    """The one warn state, and why: `mail send` refreshes this silently.
+
+    A ``fail`` here would skip ``allow`` and put ``--send-test`` out of reach, making
+    doctor unsatisfiable an hour after every login — the t_24a04813 lesson applied to
+    the new mode instead of re-litigated.
+    """
+    state = delegated_state(expires_in=-100)
+    delegated_env.keychain.items[ACCOUNT_DELEGATED_CACHE] = state
+    assert run_doctor("--json") == EXIT_OK
+    checks = {c["name"]: c for c in delegated_checks(capsys)}
+    assert checks["token"]["status"] == "warn"
+    assert checks["allow"]["status"] == "pass", "a warn must not stop the run"
+    assert checks["send-test"]["status"] == "skipped", "not requested, so skipped — not run"
+
+
+def test_expired_but_refreshable_token_is_a_warn_on_stdout_not_a_fail(
+    delegated_env, capsys
+) -> None:
+    state = delegated_state(expires_in=-100)
+    delegated_env.keychain.items[ACCOUNT_DELEGATED_CACHE] = state
+    assert run_doctor() == EXIT_OK
+    captured = capsys.readouterr()
+    assert "token: warn" in captured.out
+    assert "token: warn" not in captured.err
+
+
+def test_unreadable_token_cache_fails_closed_with_the_sign_in_hint(
+    delegated_env, capsys
+) -> None:
+    """A corrupt keychain item tells the operator nothing unless it is reported."""
+    delegated_env.keychain.items[ACCOUNT_DELEGATED_CACHE] = "this-is-not-a-cache"
+    assert run_doctor("--json") == EXIT_AUTH
+    checks = {c["name"]: c for c in delegated_checks(capsys)}
+    assert checks["token"]["status"] == "fail"
+    assert "unreadable" in checks["token"]["detail"]
+
+
+def test_account_present_but_holding_no_sign_in_is_exit_4(
+    config_file, fake_keychain, capsys
+) -> None:
+    """An item that exists but holds no access token is a fail, not a pass.
+
+    The presence check asks only whether the account is there, so this is the state
+    where it says ``present`` and the token check is the one that must refuse: a
+    half-written sign-in (or one msal has emptied) has nothing to send with and
+    nothing to refresh.
+    """
+    delegated_config_file(config_file)
+    seed_delegated_sign_in(fake_keychain)
+    fake_keychain.items[ACCOUNT_DELEGATED_CACHE] = "{}"
+    assert run_doctor("--json") == EXIT_AUTH
+    checks = {c["name"]: c for c in delegated_checks(capsys)}
+    assert checks["keychain"]["status"] == "pass", "the account IS there"
+    assert checks["token"]["status"] == "fail"
+    assert checks["scopes"]["status"] == "skipped"
+    assert checks["sender"]["status"] == "skipped"
+
+
+def test_account_present_but_holding_no_sign_in_names_the_fix(
+    config_file, fake_keychain, capsys
+) -> None:
+    delegated_config_file(config_file)
+    seed_delegated_sign_in(fake_keychain)
+    fake_keychain.items[ACCOUNT_DELEGATED_CACHE] = "{}"
+    assert run_doctor() == EXIT_AUTH
+    err = capsys.readouterr().err
+    assert "nobody is signed in" in err
+    assert "mnotify login" in err
+
+
+def test_cache_access_token_pruned_but_refresh_token_held_warns_and_continues(
+    config_file, fake_keychain, capsys
+) -> None:
+    """The msal-pruned shape: no access token, refresh token held -> warn, not fail.
+
+    msal prunes expired access tokens during ``search()`` and the silent-refresh path
+    persists that pruning, so a cache that has been through one expired-AT lookup
+    holds ONLY a refresh token — and ``get_delegated_token`` still authenticates from
+    it. Failing this shape would make doctor unsatisfiable for a working sign-in
+    (the t_24a04813 class, in the new mode).
+    """
+    delegated_config_file(config_file)
+    seed_delegated_sign_in(fake_keychain)
+    state = json.loads(delegated_state())
+    state["AccessToken"] = {}  # exactly what msal's prune leaves behind
+    fake_keychain.items[ACCOUNT_DELEGATED_CACHE] = json.dumps(state)
+    assert run_doctor("--json") == EXIT_OK
+    checks = {c["name"]: c for c in delegated_checks(capsys)}
+    assert checks["token"]["status"] == "warn"
+    assert checks["scopes"]["status"] == "pass", "the refresh token's target list names the grant"
+    assert checks["sender"]["status"] == "pass"
+    assert checks["allow"]["status"] == "pass"
+
+
+def test_cache_entry_without_a_readable_expiry_and_nothing_to_refresh_fails(
+    config_file, fake_keychain, capsys
+) -> None:
+    """A malformed ``expires_on`` is not 'never expires'; with no RT it is a dead sign-in."""
+    delegated_config_file(config_file)
+    seed_delegated_sign_in(fake_keychain)
+    state = json.loads(delegated_state(expires_in=-100, refresh_token=False))
+    for entry in state["AccessToken"].values():
+        entry["expires_on"] = "not-a-number"
+    fake_keychain.items[ACCOUNT_DELEGATED_CACHE] = json.dumps(state)
+    assert run_doctor("--json") == EXIT_AUTH
+    checks = {c["name"]: c for c in delegated_checks(capsys)}
+    assert checks["token"]["status"] == "fail"
+
+
+# --- Check 5 (delegated): scopes -------------------------------------------
+def test_missing_chat_message_send_scope_fails_and_names_the_scope(
+    delegated_env, capsys
+) -> None:
+    """The cached ``target`` list is what the token was issued for: authoritative."""
+    delegated_env.keychain.items[ACCOUNT_DELEGATED_CACHE] = delegated_state(
+        scopes=("Mail.Send", "Chat.ReadBasic", "User.Read", "offline_access")
+    )
+    assert run_doctor("--json") == EXIT_AUTH
+    checks = {c["name"]: c for c in delegated_checks(capsys)}
+    assert checks["scopes"]["status"] == "fail"
+    assert "ChatMessage.Send" in checks["scopes"]["detail"]
+    assert checks["sender"]["status"] == "skipped", "the failure stops the run"
+
+
+def test_missing_mail_send_scope_fails_and_names_only_that_scope(
+    delegated_env, capsys
+) -> None:
+    delegated_env.keychain.items[ACCOUNT_DELEGATED_CACHE] = delegated_state(
+        scopes=("ChatMessage.Send", "User.Read", "offline_access")
+    )
+    assert run_doctor("--json") == EXIT_AUTH
+    checks = {c["name"]: c for c in delegated_checks(capsys)}
+    assert checks["scopes"]["status"] == "fail"
+    # "missing" and "cached" must not blur: ChatMessage.Send IS granted here, it
+    # appears only inside the cached-grant list, never in the "do not include" part.
+    missing_part, cached_part = checks["scopes"]["detail"].split("(cached grant:")
+    assert missing_part == "granted scopes do not include Mail.Send "
+    assert "ChatMessage.Send" in cached_part
+
+
+def test_scope_failure_hint_names_both_the_login_command_and_the_app_registration(
+    delegated_env, capsys
+) -> None:
+    """Two causes, one hint: the operator can re-login, or an admin must grant the permission."""
+    delegated_env.keychain.items[ACCOUNT_DELEGATED_CACHE] = delegated_state(
+        scopes=("User.Read",)
+    )
+    assert run_doctor() == EXIT_AUTH
+    err = capsys.readouterr().err
+    assert "mnotify login" in err
+    assert "ADMIN-SETUP" in err, "a trimmed tenant consent is an admin-side fix"
+
+
+def test_a_full_grant_passes_the_scope_check_without_printing_anything_sensitive(
+    delegated_env, capsys
+) -> None:
+    assert run_doctor() == EXIT_OK
+    captured = capsys.readouterr()
+    assert "Mail.Send" in captured.out and "ChatMessage.Send" in captured.out
+    assert CANARY_DELEGATED not in captured.out + captured.err
+
+
+def test_scope_check_reads_the_grant_of_an_expired_but_refreshable_token(
+    delegated_env, capsys
+) -> None:
+    """The warn must not smuggle a bad grant through: a refresh renews the SAME grant."""
+    delegated_env.keychain.items[ACCOUNT_DELEGATED_CACHE] = delegated_state(
+        expires_in=-100, scopes=("Mail.Send", "User.Read", "offline_access")
+    )
+    assert run_doctor("--json") == EXIT_AUTH
+    checks = {c["name"]: c for c in delegated_checks(capsys)}
+    assert checks["token"]["status"] == "warn", "expiry is still only a warn"
+    assert checks["scopes"]["status"] == "fail", "the grant is a fact, warn or not"
+
+
+def test_scope_grant_is_read_without_touching_the_credential_fields(
+    delegated_env, monkeypatch
+) -> None:
+    """The reader must not be ``cache.search()``: that prunes expired tokens as a side effect."""
+    import micro_notify.commands.doctor as doctor
+
+    calls: list[bool] = []
+    real_search = msal.TokenCache.search
+
+    def spy(self, *args, **kwargs):
+        calls.append(True)
+        return real_search(self, *args, **kwargs)
+
+    monkeypatch.setattr(msal.TokenCache, "search", spy)
+    delegated_env.keychain.items[ACCOUNT_DELEGATED_CACHE] = delegated_state(expires_in=-100)
+    # `whoami` legitimately uses search for the identity; zero it out by patching the
+    # sender check's identity source so this test measures ONLY the cache reader.
+    monkeypatch.setattr(
+        delegation, "whoami",
+        lambda: delegation.WhoamiResult(upn=PERSON, mode=MAIL_MODE_DELEGATED, expires_at=None),
+    )
+    assert doctor.run(argparse.Namespace(json=True, send_test=None)) == EXIT_OK
+    assert calls == [], "doctor must parse the serialised cache, not query a live msal cache"
+
+
+def test_read_delegated_cache_reports_names_numbers_and_readability() -> None:
+    """Unit-level pin of the four facts, including the ones the e2e run cannot separate."""
+    from micro_notify.commands.doctor import read_delegated_cache
+
+    live = read_delegated_cache(delegated_state())
+    assert live.readable is True and live.has_refresh_token is True
+    assert set(live.scopes) == set(delegation.DELEGATED_SCOPES)
+    assert live.expires_at is not None
+
+    dead = read_delegated_cache(delegated_state(refresh_token=False))
+    assert dead.has_refresh_token is False
+
+    narrow = read_delegated_cache(delegated_state(scopes=("User.Read",)))
+    assert narrow.scopes == ("User.Read",)
+
+    assert read_delegated_cache("").readable is True, "absent is not corrupt"
+    assert read_delegated_cache("").expires_at is None
+    for garbage in ("not-json", "[1,2,3]", '{"AccessToken": 7}', '{"AccessToken": {"k": 7}}'):
+        assert read_delegated_cache(garbage).readable is False, garbage
+
+
+# --- Check 6 (delegated): identity == effective sender ----------------------
+def test_signed_in_upn_matching_the_sender_passes(
+    delegated_env, capsys
+) -> None:
+    assert run_doctor() == EXIT_OK
+    assert f"signed in as {PERSON}" in capsys.readouterr().out
+
+
+def test_upn_mismatch_fails_with_the_logout_and_login_hint(
+    config_file, fake_keychain, capsys
+) -> None:
+    """The D2 rule, checked before a send is spent: /me/sendMail has no send-as-other."""
+    delegated_config_file(config_file, sender=OTHER_PERSON)
+    seed_delegated_sign_in(fake_keychain)
+    assert run_doctor("--json") == EXIT_USAGE
+    checks = {c["name"]: c for c in delegated_checks(capsys)}
+    assert checks["sender"]["status"] == "fail"
+    assert checks["allow"]["status"] == "skipped"
+    assert PERSON in checks["sender"]["detail"] and OTHER_PERSON in checks["sender"]["detail"]
+
+
+def test_upn_mismatch_hint_tells_the_operator_to_logout_and_login_as_the_sender(
+    config_file, fake_keychain, capsys
+) -> None:
+    delegated_config_file(config_file, sender=OTHER_PERSON)
+    seed_delegated_sign_in(fake_keychain)
+    assert run_doctor() == EXIT_USAGE
+    err = capsys.readouterr().err
+    assert "logout" in err and "login" in err
+    assert OTHER_PERSON in err, "the hint must name the account to sign in as"
+
+
+def test_upn_comparison_ignores_case(
+    config_file, fake_keychain, capsys
+) -> None:
+    """Entra treats UPN case as not meaningful, so this is not a different mailbox."""
+    delegated_config_file(config_file, sender=PERSON.upper())
+    seed_delegated_sign_in(fake_keychain)
+    assert run_doctor() == EXIT_OK
+    assert "sender: pass" in capsys.readouterr().out
+
+
+def test_sender_check_never_prints_a_token(
+    config_file, fake_keychain, capsys
+) -> None:
+    delegated_config_file(config_file, sender=OTHER_PERSON)
+    seed_delegated_sign_in(fake_keychain)
+    assert run_doctor() == EXIT_USAGE
+    blob = capsys.readouterr().out + capsys.readouterr().err
+    for canary in (CANARY_DELEGATED, "RT-CANARY-DO-NOT-PRINT", "IDT-CANARY-DO-NOT-PRINT"):
+        assert canary not in blob
+    assert "eyJ" not in blob
+
+
+def test_sender_check_refuses_without_printing_a_token_in_json_too(
+    config_file, fake_keychain, capsys
+) -> None:
+    delegated_config_file(config_file, sender=OTHER_PERSON)
+    seed_delegated_sign_in(fake_keychain)
+    assert run_doctor("--json") == EXIT_USAGE
+    blob = json.dumps(json.loads(capsys.readouterr().out))
+    assert CANARY_DELEGATED not in blob and "eyJ" not in blob
+
+
+def test_sender_check_reports_a_refusal_as_a_sign_in_failure(
+    config_file, fake_keychain, monkeypatch
+) -> None:
+    """Unit-level pin of the defensive branch the check ORDER normally hides.
+
+    An e2e run can never reach it — check 4 fails first — so it is called directly:
+    a cache that holds a usable access token but names nobody must produce exit 4 and
+    the sign-in hint, not a crash and not a ``sender: pass`` for an unknown identity.
+    """
+    from micro_notify import AuthError
+    from micro_notify.commands.doctor import FAIL, Report, check_delegated_sender
+
+    def refusing() -> delegation.WhoamiResult:
+        raise AuthError("nobody is signed in; run mnotify login")
+
+    monkeypatch.setattr(delegation, "whoami", refusing)
+    delegated_config_file(config_file)
+    report = Report(True)
+    config = load_config(config_file)
+    assert check_delegated_sender(report, config) is False
+    entry = report.checks[-1]
+    assert entry == {"name": "sender", "status": FAIL, "detail": "nobody is signed in; run mnotify login"}
+    assert report.exit_code == EXIT_AUTH
+
+
+def test_delegated_human_report_prints_scopes_and_sender_on_stdout(
+    delegated_env, capsys
+) -> None:
+    """The two new checks are lines like every other check: name, status, detail, stdout."""
+    assert run_doctor() == EXIT_OK
+    captured = capsys.readouterr()
+    assert "scopes: pass" in captured.out
+    assert "sender: pass" in captured.out
+    assert not captured.err, "a passing delegated run writes nothing to stderr"
+
+
+# --- Check 3 (delegated): chat targets are valid ---------------------------
+def test_delegated_mode_accepts_a_chat_target_with_no_webhook_url(
+    config_file, fake_keychain, capsys
+) -> None:
+    """D3: a chat is addressed by the config's chat_id over Graph — no webhook to find."""
+    seed_delegated_sign_in(fake_keychain)
+    delegated_config_file(
+        config_file, teams_targets=(TeamTarget(name="standup", kind="chat", chat_id=CHAT_ID),)
+    )
+    assert run_doctor("--json") == EXIT_OK
+    checks = {c["name"]: c for c in delegated_checks(capsys)}
+    assert checks["teams"]["status"] == "pass"
+    assert "teams:standup" not in json.dumps(checks), "no phantom webhook account demanded"
+
+
+def test_delegated_mode_still_requires_webhook_urls_for_channel_and_dm(
+    config_file, fake_keychain, capsys
+) -> None:
+    """The relaxation is per-kind, not a blanket skip."""
+    seed_delegated_sign_in(fake_keychain)
+    del fake_keychain.items["teams:alerts"]  # the channel target's URL is missing
+    delegated_config_file(
+        config_file,
+        teams_targets=(
+            TeamTarget(name="standup", kind="chat", chat_id=CHAT_ID),
+            TeamTarget(name="alerts", kind="channel"),
+        ),
+    )
+    assert run_doctor() == EXIT_AUTH
+    err = capsys.readouterr().err
+    assert "teams:alerts" in err
+    assert "teams:standup" not in err
+
+
+def test_delegated_mode_prints_which_targets_needed_no_url(
+    config_file, fake_keychain, capsys
+) -> None:
+    seed_delegated_sign_in(fake_keychain)
+    fake_keychain.seed("teams:alerts", canary_webhook_url())
+    delegated_config_file(
+        config_file,
+        teams_targets=(
+            TeamTarget(name="standup", kind="chat", chat_id=CHAT_ID),
+            TeamTarget(name="alerts", kind="channel"),
+        ),
+    )
+    assert run_doctor() == EXIT_OK
+    out = capsys.readouterr().out
+    assert "chat target" in out, "the report must explain why no URL was looked for"
+    assert canary_webhook_url() not in out
+
+
+def test_app_mode_still_demands_a_url_for_every_target_including_a_chat(
+    mnotify_config, seeded_keychain, msal_stub, http_counter, capsys
+) -> None:
+    """App mode's check 3 is byte-identical: the flag defaults to False, behaviour unchanged."""
+    from dataclasses import replace
+
+    msal_stub(jwt_with_roles("Mail.Send"))
+    config = placeholder_config(mnotify_config.parent)
+    write_config(
+        replace(config, teams_targets=config.teams_targets
+                + (TeamTarget(name="standup", kind="chat", chat_id=CHAT_ID),)),
+        mnotify_config,
+    )
+    assert run_doctor() == EXIT_AUTH
+    assert "teams:standup" in capsys.readouterr().err, "app mode cannot post to a chat"
+
+
+# --- --send-test branches per mode -----------------------------------------
+def test_delegated_send_test_posts_to_me_sendmail(
+    delegated_env, http_counter, capsys
+) -> None:
+    """D2's URL: no sender in the path — the mailbox is the signed-in person's."""
+    http_counter.responses.append(httpx.Response(202))
+    assert run_doctor("--send-test", SEND_TARGET) == EXIT_OK
+    assert [r.url.path for r in http_counter.requests] == ["/v1.0/me/sendMail"]
+    assert [r.url.host for r in http_counter.requests] == ["graph.microsoft.com"]
+
+
+def test_delegated_send_test_carries_the_delegated_token_not_a_cert_token(
+    delegated_env, http_counter
+) -> None:
+    http_counter.responses.append(httpx.Response(202))
+    assert run_doctor("--send-test", SEND_TARGET) == EXIT_OK
+    assert [r.headers["authorization"] for r in http_counter.requests] == [
+        f"Bearer {CANARY_DELEGATED}"
+    ]
+    assert delegated_env.tokens.calls, "the send must go through the D2 token path"
+
+
+def test_delegated_send_test_never_prints_the_token(
+    delegated_env, http_counter, capsys
+) -> None:
+    http_counter.responses.append(httpx.Response(202))
+    assert run_doctor("--send-test", SEND_TARGET, "--json") == EXIT_OK
+    blob = json.dumps(json.loads(capsys.readouterr().out))
+    assert CANARY_DELEGATED not in blob and "eyJ" not in blob
+    assert "s***@example.com" in blob, "the recipient echo is still masked"
+
+
+def test_delegated_send_test_spends_exactly_one_unit_of_budget(
+    delegated_env, http_counter, mnotify_config
+) -> None:
+    http_counter.responses.append(httpx.Response(202))
+    assert run_doctor("--send-test", SEND_TARGET) == EXIT_OK
+    counter = load_config(mnotify_config).paths.counter_file
+    assert json.loads(counter.read_text(encoding="utf-8"))["count"] == 1
+
+
+def test_delegated_send_test_audits_one_sent_line(
+    delegated_env, http_counter, mnotify_config, read_json_lines
+) -> None:
+    http_counter.responses.append(httpx.Response(202))
+    assert run_doctor("--send-test", SEND_TARGET) == EXIT_OK
+    entries = read_json_lines(load_config(mnotify_config).paths.audit)
+    assert [e["outcome"] for e in entries] == ["sent"]
+
+
+def test_delegated_guard_refusal_costs_no_token_and_no_http(
+    config_file, fake_keychain, http_counter, monkeypatch
+) -> None:
+    """Order preserved in the new mode: guard first, token only for a send that may happen."""
+    from micro_notify.config import AllowConfig
+
+    def never(*_args, **_kwargs):
+        raise AssertionError("delegated mode spent a token on a refused send")
+
+    delegated_config_file(config_file, allow=AllowConfig(domains=("contoso.com",)))
+    seed_delegated_sign_in(fake_keychain)
+    monkeypatch.setattr(delegation, "get_delegated_token", never)
+    assert run_doctor("--send-test", SEND_TARGET) == EXIT_GUARD
+    assert http_counter.requests == []
+
+
+def test_delegated_mode_without_a_sign_in_never_reaches_the_send(
+    config_file, fake_keychain, http_counter, monkeypatch
+) -> None:
+    """Fail-closed ordering: a missing sign-in stops the run before any send attempt."""
+    def never(*_args, **_kwargs):
+        raise AssertionError("delegated mode tried to send without a sign-in")
+
+    delegated_config_file(config_file)
+    monkeypatch.setattr(delegation, "get_delegated_token", never)
+    monkeypatch.setattr(delegation, "whoami", never)
+    http_counter.responses.append(httpx.Response(202))
+    assert run_doctor("--send-test", SEND_TARGET) == EXIT_AUTH
+    assert http_counter.requests == []
+    counter = load_config(config_file).paths.counter_file
+    assert not counter.exists(), "a refused pre-flight must not spend daily budget"
+
+
+# --- Zero network without --send-test, delegated mode ----------------------
+def test_delegated_mode_without_send_test_makes_zero_network_calls(
+    delegated_env, http_counter
+) -> None:
+    assert run_doctor() == EXIT_OK
+    assert http_counter.requests == []
+    assert http_counter.clients == [], "doctor opened an HTTP client without --send-test"
+
+
+def test_delegated_mode_without_send_test_never_builds_a_public_client(
+    delegated_env, http_counter, monkeypatch
+) -> None:
+    """A real PublicClientApplication does tenant discovery: that is a network call."""
+    def never(**_kwargs):
+        raise AssertionError("doctor built a PublicClientApplication without --send-test")
+
+    monkeypatch.setattr(delegation.msal, "PublicClientApplication", never)
+    assert run_doctor() == EXIT_OK
+    assert http_counter.requests == []
+
+
+def test_delegated_mode_reads_and_parses_the_token_cache_once_per_run(
+    delegated_env, monkeypatch, capsys
+) -> None:
+    """One parsed read shared by the token, scopes and sender checks.
+
+    Counted at ``read_delegated_state`` rather than in the keychain audit, because the
+    audit also carries the presence probe and ``whoami``'s own keychain-only identity
+    read — both of which are supposed to happen. What must NOT happen is three parses
+    of the same blob, or a diagnostic writing the operator's credential back.
+    """
+    import micro_notify.commands.doctor as doctor
+
+    calls: list[bool] = []
+    real = doctor.read_delegated_state
+
+    def spy():
+        calls.append(True)
+        return real()
+
+    monkeypatch.setattr(doctor, "read_delegated_state", spy)
+    before = dict(delegated_env.keychain.items)
+    assert run_doctor("--json") == EXIT_OK
+    delegated_checks(capsys)
+    assert len(calls) == 1, f"expected one parse of the cache, got {len(calls)}"
+    assert delegated_env.keychain.items == before, "a diagnostic must not rewrite the cache"
+
+
+def test_delegated_mode_does_not_spend_the_daily_budget_itself(
+    delegated_env, monkeypatch
+) -> None:
+    from micro_notify import guard
+
+    def never(*_args, **_kwargs):
+        raise AssertionError("doctor wrote the daily counter")
+
+    monkeypatch.setattr(guard, "record_send", never)
+    assert run_doctor() == EXIT_OK
