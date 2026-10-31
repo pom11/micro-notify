@@ -1068,10 +1068,13 @@ def _config_step(
     which is the whole advantage over the manual path — nothing is typed.
 
     In delegated mode (``mode=`` :data:`MODE_DELEGATED`, D5) two values change and
-    nothing else does: ``mode`` becomes ``delegated`` and ``sender`` is the UPN the
-    sign-in produced, because amendment A.3 makes the sender the identity in the token
-    rather than a mailbox the app impersonates. ``auth`` stays ``certificate`` — see
-    :func:`_bootstrap_delegated` for why a delegated run writes no new credential.
+    nothing else does: ``mode`` becomes ``delegated`` and the sender is the address the
+    operator passed — which the following sign-in must then prove is the person actually
+    signing in, because amendment A.3 makes the sender the identity in the token rather
+    than a mailbox the app impersonates (see :func:`_require_signed_in_as`, which refuses
+    the run when the two disagree). ``auth`` stays ``certificate`` — see
+    :func:`_bootstrap_delegated` for why a delegated run writes no new credential, and
+    for why this step runs *before* the sign-in rather than after it.
 
     A file that already says exactly what this run would say is *not* rewritten: the
     re-run reports ``exists`` and leaves the bytes (and the mtime) alone, which is what
@@ -1310,6 +1313,16 @@ def _bootstrap_delegated(
     _public_client_step(entra.app_id, out)
     if getattr(args, "admin_consent", False):
         _consent_step(entra.sp_object_id, out)
+    else:
+        # Recorded rather than left out, so the step vocabulary of a real run is the same
+        # list `--dry-run` printed. A summary that quietly lacked a step the plan showed
+        # would make an operator re-read the plan to work out whether the step was skipped
+        # or forgotten, and would make the two summaries not comparable by `jq`.
+        out.add(
+            STEP_CONSENT,
+            OUTCOME_SKIPPED,
+            "not requested: pass --admin-consent, or consent per user with `mnotify login`",
+        )
 
     # The config before the sign-in, because the sign-in needs it: amendment A.1 puts
     # the delegated login on *this* registration, and `mnotify login` reads its client
