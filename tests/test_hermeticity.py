@@ -152,6 +152,18 @@ def test_the_snapshot_detects_created_modified_and_deleted(tmp_path: Path) -> No
 
 
 # --- The keychain guard: security(1) must never be exec'd -------------------
+# Every in-process probe below names a *path that cannot exist*
+# (``/nonexistent-mnotify-test/security``) or a read-only verb against a canary
+# account that cannot exist. Both shapes still exercise the check — it matches the
+# executable NAME — while making a broken guard harmless: a removed check then dies
+# with ``FileNotFoundError``, or misses an absent keychain item. It must never be
+# possible for a regression in the guard to execute the real ``security(1)``
+# against a real account, which would echo the operator's secret into the test
+# report, or to reach ``add-generic-password``, which would mutate the keychain.
+UNEXECUTABLE_SECURITY = "/nonexistent-mnotify-test/security"
+CANARY_ACCOUNT = "hermeticity.canary.does-not-exist"
+
+
 def test_the_session_patch_is_the_one_in_force() -> None:
     """Structural proof: every exec entry point is the guarded object right now.
 
@@ -189,11 +201,11 @@ def test_the_forbidden_set_is_the_documented_one() -> None:
 @pytest.mark.parametrize(
     "argv",
     [
-        [SECURITY_BINARY, "find-generic-password", "-s", secrets.SERVICE, "-a", "graph.client_secret"],
-        [secrets.SECURITY_BINARY.rsplit("/", 1)[-1], "delete-generic-password"],
-        ["security", "add-generic-password", "-s", secrets.SERVICE],
+        [UNEXECUTABLE_SECURITY, "find-generic-password", "-s", secrets.SERVICE, "-a", CANARY_ACCOUNT],
+        ["security", "find-generic-password", "-s", secrets.SERVICE, "-a", CANARY_ACCOUNT],
+        [UNEXECUTABLE_SECURITY, "delete-generic-password", "-s", secrets.SERVICE, "-a", CANARY_ACCOUNT],
     ],
-    ids=["absolute-path", "bare-name", "add-generic-password"],
+    ids=["absolute-path", "bare-name", "delete-verb"],
 )
 def test_the_keychain_guard_refuses_a_security_argv_before_executing_it(argv: list[str]) -> None:
     """``security`` fails the test at the argv, so the binary is never reached."""
@@ -203,19 +215,19 @@ def test_the_keychain_guard_refuses_a_security_argv_before_executing_it(argv: li
         subprocess.Popen(argv)
 
 
-def test_the_keychain_guard_catches_a_path_object_as_argv_zero(tmp_path: Path) -> None:
+def test_the_keychain_guard_catches_a_path_object_as_argv_zero() -> None:
     """``Path`` argv is as good as a string: the check stringifies before matching."""
     with pytest.raises(AssertionError, match="off-limits in tests"):
-        subprocess.run([Path(SECURITY_BINARY), "find-generic-password"])
+        subprocess.run([Path(UNEXECUTABLE_SECURITY), "find-generic-password"])
 
 
 @pytest.mark.parametrize(
     "command",
     [
-        "security find-generic-password -s mnotify",
-        "/usr/bin/security -i",
+        f"{UNEXECUTABLE_SECURITY} find-generic-password -s mnotify -a {CANARY_ACCOUNT}",
+        "security find-generic-password -s mnotify -a " + CANARY_ACCOUNT,
     ],
-    ids=["bare-name-shell", "absolute-path-shell"],
+    ids=["absolute-path-shell", "bare-name-shell"],
 )
 def test_the_shell_guards_refuse_a_security_command(command: str) -> None:
     """``os.system`` / ``os.popen`` are guarded too — a shell string is not a hole."""
@@ -227,16 +239,22 @@ def test_the_shell_guards_refuse_a_security_command(command: str) -> None:
 
 @pytest.mark.parametrize(
     "argv",
-    [["security", "find-generic-password"], [SECURITY_BINARY, "-i"]],
-    ids=["bare-name", "absolute-path"],
+    [
+        [UNEXECUTABLE_SECURITY, "find-generic-password", "-a", CANARY_ACCOUNT],
+        [UNEXECUTABLE_SECURITY, "-i"],
+    ],
+    ids=["find-verb", "interactive-flag"],
 )
 def test_the_exec_guards_refuse_before_the_process_is_replaced(argv: list[str]) -> None:
     """``os.exec*`` runs the argv check; the check is pure, so nothing is exec'd here.
 
-    Tested through the guard functions rather than by calling ``os.execvp`` for
-    real: if that check were broken the call would replace the pytest process
-    instead of failing, which reports badly. The wiring of those functions onto
-    ``os`` is pinned by :func:`test_the_session_patch_is_the_one_in_force`.
+    The unexecutable path is what makes this probe safe to *run*: ``os.execvp``
+    resolves its name through PATH, so with the check removed a bare ``security``
+    would exec the real binary and replace the pytest process — the one failure
+    mode that cannot report itself. A path that cannot exist turns that outcome
+    into a plain ``FileNotFoundError``, and the guard still sees the same argv
+    shape it guards in production. The wiring of these functions onto ``os`` is
+    pinned by :func:`test_the_session_patch_is_the_one_in_force`.
     """
     for guard in (conftest._guarded_execv, conftest._guarded_execvp):
         with pytest.raises(AssertionError, match="off-limits in tests"):
