@@ -1127,3 +1127,228 @@ def test_plan_function_is_not_re_exported_to_avoid_shadowing_b4() -> None:
 def test_error_is_an_auth_error() -> None:
     assert issubclass(CertUploadError, secrets.KeychainError.__bases__[0])
     assert CertUploadError("x").exit_code == EXIT_AUTH
+
+
+# =============================================================================
+# BUG2 live-scenario reducer — the shape ``az`` 2.90.0 ACTUALLY emits
+# =============================================================================
+# The 2026-10-31 live B6 run reported ``created`` on an already-configured
+# tenant, generated a new key pair and replaced the keychain certificate.
+# This reducer replays that exact scenario — keychain pair present, and the
+# app holding exactly one credential whose thumbprint is the keychain's —
+# against the canned answer ``az`` really prints, so idempotency is pinned to
+# the CLI's real output rather than to the older spelling in ``cert_entry``
+# (which base64-encodes the thumbprint; live az prints 40-char UPPERCASE HEX
+# instead). Shape sources, all cited in the PR body:
+#
+# * azure-cli 2.90.0 source (the operator's own install):
+#   ``azure/cli/command_modules/role/custom.py:1148``
+#   ``list_application_credentials`` -> ``show_application`` (:1072) ->
+#   ``_list_credentials`` (:2117) returns the application object's
+#   ``keyCredentials`` verbatim; ``role/_msgrpah/_graph_client.py:99``
+#   ``application_get`` is ``GET /applications/{id}`` (Graph v1.0). No
+#   transformation is applied between Graph and stdout.
+# * Graph ``keyCredential`` resource schema: ``customKeyIdentifier``,
+#   ``displayName``, ``endDateTime``, ``key``, ``keyId``, ``startDateTime``,
+#   ``type``, ``usage``.
+# * Live capture (operator machine, az 2.90.0, 2026-10-31, values redacted):
+#   ``customKeyIdentifier`` arrives as 40-character uppercase hex (20-byte
+#   SHA-1), ``key`` is ``null``, dates carry az's own
+#   ``%Y-%m-%dT%H:%M:%SZ`` wire format (``custom.py:1931 _datetime_to_utc``),
+#   and the entry key set is exactly the eight keys above.
+#
+# The reducer is deliberately written against live state BEFORE any product
+# change: on main it passes — the live scenario reports ``exists`` — which is
+# the finding of the BUG2 investigation (the parser is not what missed).
+
+# Placeholder key id for canned credentials (metadata only, never a secret).
+CREDENTIAL_KEY_ID = "00000000-0000-0000-0000-000000000000"
+
+
+def live_az_credential_entry(
+    thumbprint_hex: str,
+    *,
+    end_date: str,
+    key_id: str = CREDENTIAL_KEY_ID,
+    display_name: str = "CN=micro-notify",
+    start_date: str = "2026-10-31T13:59:27Z",
+) -> dict[str, Any]:
+    """One ``keyCredentials`` entry exactly as az 2.90.0 prints it (see above).
+
+    ``thumbprint_hex`` goes into ``customKeyIdentifier`` as the uppercase hex
+    az/Graph served — deliberately *not* base64, because that is what the CLI
+    was observed to emit on the operator's tenant.
+    """
+    return {
+        "customKeyIdentifier": thumbprint_hex.upper(),
+        "displayName": display_name,
+        "endDateTime": end_date,
+        "key": None,
+        "keyId": key_id,
+        "startDateTime": start_date,
+        "type": "AsymmetricX509Cert",
+        "usage": "Verify",
+    }
+
+
+def _forbid_generate(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    """Make any call to ``certgen.generate_certificate`` an immediate failure."""
+    counter = {"calls": 0}
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        counter["calls"] += 1
+        raise AssertionError("generate_certificate was called on the exists path")
+
+    monkeypatch.setattr(certupload.certgen, "generate_certificate", spy)
+    return counter
+
+
+def test_live_az_shape_reports_exists_without_rekeying(
+    pair: dict[str, str],
+    fake_keychain: Any,
+    keychain_writes: list[tuple[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The BUG2 reducer: live az shape + matching keychain pair -> ``exists``.
+
+    Pins the whole card DoD for the exists path: the outcome, no call to
+    :func:`micro_notify.certgen.generate_certificate` (spied at the call site,
+    not only via the fake openssl), no ``credential reset`` argv, exactly one
+    read, and both keychain accounts byte-equal after the run.
+    """
+    seed_pair(fake_keychain, pair)
+    before = dict(fake_keychain.items)
+    fake = FakeAz(
+        {
+            ("az", "ad", "app", "credential", "list"): json.dumps(
+                [live_az_credential_entry(pair["thumbprint"], end_date=pair["not_after"])]
+            )
+        }
+    )
+    openssl = FakeOpenssl(pair)
+    generated = _forbid_generate(monkeypatch)
+
+    result = ensure_certificate_credential(APP_ID, runner=fake, cert_runner=openssl)
+
+    assert result.outcome == OUTCOME_EXISTS
+    assert (result.created, result.generated) == (False, False)
+    assert result.thumbprint == pair["thumbprint"]
+    assert result.expires_at == pair["not_after"]
+    assert result.expired is False
+    assert result.other_credentials == 0
+    assert generated["calls"] == 0
+    assert openssl.invoked is False, "openssl ran on the exists path"
+    assert fake.reset_calls == [], "an upload was attempted on the exists path"
+    assert fake.list_calls == [
+        ["az", "ad", "app", "credential", "list", "--id", APP_ID, "--cert"]
+    ]
+    assert keychain_writes == []
+    assert dict(fake_keychain.items) == before, "the keychain pair was rewritten"
+
+
+def test_live_az_shape_matches_ours_among_foreign_credentials(
+    pair: dict[str, str],
+    fake_keychain: Any,
+    keychain_writes: list[tuple[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression pin: foreign credentials on the app must not mask our match.
+
+    The tenant may carry other certificates (a rotation, a different app's
+    orphan); the exists check must still find ours by thumbprint among them,
+    report them as ``other_credentials``, and change nothing.
+    """
+    seed_pair(fake_keychain, pair)
+    before = dict(fake_keychain.items)
+    fake = FakeAz(
+        {
+            ("az", "ad", "app", "credential", "list"): json.dumps(
+                [
+                    live_az_credential_entry("B" * 40, end_date="2027-01-01T00:00:00Z"),
+                    live_az_credential_entry(pair["thumbprint"], end_date=pair["not_after"]),
+                    live_az_credential_entry("C" * 40, end_date="2027-01-01T00:00:00Z"),
+                ]
+            )
+        }
+    )
+    generated = _forbid_generate(monkeypatch)
+
+    result = ensure_certificate_credential(
+        APP_ID, runner=fake, cert_runner=FakeOpenssl(pair)
+    )
+
+    assert result.outcome == OUTCOME_EXISTS
+    assert result.thumbprint == pair["thumbprint"]
+    assert result.other_credentials == 2
+    assert generated["calls"] == 0
+    assert fake.reset_calls == []
+    assert keychain_writes == []
+    assert dict(fake_keychain.items) == before
+
+
+def test_live_az_shape_matches_ours_alongside_a_base64_spelling(
+    pair: dict[str, str],
+    fake_keychain: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both thumbprint spellings may sit on one app; ours still matches.
+
+    ``cert_entry`` (base64) models what other tools/tenants have been seen to
+    carry; ``live_az_credential_entry`` (hex) is what this tenant serves. The
+    normaliser's job is precisely that the two spellings of the same 20 bytes
+    compare equal, so the exists check must not depend on which spelling the
+    *matching* entry happens to use.
+    """
+    seed_pair(fake_keychain, pair)
+    fake = FakeAz(
+        {
+            ("az", "ad", "app", "credential", "list"): json.dumps(
+                [
+                    cert_entry("D" * 40, "2027-01-01T00:00:00Z"),
+                    live_az_credential_entry(pair["thumbprint"], end_date=pair["not_after"]),
+                ]
+            )
+        }
+    )
+    generated = _forbid_generate(monkeypatch)
+
+    result = ensure_certificate_credential(
+        APP_ID, runner=fake, cert_runner=FakeOpenssl(pair)
+    )
+
+    assert result.outcome == OUTCOME_EXISTS
+    assert result.other_credentials == 1
+    assert generated["calls"] == 0
+    assert fake.reset_calls == []
+
+
+def test_live_az_shape_expired_still_reports_exists_not_a_rekey(
+    pair: dict[str, str],
+    fake_keychain: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An expired matching credential is reported, never silently re-keyed.
+
+    Re-keying is ``mnotify setup --gen-cert``'s call to make; the bootstrap
+    step only surfaces the expiry. Pinning this here matters because the
+    BUG2 live report showed what an unasked-for re-key costs the operator.
+    """
+    seed_pair(fake_keychain, pair)
+    fake = FakeAz(
+        {
+            ("az", "ad", "app", "credential", "list"): json.dumps(
+                [live_az_credential_entry(pair["thumbprint"], end_date="2020-01-01T00:00:00Z")]
+            )
+        }
+    )
+    generated = _forbid_generate(monkeypatch)
+
+    result = ensure_certificate_credential(
+        APP_ID, runner=fake, cert_runner=FakeOpenssl(pair)
+    )
+
+    assert result.outcome == OUTCOME_EXISTS
+    assert result.expired is True
+    assert "expired" in result.detail
+    assert generated["calls"] == 0
+    assert fake.reset_calls == []
