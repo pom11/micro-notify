@@ -68,6 +68,7 @@ not-ok: it means "could not verify", not "verified bad".
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -415,6 +416,14 @@ def check_powershell(*, runner: CommandRunner | None = None) -> CheckResult:
 
 
 # --- Check 5: ExchangeOnlineManagement module -------------------------------
+# Dotted versions pwsh may hand us ("3.10.1", "3.10"); at least one dot is
+# required, a bare integer is not treated as a version.
+_VERSION_DOTTED_RE = re.compile(r"\d+(?:\.\d+)+")
+
+# ANSI CSI sequences pwsh's console formatter can wrap table output in.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
 def check_exchange_module(*, runner: CommandRunner | None = None) -> CheckResult:
     """The Exchange Online PowerShell module is installed for this user.
 
@@ -422,6 +431,17 @@ def check_exchange_module(*, runner: CommandRunner | None = None) -> CheckResult
     ``Get-Module -ListAvailable`` never loads the module, so the probe cannot hang
     on a sign-in prompt. Empty output means "installed: no" (exit 0), which is why
     stdout decides the verdict rather than the exit code.
+
+    The probe renders the version itself (``.Version.ToString()``) because a bare
+    ``Version`` object reaching the console goes through Format-Table, and the old
+    probe echoed that table verbatim into the report — literally
+    ``ExchangeOnlineManagement Major Minor Build Revision ----- 3 10 1 -1``
+    (live run BUG 3). Parsing is defensive anyway: the highest version seen wins,
+    and output that holds no version at all degrades to a bare ``installed`` — the
+    check's real answer is presence, so an unreadable version must never turn into
+    an echo of raw output. The detail is always one line, and stderr never reaches
+    it: pwsh's stderr is a multi-record error dump, while the exit code plus the
+    install hint is the actionable half.
     """
     active = get_runner() if runner is None else runner
     argv = [
@@ -429,20 +449,19 @@ def check_exchange_module(*, runner: CommandRunner | None = None) -> CheckResult
         "-NoProfile",
         "-NonInteractive",
         "-Command",
-        f"Get-Module -ListAvailable {EXO_MODULE} | "
-        "Select-Object -First 1 -ExpandProperty Version",
+        f"Get-Module -ListAvailable {EXO_MODULE} "
+        "| Sort-Object Version -Descending | Select-Object -First 1 "
+        "-ExpandProperty Version | ForEach-Object { $_.ToString() }",
     ]
     result = active.run(argv)
     returncode = int(getattr(result, "returncode", 1) or 0)
-    stderr = (getattr(result, "stderr", None) or "").strip()
-    stdout = " ".join((getattr(result, "stdout", None) or "").split())
+    stdout = (getattr(result, "stdout", None) or "").strip()
 
     if returncode != 0:
         return CheckResult(
             CHECK_EXO_MODULE,
             FAIL,
-            detail=f"pwsh could not list installed modules (exit {returncode})"
-            + (f": {stderr}" if stderr else ""),
+            detail=f"pwsh could not list installed modules (exit {returncode})",
             fix_hint=INSTALL_EXO_HINT,
         )
     if not stdout:
@@ -452,7 +471,56 @@ def check_exchange_module(*, runner: CommandRunner | None = None) -> CheckResult
             detail=f"module {EXO_MODULE} is not installed for this user",
             fix_hint=INSTALL_EXO_HINT,
         )
-    return CheckResult(CHECK_EXO_MODULE, OK, detail=f"{EXO_MODULE} {stdout}")
+    version = _clean_module_version(stdout)
+    shown = version if version else "installed"
+    return CheckResult(CHECK_EXO_MODULE, OK, detail=f"{EXO_MODULE} {shown}")
+
+
+def _clean_module_version(stdout: str) -> str:
+    """The highest version pwsh's output names, or ``''`` when it names none.
+
+    Handles both shapes the probe can produce: the expected one version line
+    (``3.10.1``), and the legacy Format-Table dump whose data rows are the four
+    ``System.Version`` fields (``3  10  1  -1``) under a header the parser simply
+    never matches. A ``-1`` means "field not set" on that struct, so trailing
+    ``-1`` components are dropped the same way ``Version.ToString()`` drops them.
+    """
+    candidates: list[tuple[int, ...]] = []
+    for raw in _ANSI_ESCAPE_RE.sub("", stdout).splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        dotted = _VERSION_DOTTED_RE.search(line)
+        if dotted:
+            candidates.append(tuple(int(p) for p in dotted.group().split(".")))
+            continue
+        row = _table_row_version(line)
+        if row:
+            candidates.append(row)
+    if not candidates:
+        return ""
+    return ".".join(str(part) for part in max(candidates))
+
+
+def _table_row_version(line: str) -> tuple[int, ...] | None:
+    """Version tuple from a Format-Table data row like ``3  10  1  -1``.
+
+    Requires at least two integer columns, so a stray digit line is not invented
+    into a version; the header (``Major Minor ...``) and separator
+    (``----- ----- ...``) rows have no integer columns and fall through.
+    """
+    tokens = line.split()
+    values: list[int] = []
+    for token in tokens:
+        try:
+            values.append(int(token))
+        except ValueError:
+            return None
+    if len(values) < 2:
+        return None
+    while values and values[-1] < 0:
+        values.pop()
+    return tuple(values) if values else None
 
 
 # --- Check 6: the sender mailbox exists ------------------------------------
