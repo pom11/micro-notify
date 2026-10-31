@@ -1458,20 +1458,17 @@ def test_a_subclass_of_the_default_runner_is_left_alone(
     assert admin_cmd.admin_runner.get_runner() is sentinel
 
 
-def test_the_timeout_budget_follows_the_command_not_the_caller() -> None:
-    """pwsh waits on a human typing a code into a browser and brew installs real
-    packages; a 60 s probe budget fits neither. az keeps its 60 s."""
-    runner = admin_cmd.StreamingRunner()
-    assert runner._budget(["pwsh", "-NoProfile", "-File", "x.ps1"]) == exo_module.PWSH_TIMEOUT
-    assert runner._budget(["powershell", "-File", "x.ps1"]) == exo_module.PWSH_TIMEOUT
-    assert runner._budget(["brew", "install", "azure-cli"]) == admin_cmd.BREW_TIMEOUT
-    assert runner._budget(["az", "account", "show"]) == admin_cmd.SUBPROCESS_TIMEOUT
-
-
 def test_run_streaming_hands_the_prompt_over_before_the_process_ends(
     tmp_path: Path,
 ) -> None:
     """The behavioural pin for the failure this runner exists to prevent.
+
+    Lives here rather than in ``tests/test_admin_runner.py`` on purpose: the class it
+    exercises now lives in :mod:`micro_notify.admin.runner`, but what this test proves
+    is a property of the *installed* runner on the real CLI path — the thing the
+    Exchange step depends on — so it travels with the call-site pins below. The class's
+    own pins (transcript collection, timeout, missing binary, per-binary budget) are in
+    ``tests/test_admin_runner.py``, where the class is.
 
     The child prints a device-code-shaped line and then waits for a file that only
     the sink can create: if the prompt reaches ``on_line`` while pwsh is still
@@ -1507,37 +1504,6 @@ def test_run_streaming_hands_the_prompt_over_before_the_process_ends(
     assert seen and "enter the code" in seen[0]
     assert gate.exists(), "the sink never saw the prompt while the child was running"
     assert result.returncode == 0, "streaming fell back to capture: the child timed out"
-
-
-def test_run_streaming_collects_the_whole_transcript_and_exit_code() -> None:
-    """B4 still reads the transcript back to decide whether the scope holds, and
-    reads a missing returncode as failure — so both must survive streaming."""
-    result = admin_cmd.StreamingRunner().run_streaming(
-        [sys.executable, "-c", "print('one'); print('two'); raise SystemExit(0)"],
-        on_line=None,
-        timeout=30.0,
-    )
-    assert result.returncode == 0
-    assert result.stdout.split() == ["one", "two"]
-
-
-def test_run_streaming_reports_a_timeout_as_124_not_as_success() -> None:
-    """A sign-in nobody completed must not read as a green step."""
-    result = admin_cmd.StreamingRunner().run_streaming(
-        [sys.executable, "-c", "import time; print('waiting'); time.sleep(30)"],
-        on_line=None,
-        timeout=1.0,
-    )
-    assert result.returncode == admin_cmd.admin_runner.EXIT_TIMEOUT
-    assert "timed out" in (result.stderr or "")
-
-
-def test_run_streaming_surfaces_a_missing_binary_as_127() -> None:
-    """The pre-flight's 'not installed' wording depends on this, not on a crash."""
-    result = admin_cmd.StreamingRunner().run_streaming(
-        ["definitely-not-a-real-binary-9f3a"], on_line=None, timeout=5.0
-    )
-    assert result.returncode == admin_cmd.admin_runner.EXIT_NOT_FOUND
 
 
 # ===========================================================================
