@@ -848,3 +848,193 @@ as success when it was not.
 Finish with [Final verification](#final-verification). Expect `token: warn` there — as
 that section says, an absent roles claim is what a correctly hardened tenant's token
 looks like, and it is not a failure.
+
+---
+
+## The delegated tenant — `mnotify admin bootstrap --mode delegated`
+
+Everything above configures the **app-only** tenant: a certificate credential plus an
+Exchange Online scoped role, sending as one mailbox the app is allowed to impersonate.
+Design amendment A (see [the design doc](design/2026-10-27-micro-notify-design.md))
+adds a second tenant shape for a person to send as: **delegated** mode, where the sender
+is the signed-in identity and there is no certificate at all.
+
+`--mode delegated` configures that second shape with the same command, the same
+pre-flight, the same find-first app registration, the same config writer and the same
+`doctor` at the end. It is not a second command and not a second registration: the app
+`bootstrap` finds or creates in step 2 is the one `mnotify login` signs in through, which
+is why the delegated flow writes its config *before* the sign-in — `mnotify login` reads
+its client id and tenant from `[mail]`, and on a fresh tenant that file does not exist yet.
+
+```sh
+mnotify admin bootstrap --sender me@contoso.com --allow-domain contoso.com --mode delegated
+```
+
+### The steps, in order
+
+| # | step | what it does |
+| - | ---- | ------------ |
+| 1 | `preflight` | B1's read-only checks, **minus the two PowerShell ones** (see below) |
+| 2 | `entra-app` | the same find-first app registration + service principal as app mode |
+| 3 | `delegated-permissions` | declares the five §A.2 delegated scopes on the registration |
+| 4 | `public-client-flows` | turns on `isFallbackPublicClient` — the device-code flow's switch |
+| 5 | `admin-consent` | optional, opt-in with `--admin-consent`; a refusal warns and continues |
+| 6 | `config` | writes `[mail] mode = "delegated"`, sender = your `--sender` |
+| 7 | `signin` | `mnotify login`, delegated rather than re-implemented — the device-code flow |
+| 8 | `doctor` | the mode-aware delegated checks (token, scopes, who-ami, allow) |
+
+Two steps app mode has and this one does not, and neither is an omission:
+
+- **no certificate** — a delegated send builds no confidential client, so a key uploaded
+  here would be a credential the tool never reads;
+- **no Exchange scoped role** (steps 2.1–2.4) — the sender is the signed-in person, not a
+  mailbox the application impersonates, so there is no recipient scope to bound (§A.3).
+
+For the same reason `--control-mailbox` is not part of this mode, and the two `pwsh`
+pre-flight checks are skipped: a route that never calls PowerShell must not be refused by
+a machine that cannot run it. App mode still requires both.
+
+### `Allow public client flows` — conditional, and this is the only place it is set
+
+Step 1.4 of this document tells you to leave the portal's **"Allow public client flows"**
+toggle at **No**. That instruction is **app-only guidance**, and it stays correct for
+every tenant that sends through the certificate + scoped-role route above. Do not change
+it there.
+
+The toggle is **Yes** for a delegated tenant, because the device-code flow is a
+public-client flow: with the switch off Entra issues the code and then refuses to redeem
+it (`invalid_client`), so the sign-in in step 7 can never complete. The value is the
+registration-level property `isFallbackPublicClient` — the portal's label, `az ad app
+update`'s `--set isFallbackPublicClient=true`, and the Graph property are the same switch.
+(Note that `allowPublicClientFlows`, which reads as though it should be the property name,
+is not one: it is neither an `az` flag nor a Graph property, and writing it fails.)
+
+Two things follow from it being registration-level rather than mode-level, and both are
+why `bootstrap` turns it on only under `--mode delegated`:
+
+- it is **one switch for the whole registration**. A tenant that runs *both* shapes on one
+  registration has it on, which is what the delegated half needs and a widening the
+  app-only half did not ask for. If you want the two shapes fully separated, use two
+  registrations;
+- `bootstrap` in app mode **never** touches it. An app-only registration holds a
+  certificate credential, and opening such a registration to public-client flows for no
+  reason is exactly the kind of silent widening this document exists to prevent.
+
+There is one line of code in this project that sets the property, and it runs only in
+delegated mode. `tests/test_admin_delegated.py` pins that from both directions: delegated
+mode sets it once, app mode never builds a command that mentions it.
+
+### `--admin-consent`, and why it is allowed to fail
+
+`--admin-consent` requests tenant-wide admin consent for **exactly the five delegated
+scopes**, through `az ad app permission grant --scope "Mail.Send ChatMessage.Send
+Chat.ReadBasic User.Read offline_access"`.
+
+- It is **not** `az ad app permission admin-consent`. That command consents *every*
+  permission the registration declares — including an app-only tenant's `Mail.Send`
+  application permission, which is the tenant-wide grant [3.1](#31-why-this-step-exists)
+  exists to remove. `bootstrap` never builds it, and a test pins that.
+- It **never** adds or removes an application permission. The declared delegated scopes are
+  *added* with one `az ad app permission add` per scope (`--api-permissions <id>=Scope`),
+  which leaves any `Role` entry on the registration exactly where it was. Neither
+  `--set requiredResourceAccess+=` nor a whole-list `--set` is used: az's generic update
+  *replaces* the matching resource entry rather than extending it, which would clobber the
+  other mode's permissions.
+- A **refusal is not a failure.** In a tenant whose verification rules block admin consent
+  the command warns, records the step as `skipped` carrying az's reason, and carries on:
+  your own `mnotify login` consents those same five scopes for you alone. That is the
+  whole reason the flag is opt-in — the tenant-side work is useful whether or not consent
+  lands.
+- It is **refused outright in app mode** (exit 2), not ignored. An app-only tenant must not
+  gain a consented Graph permission, and quietly dropping the flag would leave you
+  believing you had consented something.
+
+### The sender must be the person who signs in
+
+In delegated mode the sender is not a mailbox the app reaches; it *is* the identity in the
+token (§A.3). So after the sign-in, `bootstrap` compares the signed-in UPN with the
+sender it just wrote and **refuses the run** if they differ (exit 2):
+
+```
+signed in as somebody.else@contoso.com but this run was asked to configure sender 'me@contoso.com'.
+In delegated mode the sender must be the signed-in person (design amendment A.3), so either
+`mnotify logout` and sign in again as 'me@contoso.com', or re-run with --sender somebody.else@contoso.com
+```
+
+It deliberately does **not** rewrite the config to match the token. You passed `--sender`
+on purpose, and a bootstrap quietly changing which mailbox a tool sends from is the sort of
+surprise a setup command must not commit.
+
+The sign-in itself is careful about asking twice: a cache-only check (`login --no-prompt`)
+runs first, so a re-run on a configured tenant reports `exists` and never opens a browser.
+The device-code flow starts only when the cache cannot produce a token — after every
+tenant write, so you are asked once, at the point where the tenant is ready for you.
+
+### Delegated mode refuses, and with which exit code
+
+| Situation | Result |
+| --------- | ------ |
+| `--admin-consent` without `--mode delegated` | exit 2, before the first probe |
+| the tenant's Graph service principal does not publish one of the five scopes | exit 2 naming it, **before** any permission is written |
+| signed-in UPN is not the configured `--sender` | exit 2, both fixes named; `doctor` is not reached |
+| `--admin-consent` refused by the tenant | the step reports `skipped` with the reason; the run still exits 0 |
+| no `--allow-domain` at all | exit 2 before the first probe (same guard as app mode) |
+| existing config holds a different sender, mode or allowlist | exit 2 unless `--force-config` |
+
+A scope the tenant does not publish is a hard stop rather than a skip: writing a permission
+whose id cannot be resolved produces a registration that signs in and then cannot send.
+
+### `--json` for a delegated run
+
+```sh
+mnotify admin bootstrap --sender me@contoso.com --allow-domain contoso.com \
+  --mode delegated --json
+```
+
+```json
+{
+  "ok": true,
+  "exitCode": 0,
+  "steps": [
+    {"name": "preflight", "outcome": "exists", "detail": "all checks already pass"},
+    {"name": "entra-app", "outcome": "exists", "detail": "found existing app registration and service principal for micro-notify"},
+    {"name": "delegated-permissions", "outcome": "exists", "detail": "delegated scopes Mail.Send, ChatMessage.Send, Chat.ReadBasic, User.Read, offline_access already declared (nothing to add)"},
+    {"name": "public-client-flows", "outcome": "exists", "detail": "isFallbackPublicClient already true — Allow public client flows is on, as amendment A.2 requires for a delegated tenant"},
+    {"name": "admin-consent", "outcome": "skipped", "detail": "not requested: pass --admin-consent, or consent per user with `mnotify login`"},
+    {"name": "config", "outcome": "exists", "detail": "/Users/you/.config/mnotify/config.toml (unchanged)"},
+    {"name": "signin", "outcome": "exists", "detail": "cached delegated sign-in still works"},
+    {"name": "doctor", "outcome": "exists", "detail": "checks green"}
+  ],
+  "mode": "delegated",
+  "sender": "me@contoso.com",
+  "allowDomains": ["contoso.com"],
+  "appId": "00000000-0000-0000-0000-000000000000",
+  "delegatedScopes": ["Mail.Send", "ChatMessage.Send", "Chat.ReadBasic", "User.Read", "offline_access"],
+  "publicClientFlows": true,
+  "signedInAs": "me@contoso.com",
+  "configPath": "/Users/you/.config/mnotify/config.toml",
+  "doctorExit": 0
+}
+```
+
+The step list is the same shape app mode prints, and `admin-consent` appears in it even
+when it was not requested: the plan `--dry-run` prints and the summary a real run reports
+are comparable entry by entry, so `jq` needs no mode-specific handling. There is no
+`thumbprint`, `scopeName` or `controlMailbox` key, because a delegated run has no
+certificate, no recipient scope and no negative control.
+
+Re-running a configured delegated tenant reports `exists` for the permissions and the
+public-client switch and writes nothing: the scope ids and the flag are read back first,
+and only what is genuinely missing is written.
+
+### What delegated mode never does
+
+- **Never writes a certificate or a secret**, and never touches `passwordCredentials`.
+- **Never grants an application permission** and never runs `admin-consent`. The only
+  consent it can request is the five delegated scopes, and only with `--admin-consent`.
+- **Never turns on public-client flows in app mode** (above).
+- **Never prints a token.** `mnotify login` owns the device-code prompt and the keychain
+  write; `bootstrap` reads back only the signed-in UPN (§A.2).
+- **Never leaves you signed out.** The point of the mode is that the tenant ends configured
+  *and* signed in, so `doctor`'s delegated checks can be green on a fresh tenant.
+
