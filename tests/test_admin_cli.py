@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -91,6 +92,55 @@ def no_real_admin_binaries(monkeypatch: pytest.MonkeyPatch) -> Any:
         return real_run(args, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", guarded)
+
+
+# The operator's own config file. Referenced only to prove this test module never
+# writes it — never read, never printed, never used as a target.
+OPERATOR_CONFIG = Path("~/.config/mnotify/config.toml").expanduser()
+
+
+def _config_stamp() -> tuple[bool, float | None]:
+    """(exists, mtime) of the operator's config. A stamp, not a read: the bytes
+    contain the operator's real tenant id and sender, which must not enter output."""
+    try:
+        return True, OPERATOR_CONFIG.stat().st_mtime_ns
+    except FileNotFoundError:
+        return False, None
+
+
+@pytest.fixture(autouse=True)
+def real_config_is_never_touched(
+    isolated_config: Path, tmp_path: Path
+) -> Any:
+    """Tripwire: no test in this module may write the operator's config file.
+
+    Why this exists rather than merely the fixture above: the bootstrap's config step
+    calls the real ``write_config``, and it *preserves* ``[paths]``, the Teams targets
+    and ``[limits]`` from whatever file is there. So a run that reaches that step with
+    ``MICRO_NOTIFY_CONFIG`` unset produces a file that looks almost right — the
+    operator's own paths and targets, with placeholder ``[mail]`` and ``[allow]`` on
+    top of them. That is the worst possible shape to notice: the config still parses,
+    ``doctor`` still passes ``config``, and the first real send fails with an AADSTS
+    error naming a tenant the operator never typed. It has already happened to this
+    machine once (see the card comment); an opt-in fixture is not a guard against it.
+
+    Checks both directions at teardown: the env var must point under ``tmp_path``, and
+    the operator's file must be exactly as it was (absent, or the same mtime).
+    """
+    before = _config_stamp()
+    yield
+    target = os.environ.get("MICRO_NOTIFY_CONFIG")
+    assert target, (
+        "MICRO_NOTIFY_CONFIG was unset at teardown: a test reached the config step "
+        "with the default path in effect, i.e. it could have written the operator's file"
+    )
+    assert Path(target).resolve().is_relative_to(tmp_path.resolve()), (
+        f"MICRO_NOTIFY_CONFIG points outside tmp_path: {target}"
+    )
+    assert _config_stamp() == before, (
+        "this test module modified the operator's real config file — the isolation "
+        "fixture did not hold, and the file now holds placeholder [mail] values"
+    )
 
 
 @pytest.fixture(autouse=True)
