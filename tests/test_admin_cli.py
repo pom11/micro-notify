@@ -1331,6 +1331,49 @@ def test_the_plain_default_runner_is_replaced_by_the_streaming_one() -> None:
         admin_cmd.set_runner(None)
 
 
+def test_bootstrap_itself_installs_the_streaming_runner(
+    fake_cli: FakeAdminCli,
+    keychain_with_certificate: Any,
+    quiet_doctor: list[dict],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pins the CALL SITE, not just the function.
+
+    A test that only calls :func:`_use_streaming_runner` stays green when someone
+    deletes the line in ``bootstrap()`` that calls it — the defect would then be the
+    exact one this runner exists to prevent (the device-code prompt captured until
+    pwsh exits), reported by no test at all. So: run the command and require the hook
+    to have fired, before any step runs.
+    """
+    calls: list[int] = []
+    real = admin_cmd._use_streaming_runner
+
+    def hook() -> None:
+        calls.append(len(fake_cli.calls))
+        real()
+
+    monkeypatch.setattr(admin_cmd, "_use_streaming_runner", hook)
+    assert run_admin("bootstrap", "--sender", SENDER, "--allow-domain", DOMAIN) == EXIT_OK
+    assert calls == [0], f"expected one call before the first command, got {calls}"
+
+
+def test_dry_run_never_installs_the_streaming_runner(
+    keychain_with_certificate: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dry run's whole promise is that the runner stays a recorder; swapping in a
+    real streaming runner there would execute the plan it just printed."""
+    monkeypatch.setattr(
+        admin_cmd,
+        "_use_streaming_runner",
+        lambda: pytest.fail("a dry run must keep the recording runner"),
+    )
+    assert (
+        run_admin("bootstrap", "--sender", SENDER, "--allow-domain", DOMAIN, "--dry-run")
+        == EXIT_OK
+    )
+
+
 def test_an_installed_fake_runner_is_never_replaced(
     fake_cli: FakeAdminCli,
 ) -> None:
