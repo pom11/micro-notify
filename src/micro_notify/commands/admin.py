@@ -61,7 +61,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import sys
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -377,6 +377,31 @@ def _confirm_installs(formulas: Sequence[str]) -> bool:
     return answer in ("y", "yes")
 
 
+@contextlib.contextmanager
+def _restored_runner() -> Iterator[None]:
+    """Put the runner back exactly as this command found it, whatever happens.
+
+    ``--dry-run`` installs a recording runner process-wide, so leaving it behind
+    would make every later command in the same process silently stop executing —
+    in production that means a subsequent ``mnotify`` invocation inside the same
+    Python process would report success having done nothing. That is why this is a
+    ``finally`` and not a happy-path reset.
+
+    The restore is a *restore*, not a hard reset to the default: a harness that
+    installed its own runner before calling ``run()`` (a test, or an embedding
+    caller) keeps it. Resetting to ``None`` here would hand the second half of such
+    a run the real :class:`SubprocessRunner`, i.e. a real ``az`` — the difference
+    between a fake tenant and mutating a live one. When nothing was installed
+    beforehand, ``get_runner()`` hands back a fresh default runner, so restoring it
+    is the same behaviour as the default.
+    """
+    previous = admin_runner.get_runner()
+    try:
+        yield
+    finally:
+        set_runner(previous)
+
+
 def _install_via_brew(formulas: Sequence[str], report: Report) -> None:
     """Run ``brew install`` for the names B1 approved, through the runner seam.
 
@@ -533,48 +558,60 @@ def _dry_run(sender: str, args: argparse.Namespace, out: Report) -> int:
     Exits 0 whatever the canned answers say: a dry run reports a plan, it does not
     grade the tenant.
     """
-    runner = DryRunRunner(DRY_RUN_RESPONSES)
-    set_runner(runner)
+    # Reuse a recording runner the caller already installed (a harness, or an
+    # embedding caller); otherwise install this command's own. Reusing matters: a
+    # runner someone else installed is the one the steps will actually talk to, so
+    # printing from a *different* DryRunRunner would print nothing — the dry run
+    # would report an empty plan and still exit 0, which is the worst possible
+    # failure for a flag whose whole job is to show the plan.
+    active = admin_runner.get_runner()
+    runner = active if isinstance(active, DryRunRunner) else DryRunRunner(DRY_RUN_RESPONSES)
+    if runner is not active:
+        set_runner(runner)
     printer = _PlanPrinter(runner, out)
+    # No try/finally here: the runner belongs to the caller's `_restored_runner`,
+    # which puts it back whatever happens (see there). A dry run reports a plan, it
+    # does not grade the tenant, so it never raises on purpose.
     out.line("# dry run: every line below is a command that WOULD run; nothing is executed")
-    try:
-        report = preflight.run_preflight(sender)
-        printer.flush()
-        out.add(STEP_PREFLIGHT, OUTCOME_DRYRUN, "read-only probes recorded, none executed")
-        _print_checks(report, out)
-        if args.install_missing:
-            # The install command is only ever run behind a y/N answer, and a dry run
-            # asks nothing — so the line is planned, with the formula name shown as a
-            # marker because which formulas are needed depends on a probe not run.
-            printer.planned(["brew install <formula>"])
 
-        from ..admin import entra
+    report = preflight.run_preflight(sender)
+    printer.flush()
+    out.add(STEP_PREFLIGHT, OUTCOME_DRYRUN, "read-only probes recorded, none executed")
+    _print_checks(report, out)
+    if args.install_missing:
+        # The install command is only ever run behind a y/N answer, and a dry run
+        # asks nothing — so the line is planned, with the formula name shown as a
+        # marker because which formulas are needed depends on a probe not run.
+        printer.planned(["brew install <formula>"])
 
-        provisioning = entra.ensure_entra_app()
-        printer.flush()
-        out.add(STEP_ENTRA, OUTCOME_DRYRUN, f"would report: {provisioning.detail}")
-        app_id = provisioning.app_id or DRY_APP_ID
-        sp_object_id = provisioning.sp_object_id or DRY_SP_OBJECT_ID
+    from ..admin import entra
 
-        # B3's write path refuses a recording runner (it would generate a real key and
-        # rewrite the keychain while the tenant stayed unchanged) — so print its plan.
-        printer.planned(plan_certificate_upload(app_id))
-        out.add(
-            STEP_CERTIFICATE,
-            OUTCOME_DRYRUN,
-            "planned the upload; no key generated and nothing written to the keychain",
-        )
+    provisioning = entra.ensure_entra_app()
+    printer.flush()
+    out.add(STEP_ENTRA, OUTCOME_DRYRUN, f"would report: {provisioning.detail}")
+    app_id = provisioning.app_id or DRY_APP_ID
+    sp_object_id = provisioning.sp_object_id or DRY_SP_OBJECT_ID
 
-        control = _dry_control_mailbox(args, report)
-        printer.planned(plan_commands(app_id, sp_object_id, sender, admin_mailbox=control))
-        out.add(STEP_EXCHANGE, OUTCOME_DRYRUN, "planned the script; no file written or run")
+    # B3's write path refuses a recording runner (it would generate a real key and
+    # rewrite the keychain while the tenant stayed unchanged) — so print its plan.
+    # `plan_certificate_upload` returns ONE argv as a token list (B3's shape, unlike
+    # B4's plan_commands which already returns lines), so it joins to a single line:
+    # printing tokens one per line would scatter the command across the plan.
+    printer.planned([" ".join(plan_certificate_upload(app_id))])
+    out.add(
+        STEP_CERTIFICATE,
+        OUTCOME_DRYRUN,
+        "planned the upload; no key generated and nothing written to the keychain",
+    )
 
-        out.add(STEP_CONFIG, OUTCOME_DRYRUN, "no config file written")
-        out.add(STEP_DOCTOR, OUTCOME_SKIPPED, "nothing was changed, so nothing to verify")
-        if getattr(args, "send_test", None):
-            out.add(STEP_SEND_TEST, OUTCOME_SKIPPED, "a dry run sends nothing")
-    finally:
-        set_runner(None)
+    control = _dry_control_mailbox(args, report)
+    printer.planned(plan_commands(app_id, sp_object_id, sender, admin_mailbox=control))
+    out.add(STEP_EXCHANGE, OUTCOME_DRYRUN, "planned the script; no file written or run")
+
+    out.add(STEP_CONFIG, OUTCOME_DRYRUN, "no config file written")
+    out.add(STEP_DOCTOR, OUTCOME_SKIPPED, "nothing was changed, so nothing to verify")
+    if getattr(args, "send_test", None):
+        out.add(STEP_SEND_TEST, OUTCOME_SKIPPED, "a dry run sends nothing")
 
     out.note("dryRun", True)
     out.note("sender", sender)
@@ -817,10 +854,14 @@ def bootstrap(args: argparse.Namespace) -> int:
     out.note("sender", sender)
     out.note("allowDomains", list(domains))
 
-    if args.dry_run:
-        return _dry_run(sender, args, out)
+    # The runner is a process-wide global. A dry run installs a recording runner, and
+    # nothing may be left behind if the run raises partway through — a recording
+    # runner still installed would make a later command in the same process report
+    # success having done nothing. The context manager puts it back whatever happens.
+    with _restored_runner():
+        if args.dry_run:
+            return _dry_run(sender, args, out)
 
-    try:
         report = _preflight_step(sender, args.install_missing, out)
         out.note("preflight", report.to_dict())
         if report.tenant_id:
@@ -846,10 +887,6 @@ def bootstrap(args: argparse.Namespace) -> int:
         code = _doctor_step(getattr(args, "send_test", None), out)
         if getattr(args, "send_test", None):
             _send_test_step(args.send_test, out, code)
-    finally:
-        # The runner is a process-wide global; a failure mid-bootstrap must not leave a
-        # dry run's or a test's recorder installed for the rest of the process.
-        set_runner(None)
 
     return out.emit(ok=code == EXIT_OK)
 

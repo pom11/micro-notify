@@ -377,7 +377,7 @@ def test_the_steps_run_in_the_declared_order(
     order = fake_cli.prefixes()
     first = next(i for i, p in enumerate(order) if p[:2] == ("az", "account"))
     app_list = next(i for i, p in enumerate(order) if p[:4] == ("az", "ad", "app", "list"))
-    sp_list = next(i for i, p in enumerate(order) if p[:3] == ("az", "ad", "sp", "list"))
+    sp_list = next(i for i, p in enumerate(order) if p[:4] == ("az", "ad", "sp", "list"))
     creds = next(i for i, p in enumerate(order) if p[:5] == ("az", "ad", "app", "credential", "list"))
     script = next(i for i, p in enumerate(order) if p[:4] == ("pwsh", "-NoProfile", "-NonInteractive", "-File"))
     assert first < app_list < sp_list < creds < script
@@ -407,9 +407,14 @@ def test_the_config_is_written_only_after_the_exchange_proof(
     fake_cli: FakeAdminCli,
     keychain_with_certificate: Any,
     quiet_doctor: list[dict],
-    mnotify_config: Path,
 ) -> None:
-    """A config for an unproven grant would advertise a capability the tenant lacks."""
+    """A config for an unproven grant would advertise a capability the tenant lacks.
+
+    Runs against the autouse ``isolated_config`` (no file yet) so the config step
+    genuinely *writes*: with a config that already matches, the idempotent path
+    reports ``exists`` and writes nothing, and this test would be asserting on an
+    empty list for the wrong reason.
+    """
     written_at: list[int] = []
     real_write = admin_cmd.write_config
 
@@ -861,7 +866,6 @@ def test_a_re_run_creates_no_objects_and_regenerates_no_key(
     keychain_with_certificate: Any,
     fake_keychain: Any,
     quiet_doctor: list[dict],
-    mnotify_config: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -876,7 +880,6 @@ def test_a_second_run_reports_the_same_ids_as_the_first(
     fake_cli: FakeAdminCli,
     keychain_with_certificate: Any,
     quiet_doctor: list[dict],
-    mnotify_config: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     assert run_admin("bootstrap", "--sender", SENDER, "--allow-domain", DOMAIN, "--json") == EXIT_OK
@@ -1138,7 +1141,9 @@ def test_paths_and_teams_targets_survive_the_rewrite(
         "write_config",
         lambda config, p=None: written.append(config) or path,
     )
-    assert run_admin("bootstrap", "--sender", SENDER, "--allow-domain", DOMAIN) == EXIT_OK
+    assert run_admin(
+        "bootstrap", "--sender", SENDER, "--allow-domain", DOMAIN, "--force-config"
+    ) == EXIT_OK
 
     config = written[0]
     assert config.limits.daily_max == 7
@@ -1212,13 +1217,17 @@ def test_send_test_is_skipped_when_doctor_fails(
 def test_doctor_is_really_delegated_not_reimplemented(
     fake_cli: FakeAdminCli,
     keychain_with_certificate: Any,
-    mnotify_config: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The tripwire for a copy-paste doctor: patch the real module and prove it runs.
 
     Here the *real* doctor is left in place with a stubbed msal, so a green bootstrap
-    means doctor's own checks ran against the config this command just wrote.
+    means doctor's own checks ran against the config this command just wrote. That is
+    why this test runs on the autouse ``isolated_config`` rather than on the shared
+    ``mnotify_config``: conftest's placeholder config carries two Teams targets whose
+    webhook URLs no keychain holds, so doctor would exit 4 on `teams` before ever
+    reaching the checks this test is about. The bootstrap writes its own minimal
+    config here — no targets — which is the end state `bootstrap` actually produces.
     """
     import base64
 
@@ -1266,21 +1275,43 @@ def test_the_thumbprint_is_reported_because_entra_displays_it(
     assert parse_summary(capsys)["thumbprint"] == THUMBPRINT
 
 
-def test_the_runner_is_restored_after_a_failure(
+def test_a_dry_run_does_not_leave_its_recording_runner_installed(
+    keychain_with_certificate: Any,
+) -> None:
+    """The leak this restore exists for: a DryRunRunner still installed afterwards
+    would make every later command in the same process report success having done
+    nothing."""
+    from micro_notify.admin.runner import SubprocessRunner
+
+    assert (
+        run_admin("bootstrap", "--sender", SENDER, "--allow-domain", DOMAIN, "--dry-run")
+        == EXIT_OK
+    )
+    runner = admin_cmd.admin_runner.get_runner()
+    assert not isinstance(runner, admin_cmd.DryRunRunner)
+    assert isinstance(runner, SubprocessRunner)
+
+
+def test_the_callers_runner_survives_a_mid_run_failure(
+    fake_cli: FakeAdminCli,
     keychain_with_certificate: Any,
     quiet_doctor: list[dict],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A half-run bootstrap must not leave a recording runner installed process-wide."""
-    from micro_notify.admin.runner import SubprocessRunner
+    """A harness that installed its own runner keeps it after a raising bootstrap.
 
+    Resetting to the *default* on failure would hand the next command the real
+    :class:`SubprocessRunner` — a real ``az`` in a process that believed it was
+    talking to a fake tenant. Restoring the caller's runner is the safe direction,
+    and the dry run's runner is still replaced by the same mechanism.
+    """
     monkeypatch.setattr(
         "micro_notify.admin.entra.ensure_entra_app",
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
     )
     with pytest.raises(RuntimeError):
         run_admin("bootstrap", "--sender", SENDER, "--allow-domain", DOMAIN)
-    assert isinstance(admin_cmd.get_runner(), SubprocessRunner)
+    assert admin_cmd.admin_runner.get_runner() is fake_cli
 
 
 def test_report_renders_one_line_per_step_in_human_mode(
