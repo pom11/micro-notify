@@ -1178,9 +1178,10 @@ def test_the_generated_script_is_structurally_balanced() -> None:
     text = script().text
     for opener, closer in (("{", "}"), ("(", ")"), ("[", "]")):
         assert text.count(opener) == text.count(closer), f"unbalanced {opener}{closer}"
-    # exactly one try/catch/finally chain, plus the nested try that protects the
-    # disconnect - no more, or a block has escaped its guard
-    assert text.count("try {") == 2 and text.count("} catch {") == 2 and text.count("} finally {") == 1
+    # three try/catch pairs: the outer run, the per-attempt connect wrap (the retry
+    # cannot see a terminating error otherwise), and the disconnect guard - plus
+    # exactly one finally, no more, or a block has escaped its guard
+    assert text.count("try {") == 3 and text.count("} catch {") == 3 and text.count("} finally {") == 1
     assert text.index("try {") < text.index("} catch {") < text.index("} finally {")
     assert "\nif ($MnotifyOk) { exit 0 } else { exit 1 }" in text
 
@@ -1365,7 +1366,7 @@ def test_the_authz_check_to_dict_is_self_explanatory() -> None:
 # missing behaviour instead of once at import time.
 # ===========================================================================
 
-DEAD_CONNECT_ERROR = "Error while copying content to a stream."
+DEAD_CONNECT_ERROR = "Error while copying content to a stream"
 
 
 def legacy_death_lines() -> list[str]:
@@ -1510,7 +1511,16 @@ def test_a_check_that_did_not_run_can_never_read_as_a_pass() -> None:
     for label, lines in shapes.items():
         result = parse_pwsh_output(lines, script=script())
         assert result.ok is False, label
-        assert not any(c.passed for c in (result.sender_check, result.admin_check)), label
+        # The anti-pattern is the whole verification reading green. A control that
+        # really did answer may still pass on its own - what must never happen is
+        # both reading as passed while one of them was never answered.
+        assert not (result.sender_check.passed and result.admin_check.passed), label
+        unanswered = [
+            check for check in (result.sender_check, result.admin_check)
+            if check.in_scope is None
+        ]
+        assert unanswered, label
+        assert all(not check.passed for check in unanswered), label
         assert result.verified is False, f"{label}: an absent check must not read as verified"
 
 
@@ -1573,6 +1583,42 @@ def test_the_generated_script_retries_the_connect_once_and_never_more_than_once(
     assert "Start-Sleep" in text[loop_at:], (
         "an immediate re-attempt hits the same network blip"
     )
+    # The retry branch must actually skip the give-up path: without `continue` a
+    # first failed attempt would emit the 'both attempts' failure and throw before
+    # attempt 2 ever ran - the retry would exist on paper only.
+    retry_branch = text[text.index("if ($MnotifyAttempt -lt $MnotifyConnectTries) {") :]
+    retry_branch = retry_branch[: retry_branch.index("        }")]
+    assert "continue" in retry_branch, "the retry branch must skip the give-up path"
+
+
+def test_the_powershell_classifier_checks_permanent_markers_before_transient_ones() -> None:
+    """AADSTS text carries network-shaped words, so a script that matched the
+    transient list first would re-prompt a refused sign-in. The Python classifier is
+    pinned by the parametrized matrix; this pins the script's copy of the same rule."""
+    text = script().text
+    fn = text[text.index("function Test-MnotifyTransient {") :]
+    fn = fn[: fn.index("\n}", fn.index("return $false"))]
+    permanent = fn.index("foreach ($MnotifyMarker in $MnotifyPermanent)")
+    transient = fn.index("foreach ($MnotifySignature in $MnotifyTransient)")
+    assert permanent < transient
+
+
+def test_the_connect_loop_is_followed_by_a_not_connected_belt() -> None:
+    """No write cmdlet may run on a session that was never established.
+
+    Every failing path in the loop throws, so the belt is unreachable today - which
+    is exactly why a pin is the only thing keeping it there: a future edit that
+    softens one throw (or adds a `break`) would otherwise route an unauthenticated
+    run straight into New-ServicePrincipal.
+    """
+    text = script().text
+    loop_end = text.index("Connect-ExchangeOnline -Device")
+    belt = text.index("if (-not $MnotifyConnected) {", loop_end)
+    finally_at = text.index("} finally {")
+    assert belt < finally_at, "the belt must sit inside the try, before the writes are reachable"
+    assert text.index("New-ServicePrincipal") > belt
+    segment = text[belt: belt + 300]
+    assert "throw" in segment, "the belt must stop the run, not log and continue"
 
 
 def test_the_generated_script_gives_up_without_a_second_sign_in_on_a_non_transient_error() -> None:
@@ -1582,11 +1628,17 @@ def test_the_generated_script_gives_up_without_a_second_sign_in_on_a_non_transie
     loop_body = text[text.index("for ($MnotifyAttempt = 1;") :]
     gate = loop_body.index("if (-not $MnotifyAttemptTransient) {")
     throw = loop_body.index("throw", gate)
-    retry_notice = loop_body.index("retrying", gate)
+    retry_notice = loop_body.index("retrying the connect once", gate)
     assert gate < throw < retry_notice, (
         "the non-transient path must throw before the retry notice is reachable"
     )
-    assert "connect_failed" in loop_body[:gate], (
+    # The reason reaches the parser twice over before the throw: the per-attempt
+    # line (emitted before the gate, for every failed attempt) and the giving-up
+    # line (emitted inside the gate, before the throw that ends the run).
+    assert "connect_attempt" in loop_body[:gate], (
+        "the failed attempt must be reported before the give-up gate"
+    )
+    assert gate < loop_body.index("connect_failed") < throw, (
         "giving up on a non-transient error must still report why to the parser"
     )
 
@@ -1680,6 +1732,26 @@ def test_a_died_session_raises_the_could_not_verify_sentence_not_the_failed_one(
     assert "re-run" in message
     assert "verification failed" not in message
     assert excinfo.value.result.verified is False
+
+
+def test_a_reported_connect_death_overrules_a_connected_claim() -> None:
+    """The belt on the belt: if the script says the connect gave up, the run is not
+    trusted even when the same transcript also claims a session.
+
+    A truthful script cannot emit both lines - `connected` only follows a successful
+    attempt - so a transcript carrying both is broken or forged, and either way the
+    checks after the death cannot be believed.
+    """
+    lines = [
+        event(event="connect_attempt", attempt=1, outcome="failed", transient=True, error=DEAD_CONNECT_ERROR),
+        event(event="connect_failed", attempts=2, transient=True, error=DEAD_CONNECT_ERROR),
+        event(event="connected"),  # contradicts the death above
+    ] + [ln for ln in pwsh_lines() if ln.startswith(EVENT_PREFIX)]
+    result = parse_pwsh_output(lines, script=script())
+    assert result.ok is False
+    assert result.verified is False, "a death the script itself reported wins"
+    assert result.reason == exo.REASON_CONNECT_TRANSIENT
+    assert any("connect giving up" in f for f in result.failures)
 
 
 def test_a_wrong_scope_still_uses_the_failed_verification_sentence(temp_dir: Path) -> None:
