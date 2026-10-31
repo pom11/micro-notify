@@ -866,6 +866,16 @@ pre-flight, the same find-first app registration, the same config writer and the
 is why the delegated flow writes its config *before* the sign-in — `mnotify login` reads
 its client id and tenant from `[mail]`, and on a fresh tenant that file does not exist yet.
 
+A note on the bullet in [What this command never does](#what-this-command-never-does)
+above, which says `bootstrap` "never grants an API permission and never grants admin
+consent": that is **app-only guidance**, correct for the default mode and unchanged, and it
+is why that mode's invariant is pinned over every `az` argv it can build. `--mode
+delegated` does declare permissions — it could not sign anybody in otherwise — and the list
+of what *that* mode never does is
+[below](#what-delegated-mode-never-does). The rule both modes share is the one that
+matters: neither ever grants an **application** permission, and neither ever runs
+`az ad app permission admin-consent`.
+
 ```sh
 mnotify admin bootstrap --sender me@contoso.com --allow-domain contoso.com --mode delegated
 ```
