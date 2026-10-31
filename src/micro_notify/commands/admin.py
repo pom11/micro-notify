@@ -65,7 +65,8 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
-from .. import EXIT_OK, UsageError
+from .. import EXIT_OK, AuthError, UsageError
+from .. import delegation
 from ..admin import exo
 from ..admin import preflight
 from ..admin import runner as admin_runner
@@ -84,6 +85,7 @@ from ..config import (
     load_config,
     write_config,
 )
+from ..delegation import DELEGATED_SCOPES
 from . import doctor as doctor_module
 from . import print_json
 
@@ -107,6 +109,14 @@ STEP_CONFIG = "config"
 STEP_DOCTOR = "doctor"
 STEP_SEND_TEST = "send-test"
 
+# The delegated-mode steps (D5). Names, not redefinitions: everything the two modes
+# share keeps its name, so a reader comparing the two lists sees exactly which steps
+# differ and which are the same step run for a different credential.
+STEP_PERMISSIONS = "delegated-permissions"
+STEP_PUBLIC_CLIENT = "public-client-flows"
+STEP_CONSENT = "admin-consent"
+STEP_SIGNIN = "signin"
+
 BOOTSTRAP_STEPS: tuple[str, ...] = (
     STEP_PREFLIGHT,
     STEP_ENTRA,
@@ -115,6 +125,39 @@ BOOTSTRAP_STEPS: tuple[str, ...] = (
     STEP_CONFIG,
     STEP_DOCTOR,
 )
+
+# The delegated run order, and why it differs from the app-only list in two places:
+#
+# * permissions and the public-client switch come **before** anything that signs a
+#   person in, because the device-code flow needs both — an app that has not declared
+#   the scopes cannot be consented, and `isFallbackPublicClient` false makes Entra
+#   refuse to redeem the code (`invalid_client`). Signing in first would fail on a
+#   fresh tenant;
+# * `config` comes **before** the sign-in, which is the reverse of the app-only list.
+#   That is not an ordering preference: amendment A.1 says the delegated sign-in rides
+#   *this* registration, so `mnotify login` reads its client id and tenant from the
+#   config file that does not exist yet on a fresh tenant. The config is login's
+#   precondition here, not its reward — and the sender it writes is the operator's
+#   declared `--sender`, which the sign-in then has to *prove* (see
+#   :func:`_require_signed_in_as`);
+# * `doctor` stays last, and `admin-consent` is the only step that may be *absent*
+#   (it runs only when `--admin-consent` is passed).
+DELEGATED_BOOTSTRAP_STEPS: tuple[str, ...] = (
+    STEP_PREFLIGHT,
+    STEP_ENTRA,
+    STEP_PERMISSIONS,
+    STEP_PUBLIC_CLIENT,
+    STEP_CONSENT,
+    STEP_CONFIG,
+    STEP_SIGNIN,
+    STEP_DOCTOR,
+)
+
+# The two credentials one registration can be used with (design amendment A.1).
+# `app` is the default and keeps every app-only behaviour byte-identical.
+MODE_APP = "app"
+MODE_DELEGATED = "delegated"
+BOOTSTRAP_MODES: tuple[str, ...] = (MODE_APP, MODE_DELEGATED)
 
 INSTALL_PROMPT = "Install {formulas} with brew? This changes the machine. [y/N]: "
 
@@ -145,6 +188,27 @@ DRY_APP_ID = "<appId>"
 DRY_SP_OBJECT_ID = "<spObjectId>"
 DRY_CONTROL_MAILBOX = "<signed-in-admin-mailbox>"
 DRY_TENANT_ID = "<tenantId>"
+# The delegated-mode markers (D5). A scope id is not earned until the tenant's Graph
+# service principal has been read, and the signed-in UPN does not exist until a human
+# has finished a browser — printing an all-zero GUID for either would look like a real
+# value the plan had resolved.
+DRY_SCOPE_ID = "<scopeId>"
+DRY_GRAPH_SP_OBJECT_ID = "<graphServicePrincipalObjectId>"
+DRY_SIGNIN_UPN = "<signed-in-upn>"
+DRY_PUBLIC_CLIENT_FLAG = "isFallbackPublicClient=true"
+
+
+def _mode_of(args: argparse.Namespace) -> str:
+    """Which credential this run configures — the one branch point of the bootstrap.
+
+    ``getattr`` with the app-only default rather than a direct attribute read, for the
+    same reason B5 reads every other flag defensively: a caller that builds a Namespace
+    by hand (a test, an embedding caller) that pre-dates ``--mode`` must keep getting
+    exactly the behaviour it always got. A missing attribute here means app-only, which
+    is the conservative answer — the delegated steps are the ones that mutate a
+    registration's permissions, so no run may reach them by accident.
+    """
+    return (getattr(args, "mode", None) or MODE_APP).strip().lower()
 
 
 class BootstrapError(UsageError):
@@ -229,6 +293,32 @@ def add_parser(subparsers: "argparse._SubParsersAction") -> None:
         default=None,
         help="after everything, send one real test mail to ADDR through the normal "
         "mail path (spends one unit of the daily cap)",
+    )
+    # --- delegated mode (design amendment A.1-A.4, card D5) -------------------
+    # Appended rather than folded into the flags above: `--mode` defaults to `app`,
+    # so every app-only invocation parses and behaves exactly as it did before this
+    # flag existed.
+    bootstrap.add_argument(
+        "--mode",
+        choices=BOOTSTRAP_MODES,
+        default=MODE_APP,
+        help="which credential this tenant is configured for. `app` (the default) is "
+        "the certificate + Exchange Online scoped-role route above. `delegated` "
+        "configures the SAME registration for a person to sign in through: it declares "
+        "the five delegated scopes of amendment A.2, turns on the public-client flows "
+        "the device-code sign-in needs, and skips the certificate and the Exchange "
+        "scoped role — neither is read by a delegated send. It does NOT grant any "
+        "application permission.",
+    )
+    bootstrap.add_argument(
+        "--admin-consent",
+        action="store_true",
+        help="delegated mode only: also ask Entra for tenant-wide admin consent for "
+        "exactly those five delegated scopes. Needs the privilege; if it is refused "
+        "the bootstrap WARNS and continues, because `mnotify login` consents the same "
+        "scopes for the signed-in user alone. Refused in app mode: app-only tenants "
+        "send through the Exchange scoped role and must not gain a consented Graph "
+        "permission (docs/ADMIN-SETUP.md §3.1)",
     )
 
 
@@ -471,7 +561,7 @@ def _refuse_failing_preflight(
 
 
 def _preflight_step(
-    sender: str, install_missing: bool, out: Report
+    sender: str, install_missing: bool, out: Report, *, include_exchange: bool = True
 ) -> preflight.PreflightReport:
     """1. B1's six read-only checks, plus the opt-in install round.
 
@@ -479,8 +569,13 @@ def _preflight_step(
     the answer to "what is wrong with this machine right now", and editing it afterwards
     would make it describe a state no check ever observed. So: probe -> ask -> install ->
     probe again, and the second report is what everything downstream reads.
+
+    ``include_exchange=False`` (delegated mode) hands B1's own flag straight through:
+    the delegated route never calls `pwsh`, so failing two PowerShell checks it cannot
+    use would refuse a machine that is perfectly ready (see B1's
+    :func:`~micro_notify.admin.preflight.run_preflight`).
     """
-    first = preflight.run_preflight(sender)
+    first = preflight.run_preflight(sender, include_exchange=include_exchange)
     _print_checks(first, out)
     if first.ok:
         out.add(STEP_PREFLIGHT, OUTCOME_EXISTS, "all checks already pass")
@@ -504,7 +599,7 @@ def _preflight_step(
         )
 
     _install_via_brew(formulas, out)
-    second = preflight.run_preflight(sender)
+    second = preflight.run_preflight(sender, include_exchange=include_exchange)
     _print_checks(second, out)
     if not second.ok:
         _refuse_failing_preflight(second, preflight.plan_installs(second))
@@ -578,6 +673,12 @@ def _dry_run(sender: str, args: argparse.Namespace, out: Report) -> int:
     is what those cards declare as their dry-run surface and why both refuse a
     recording runner on their write path.
 
+    The mode branch is a step-list branch, not a second dry run: the pre-flight and the
+    Entra step are the same calls with the same printer in both modes, and only the
+    middle of the flow differs. Delegated steps are pure ``az``, so they are *run*
+    under the recorder rather than printed from a parallel plan — the same rule B5 set,
+    and why the plan cannot advertise a command the step would not run.
+
     Exits 0 whatever the canned answers say: a dry run reports a plan, it does not
     grade the tenant.
     """
@@ -615,6 +716,23 @@ def _dry_run(sender: str, args: argparse.Namespace, out: Report) -> int:
     app_id = provisioning.app_id or DRY_APP_ID
     sp_object_id = provisioning.sp_object_id or DRY_SP_OBJECT_ID
 
+    if _mode_of(args) == MODE_DELEGATED:
+        return _dry_run_delegated(app_id, sp_object_id, args, out, printer)
+    return _dry_run_app_only(
+        sender, app_id, sp_object_id, args, report, out, printer
+    )
+
+
+def _dry_run_app_only(
+    sender: str,
+    app_id: str,
+    sp_object_id: str,
+    args: argparse.Namespace,
+    report: Any,
+    out: Report,
+    printer: _PlanPrinter,
+) -> int:
+    """The certificate + Exchange-scoped-role half of the plan (B5's original)."""
     # B3's write path refuses a recording runner (it would generate a real key and
     # rewrite the keychain while the tenant stayed unchanged) — so print its plan.
     # `plan_certificate_upload` returns ONE argv as a token list (B3's shape, unlike
@@ -641,6 +759,102 @@ def _dry_run(sender: str, args: argparse.Namespace, out: Report) -> int:
     out.note("allowDomains", list(_valid_domains(args.allow_domain)))
     out.note("controlMailbox", _dry_control_mailbox(args, report))
     out.note("appId", app_id)
+    out.exit_code = EXIT_OK
+    return out.emit(ok=True)
+
+
+def _dry_run_delegated(
+    app_id: str,
+    sp_object_id: str,
+    args: argparse.Namespace,
+    out: Report,
+    printer: _PlanPrinter,
+) -> int:
+    """The delegated half of the plan: permissions, the switch, consent, nothing else.
+
+    Two things this deliberately does *not* print, both of them the point:
+
+    * no certificate upload and no Exchange script — a delegated send reads neither,
+      and a plan that showed them would advertise credential work the mode does not do
+      (the card's regression guard, pinned from the other side too);
+    * no ``admin-consent`` line unless ``--admin-consent`` was passed. A dry run that
+      showed a tenant-wide consent nobody asked for would be the worst kind of surprise.
+
+    The device-code prompt is reported rather than printed: a dry run must not look
+    like it is asking the operator to sign in.
+    """
+    from ..admin import delegated_setup
+
+    scopes = list(delegation.DELEGATED_SCOPES)
+
+    # The reads the real step makes, through the seam, then the writes it would make.
+    delegated_setup.show_app(app_id)
+    delegated_setup.graph_resource(scopes)
+    printer.flush()
+    for name in scopes:
+        printer.planned([_command_line(delegated_setup.permission_add_argv(app_id, DRY_SCOPE_ID))])
+    out.add(
+        STEP_PERMISSIONS,
+        OUTCOME_DRYRUN,
+        f"would declare {len(scopes)} delegated scopes ({', '.join(scopes)}); "
+        f"no application permission is touched",
+    )
+
+    delegated_setup.show_app(app_id)
+    printer.flush()
+    printer.planned(
+        [_command_line(delegated_setup.public_client_enable_argv(app_id))]
+    )
+    out.add(
+        STEP_PUBLIC_CLIENT,
+        OUTCOME_DRYRUN,
+        f"would set {DRY_PUBLIC_CLIENT_FLAG}; delegated mode only — an app-only tenant "
+        "keeps it false",
+    )
+
+    if getattr(args, "admin_consent", False):
+        delegated_setup.list_grants_argv(sp_object_id)
+        delegated_setup.graph_resource(scopes)
+        printer.flush()
+        printer.planned(
+            [
+                _command_line(
+                    delegated_setup.consent_grant_argv(
+                        sp_object_id, DRY_GRAPH_SP_OBJECT_ID, scopes
+                    )
+                )
+            ]
+        )
+        out.add(
+            STEP_CONSENT,
+            OUTCOME_DRYRUN,
+            "would request admin consent for the delegated scopes only; a refusal "
+            "warns and continues (user consent via `mnotify login` still works)",
+        )
+    else:
+        out.add(
+            STEP_CONSENT,
+            OUTCOME_SKIPPED,
+            "not requested: pass --admin-consent, or consent per user with `mnotify login`",
+        )
+
+    out.add(
+        STEP_SIGNIN,
+        OUTCOME_SKIPPED,
+        f"a dry run does not sign anyone in — the real run ends with the device-code "
+        f"flow of `mnotify login` and {DRY_SIGNIN_UPN} becomes the config sender",
+    )
+    out.add(STEP_CONFIG, OUTCOME_DRYRUN, "no config file written")
+    out.add(STEP_DOCTOR, OUTCOME_SKIPPED, "nothing was changed, so nothing to verify")
+    if getattr(args, "send_test", None):
+        out.add(STEP_SEND_TEST, OUTCOME_SKIPPED, "a dry run sends nothing")
+
+    out.note("dryRun", True)
+    out.note("mode", MODE_DELEGATED)
+    out.note("sender", _valid_sender(args.sender))
+    out.note("allowDomains", list(_valid_domains(args.allow_domain)))
+    out.note("appId", app_id)
+    out.note("delegatedScopes", scopes)
     out.exit_code = EXIT_OK
     return out.emit(ok=True)
 
@@ -706,6 +920,119 @@ def _exchange_step(
     return result
 
 
+# --- The delegated-mode steps (D5, design amendment A.2 / A.4 §6 step 6) ------
+def _permissions_step(app_id: str, out: Report) -> Any:
+    """D.1 Declare the five delegated scopes on the shared registration.
+
+    The scope list is :data:`micro_notify.delegation.DELEGATED_SCOPES` — the same
+    tuple the sign-in requests — so the app can never be configured for fewer scopes
+    than a login asks for (which would fail at the consent screen, after the tenant
+    was already mutated). The declaration is additive and touches no ``Role`` entry;
+    see ``admin/delegated_setup.py`` for why that rules out az's ``--set +=``.
+    """
+    from ..admin import delegated_setup
+
+    result = delegated_setup.ensure_delegated_permissions(
+        app_id, delegation.DELEGATED_SCOPES
+    )
+    out.add(STEP_PERMISSIONS, result.outcome, result.detail)
+    out.note("delegatedScopes", list(delegation.DELEGATED_SCOPES))
+    return result
+
+
+def _public_client_step(app_id: str, out: Report) -> Any:
+    """D.2 ``isFallbackPublicClient`` = true: the device-code flow's only switch.
+
+    Loudly conditional (the card's word, and amendment A.2's table): this flag belongs
+    to the *whole registration*, and this is the only line of code in the project that
+    turns it on. It runs only under ``--mode delegated``; an app-only tenant keeps it
+    false, and flipping it there would open a registration that holds a certificate
+    credential to public-client flows for no reason.
+    """
+    from ..admin import delegated_setup
+
+    result = delegated_setup.ensure_public_client_flows(app_id)
+    out.add(STEP_PUBLIC_CLIENT, result.outcome, result.detail)
+    out.note("publicClientFlows", True)
+    return result
+
+
+def _consent_step(sp_object_id: str, out: Report) -> Any:
+    """D.3 Optional tenant-wide consent for exactly the five scopes.
+
+    The whole point of ``--admin-consent`` being opt-in and warn-and-continue: the
+    privilege often is not there (verification-blocked tenants), and the delegated
+    flow works without tenant-wide consent — the operator's own sign-in consents the
+    same scopes for themselves. A refusal is therefore ``skipped`` carrying the reason
+    as its detail, never a failed run; under ``--json`` that step entry is the only
+    place the reason can appear, because ``ok``/``exitCode`` are the only failure
+    channels and neither may open for a warn.
+    """
+    from ..admin import delegated_setup
+
+    result = delegated_setup.ensure_admin_consent(
+        sp_object_id, delegation.DELEGATED_SCOPES
+    )
+    if result.warned:
+        out.add(STEP_CONSENT, OUTCOME_SKIPPED, result.detail)
+        out.note("consentHint", delegated_setup.CONSENT_HINT)
+    else:
+        out.add(STEP_CONSENT, result.outcome, result.detail)
+    out.note("adminConsent", result.to_dict())
+    return result
+
+
+def _signin_args(*, machine: bool, no_prompt: bool) -> argparse.Namespace:
+    """The namespace ``commands/login.py`` expects for one sign-in."""
+    return argparse.Namespace(no_prompt=no_prompt, json=machine)
+
+
+def _signin_step(out: Report) -> str:
+    """D.4 ``mnotify login``, delegated rather than re-implemented — and last.
+
+    Same contract B5 set for doctor: login owns its own printing (the device-code
+    prompt goes to its stderr, the result line to its stdout), so under our ``--json``
+    its stdout is routed to stderr and the bootstrap's summary stays the single
+    document on stdout.
+
+    The order is the interesting part. The *verify* comes first
+    (``login --no-prompt`` — the cache-only check, which never prompts): on a re-run
+    of an already-configured tenant the sign-in reports ``exists`` and no operator is
+    ever asked to open a browser twice. Only when the cache cannot produce a token
+    does the interactive device-code flow start — after every tenant write, so the
+    operator is asked exactly once, at the point where the tenant is ready for them.
+
+    Returns the signed-in UPN, which becomes the config's sender: amendment A.3 makes
+    the sender the identity in the token, so this value is the only honest one to
+    write, and the caller refuses to write a config whose sender is some other address.
+    """
+    from . import login as login_module
+
+    def _run(*, no_prompt: bool) -> int:
+        if out.machine:
+            with contextlib.redirect_stdout(sys.stderr):
+                return login_module.run(_signin_args(machine=True, no_prompt=no_prompt))
+        return login_module.run(_signin_args(machine=False, no_prompt=no_prompt))
+
+    try:
+        _run(no_prompt=True)
+        out.add(STEP_SIGNIN, OUTCOME_EXISTS, "cached delegated sign-in still works")
+    except AuthError:
+        # Not a failure — the fresh-tenant state. The interactive flow is the fix,
+        # and this is the same AuthError that would exit 4 if it were raised by the
+        # interactive call below, where it genuinely is a failure.
+        _run(no_prompt=False)
+        out.add(STEP_SIGNIN, OUTCOME_CREATED, "signed in via the device-code flow")
+
+    identity = delegation.whoami()  # reads the keychain only; never returns a token
+    if not identity.upn:
+        raise AuthError(
+            f"signed in but the cached identity names no user; {delegation.LOGIN_HINT}"
+        )
+    out.note("signedInAs", identity.upn)
+    return identity.upn
+
+
 # --- The config write --------------------------------------------------------
 def _previous_config(path: Path) -> Config | None:
     """The earlier config when it parses; ``None`` when absent or unusable.
@@ -729,13 +1056,22 @@ def _config_step(
     domains: Sequence[str],
     force: bool,
     out: Report,
+    *,
+    mode: str = MODE_APP,
+    auth: str | None = None,
 ) -> Path:
     """5. Write the config with the same keys ``mnotify setup`` writes.
 
-    ``auth`` is ``certificate`` because that is the only credential this command
-    establishes (B3 uploaded the public half); ``tenant_id`` comes from the signed-in
-    directory and ``client_id`` from the app B2 resolved, which is the whole advantage
-    over the manual path — nothing is typed.
+    ``auth`` is ``certificate`` in the default app-only mode because that is the only
+    credential that command establishes (B3 uploaded the public half); ``tenant_id``
+    comes from the signed-in directory and ``client_id`` from the app B2 resolved,
+    which is the whole advantage over the manual path — nothing is typed.
+
+    In delegated mode (``mode=`` :data:`MODE_DELEGATED`, D5) two values change and
+    nothing else does: ``mode`` becomes ``delegated`` and ``sender`` is the UPN the
+    sign-in produced, because amendment A.3 makes the sender the identity in the token
+    rather than a mailbox the app impersonates. ``auth`` stays ``certificate`` — see
+    :func:`_bootstrap_delegated` for why a delegated run writes no new credential.
 
     A file that already says exactly what this run would say is *not* rewritten: the
     re-run reports ``exists`` and leaves the bytes (and the mtime) alone, which is what
@@ -743,6 +1079,11 @@ def _config_step(
     is refused unless ``--force-config`` was passed — someone edited it, and silently
     overwriting their choice of sender during a run that only meant to re-verify the
     tenant is the failure mode a flag is for.
+
+    ``mode`` is part of the "says exactly the same thing" test, on purpose: a config
+    that matches on tenant, client, sender and auth but declares the other mode is not
+    a match, and writing over it without ``--force-config`` would flip which credential
+    every later send uses.
 
     This command owns ``[mail]`` and ``[allow]`` and nobody else's: ``[paths]``, the
     Teams targets **and** ``[limits]`` carry over from whatever is already there. The
@@ -754,21 +1095,24 @@ def _config_step(
     """
     path = config_path()
     previous = _previous_config(path)
+    wanted_auth = auth if auth is not None else AUTH_CERTIFICATE
 
     mail_matches = previous is not None and (
         previous.mail.tenant_id == tenant_id
         and previous.mail.client_id == app_id
         and previous.mail.sender == sender
-        and previous.mail.auth == AUTH_CERTIFICATE
+        and previous.mail.auth == wanted_auth
+        and previous.mail.mode == mode
     )
     allow_matches = previous is not None and tuple(previous.allow.domains) == tuple(domains)
     if previous is not None and not (mail_matches and allow_matches):
         if not force:
             raise BootstrapError(
                 f"{path} already holds different [mail]/[allow] values than this run "
-                f"would write (sender {previous.mail.sender!r} -> {sender!r}). Re-run "
-                "with `--force-config` to overwrite it, or edit the file yourself "
-                "(`mnotify config show` prints it with secrets masked)"
+                f"would write (sender {previous.mail.sender!r} -> {sender!r}; mode "
+                f"{previous.mail.mode!r} -> {mode!r}). Re-run with `--force-config` to "
+                "overwrite it, or edit the file yourself (`mnotify config show` prints "
+                "it with secrets masked)"
             )
         out.line(f"overwriting {path} (--force-config)")
 
@@ -783,7 +1127,8 @@ def _config_step(
             tenant_id=tenant_id,
             client_id=app_id,
             sender=sender,
-            auth=AUTH_CERTIFICATE,
+            auth=wanted_auth,
+            mode=mode,
         ),
         allow=AllowConfig(domains=tuple(domains)),
         limits=previous.limits if previous is not None else LimitsConfig(),
@@ -865,6 +1210,21 @@ def bootstrap(args: argparse.Namespace) -> int:
     """``mnotify admin bootstrap`` — the ADMIN-SETUP procedure, in order, idempotent."""
     sender = _valid_sender(args.sender)
     domains = _valid_domains(args.allow_domain)
+    mode = _mode_of(args)
+
+    # `--admin-consent` in app mode is refused rather than ignored. The flag can only
+    # do one of two things there: grant a Graph delegated consent the app-only route
+    # never uses, or — worse, if it were widened to the app's `Role` entries — hand the
+    # tenant the whole-directory Mail.Send consent ADMIN-SETUP §3.1 tells the operator
+    # to *remove*. Ignoring it silently would leave the operator believing they had
+    # consented something.
+    if getattr(args, "admin_consent", False) and mode == MODE_APP:
+        raise BootstrapError(
+            "`--admin-consent` needs `--mode delegated`: an app-only tenant sends "
+            "through the Exchange Online scoped role (ADMIN-SETUP §2) and must not "
+            "gain a consented Graph permission — §3.1 removes the tenant-wide consent "
+            "on purpose. Drop the flag, or run the delegated bootstrap"
+        )
 
     # The empty-allowlist refusal comes first, before the first probe. Not tidiness:
     # otherwise the bootstrap mutates the tenant and then hands over a config where every
@@ -876,6 +1236,7 @@ def bootstrap(args: argparse.Namespace) -> int:
     out = Report(bool(getattr(args, "json", False)))
     out.note("sender", sender)
     out.note("allowDomains", list(domains))
+    out.note("mode", mode)
 
     # The runner is a process-wide global. A dry run installs a recording runner, and
     # nothing may be left behind if the run raises partway through — a recording
@@ -889,12 +1250,17 @@ def bootstrap(args: argparse.Namespace) -> int:
         # device-code prompt has to reach the terminal while pwsh is still waiting.
         _use_streaming_runner()
 
-        report = _preflight_step(sender, args.install_missing, out)
+        report = _preflight_step(
+            sender, args.install_missing, out, include_exchange=mode == MODE_APP
+        )
         out.note("preflight", report.to_dict())
         if report.tenant_id:
             out.note("tenantId", report.tenant_id)
         if report.tenant_name:
             out.note("tenantName", report.tenant_name)
+
+        if mode == MODE_DELEGATED:
+            return _bootstrap_delegated(sender, domains, args, report, out)
 
         control = _control_mailbox(args, report, sender)
         out.note("controlMailbox", control)
@@ -916,6 +1282,84 @@ def bootstrap(args: argparse.Namespace) -> int:
             _send_test_step(args.send_test, out, code)
 
     return out.emit(ok=code == EXIT_OK)
+
+
+def _bootstrap_delegated(
+    sender: str,
+    domains: Sequence[str],
+    args: argparse.Namespace,
+    report: preflight.PreflightReport,
+    out: Report,
+) -> int:
+    """``mnotify admin bootstrap --mode delegated`` — the delegated route, in order.
+
+    The shared frame is untouched: the same pre-flight (minus the two PowerShell
+    checks, which this route never needs — see :func:`_preflight_step`), the same B2
+    find-first app registration, the same config writer, the same doctor. What differs
+    is the middle: instead of a certificate and an Exchange scoped role, this run
+    declares the five delegated scopes, turns on the public-client flow, optionally
+    consents them, and finishes by signing the operator in.
+
+    Two steps the app-only route has and this one does not, and neither is an omission:
+    no certificate (a delegated send builds no confidential client, so a key here would
+    be a credential the tool never reads) and no Exchange scoped role (the sender is the
+    signed-in person, not a mailbox the app impersonates — amendment A.3).
+    """
+    entra = _entra_step(out)
+    _permissions_step(entra.app_id, out)
+    _public_client_step(entra.app_id, out)
+    if getattr(args, "admin_consent", False):
+        _consent_step(entra.sp_object_id, out)
+
+    # The config before the sign-in, because the sign-in needs it: amendment A.1 puts
+    # the delegated login on *this* registration, and `mnotify login` reads its client
+    # id and tenant from `[mail]`. On a fresh tenant that file does not exist yet, so
+    # login would fail on its own missing config before a human ever saw a code.
+    #
+    # The sender written here is the operator's declared `--sender`; the sign-in below
+    # is what proves that address is a person who can actually sign in, and
+    # :func:`_require_signed_in_as` refuses to let the run call itself successful when
+    # the identity in the token is somebody else.
+    _config_step(
+        report.tenant_id or "",
+        entra.app_id,
+        sender,
+        domains,
+        bool(getattr(args, "force_config", False)),
+        out,
+        mode=MODE_DELEGATED,
+    )
+    signed_in = _signin_step(out)
+    _require_signed_in_as(signed_in, sender)
+
+    code = _doctor_step(getattr(args, "send_test", None), out)
+    if getattr(args, "send_test", None):
+        _send_test_step(args.send_test, out, code)
+
+    return out.emit(ok=code == EXIT_OK)
+
+
+def _require_signed_in_as(upn: str, sender: str) -> None:
+    """The delegated mode's one hard identity rule, checked before ``doctor``.
+
+    Amendment A.3: in delegated mode the sender *is* the identity in the token, so a
+    config whose sender is an address nobody is signed in as cannot be honoured at all
+    — every send would fail with the sender-mismatch refusal (exit 2) D2 built into the
+    send path. Saying so here, right after the sign-in, is the difference between an
+    operator who fixes it in one command and one who discovers it at the first send.
+
+    The config is deliberately *not* rewritten to match the token. The operator passed
+    ``--sender`` on purpose, and quietly changing the mailbox a tool sends from is the
+    kind of surprise a bootstrap must not commit; the hint names both ways out.
+    """
+    if upn.casefold() == sender.casefold():
+        return
+    raise BootstrapError(
+        f"signed in as {upn} but this run was asked to configure sender {sender!r}. "
+        "In delegated mode the sender must be the signed-in person (design amendment "
+        "A.3), so either `mnotify logout` and sign in again as "
+        f"{sender!r}, or re-run with `--sender {upn}`"
+    )
 
 
 def _control_mailbox(
