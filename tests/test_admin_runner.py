@@ -10,20 +10,24 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from micro_notify import EXIT_USAGE
+from micro_notify.admin import exo as exo_module
 from micro_notify.admin import runner as runner_module
 from micro_notify.admin.runner import (
+    BREW_TIMEOUT,
     EXIT_NOT_FOUND,
     EXIT_TIMEOUT,
     STDERR_QUOTE_LIMIT,
     SUBPROCESS_TIMEOUT,
     CommandError,
     DryRunRunner,
+    StreamingRunner,
     SubprocessRunner,
     get_runner,
     parse_json_result,
@@ -398,6 +402,52 @@ def test_dry_run_runner_is_a_drop_in_for_run_json() -> None:
     assert run_json(["az", "ad", "user", "show", "--id", "person@contoso.com"], runner=dry) == {
         "userPrincipalName": "person@contoso.com"
     }
+
+
+# --- StreamingRunner (moved in from the command layer, card B7) --------------
+# These four are the class's own pins and they travel with the class: what is being
+# exercised is the mechanism in this module, not a call site. The call-site pins —
+# that the real CLI ends up with this runner installed and a dry run never does —
+# stay in tests/test_admin_cli.py, where the command is.
+def test_the_timeout_budget_follows_the_command_not_the_caller() -> None:
+    """pwsh waits on a human typing a code into a browser and brew installs real
+    packages; a 60 s probe budget fits neither. az keeps its 60 s."""
+    runner = StreamingRunner()
+    assert runner._budget(["pwsh", "-NoProfile", "-File", "x.ps1"]) == exo_module.PWSH_TIMEOUT
+    assert runner._budget(["powershell", "-File", "x.ps1"]) == exo_module.PWSH_TIMEOUT
+    assert runner._budget(["brew", "install", "azure-cli"]) == BREW_TIMEOUT
+    assert runner._budget(["az", "account", "show"]) == SUBPROCESS_TIMEOUT
+
+
+def test_run_streaming_collects_the_whole_transcript_and_exit_code() -> None:
+    """B4 still reads the transcript back to decide whether the scope holds, and
+    reads a missing returncode as failure — so both must survive streaming."""
+    result = StreamingRunner().run_streaming(
+        [sys.executable, "-c", "print('one'); print('two'); raise SystemExit(0)"],
+        on_line=None,
+        timeout=30.0,
+    )
+    assert result.returncode == 0
+    assert result.stdout.split() == ["one", "two"]
+
+
+def test_run_streaming_reports_a_timeout_as_124_not_as_success() -> None:
+    """A sign-in nobody completed must not read as a green step."""
+    result = StreamingRunner().run_streaming(
+        [sys.executable, "-c", "import time; print('waiting'); time.sleep(30)"],
+        on_line=None,
+        timeout=1.0,
+    )
+    assert result.returncode == EXIT_TIMEOUT
+    assert "timed out" in (result.stderr or "")
+
+
+def test_run_streaming_surfaces_a_missing_binary_as_127() -> None:
+    """The pre-flight's 'not installed' wording depends on this, not on a crash."""
+    result = StreamingRunner().run_streaming(
+        ["definitely-not-a-real-binary-9f3a"], on_line=None, timeout=5.0
+    )
+    assert result.returncode == EXIT_NOT_FOUND
 
 
 # --- Contract pins ---------------------------------------------------------

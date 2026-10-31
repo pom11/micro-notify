@@ -20,6 +20,10 @@ Declared seams (later admin cards read them, never edit them)
 * :class:`DryRunRunner` — records every argv it is handed and executes **nothing**;
   ``mnotify admin bootstrap --dry-run`` is built on this, not on an ``if dry_run``
   branch sprinkled through the command modules.
+* :class:`StreamingRunner` — the runner the real CLI installs over the plain
+  :class:`SubprocessRunner`: it hands each output line to a callback while the
+  process is still running, and it bounds each command by kind (``pwsh`` waits on a
+  human, ``brew`` changes the machine, a probe does not).
 * :func:`which` and :func:`run_json` — the two helpers every probe needs.
 
 Rules this module keeps
@@ -38,8 +42,11 @@ Rules this module keeps
 from __future__ import annotations
 
 import json
+import queue as queue_module
 import shutil
 import subprocess
+import threading
+import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -191,6 +198,175 @@ class DryRunRunner:
         return False
 
 
+# --- The real-machine runner -------------------------------------------------
+# How long a `brew install` may take. azure-cli and powershell are large casks and
+# a formula install pulls dependencies, so the 60 s a probe gets is not a budget a
+# machine change fits into. Kept here rather than passed by every caller because the
+# rule belongs to the runner that enforces it.
+BREW_TIMEOUT = 1800.0
+
+_PW_SH_BINARIES = frozenset({"pwsh", "powershell"})
+_BREW_BINARIES = frozenset({"brew"})
+
+
+class StreamingRunner:
+    """The runner the real CLI uses: streams lines, and bounds each command by kind.
+
+    Why this exists
+    ---------------
+
+    B4 declared the streaming seam — ``run_streaming(argv, on_line=...)`` — precisely
+    because the Exchange step signs in with the **device-code flow**: the operator has
+    to read a code off the screen and type it into a browser while ``pwsh`` is still
+    waiting. :class:`SubprocessRunner` captures, so with nothing but the default runner
+    installed the prompt is held until ``pwsh`` exits: the operator never sees the code,
+    the sign-in never completes, and the run ends in the timeout with the transcript
+    thrown away — the Exchange step could never finish on a real machine.
+
+    The two other things it fixes, both on the real path only
+    --------------------------------------------------------
+
+    * ``pwsh`` gets B4's ``PWSH_TIMEOUT`` (the sign-in is a human-scale wait), where
+      the default runner applies its 60 s probe budget to everything;
+    * ``brew`` gets :data:`BREW_TIMEOUT`, for the same reason: an install that is
+      legitimately slow must not be killed at 60 s and reported as a failure.
+
+    ``az`` keeps the 60 s probe budget, unchanged.
+
+    Timeouts are chosen from ``argv[0]`` rather than passed by callers so that the
+    rule lives in one place and no call site can forget it.
+
+    Who installs it
+    ---------------
+
+    The command layer (:func:`micro_notify.commands.admin._use_streaming_runner`)
+    installs this class over the *plain* :class:`SubprocessRunner` only, so an installed
+    fake — a test's, a dry run's, an embedding caller's — is never bypassed. That
+    identity check belongs to the caller, not here: the module owns the mechanism, the
+    command owns the policy of when it applies.
+    """
+
+    def __init__(self, timeout: float = SUBPROCESS_TIMEOUT) -> None:
+        self.timeout = timeout
+
+    # --- the seam B4 declared ------------------------------------------------
+    def run_streaming(
+        self,
+        argv: Sequence[str],
+        *,
+        on_line: Callable[[str], None] | None = None,
+        timeout: float | None = None,
+    ) -> subprocess.CompletedProcess:
+        """Run ``argv``, handing each output line to ``on_line`` as it appears.
+
+        ``stderr`` is merged into ``stdout`` on purpose: the line the operator must
+        read is a sign-in prompt, and a prompt that happens to arrive on stderr must
+        not be the one thing held back until the process ends. Every line is also
+        collected, because B4 still reads the whole transcript back to decide whether
+        the scope holds.
+        """
+        args = [str(a) for a in argv]
+        if not args:
+            raise CommandError("cannot run an empty command")
+        limit = self.timeout if timeout is None else float(timeout)
+        try:
+            process = subprocess.Popen(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        except FileNotFoundError:
+            return _synthetic(args, EXIT_NOT_FOUND, f"command not found: {args[0]}")
+        except PermissionError:
+            return _synthetic(args, EXIT_NOT_FOUND, f"not executable: {args[0]}")
+        except OSError as exc:
+            return _synthetic(args, 1, f"{type(exc).__name__} starting {args[0]}")
+
+        lines: list[str] = []
+        pending: queue_module.Queue[str] = queue_module.Queue()
+
+        def pump() -> None:
+            stream = process.stdout
+            if stream is None:
+                return
+            for raw in stream:
+                pending.put(raw.rstrip("\n"))
+            pending.put(_STREAM_END)
+
+        reader = threading.Thread(target=pump, daemon=True)
+        reader.start()
+        deadline = time.monotonic() + limit
+        ended = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                item = pending.get(timeout=min(remaining, 0.25))
+            except queue_module.Empty:
+                continue
+            if item is _STREAM_END:
+                ended = True
+                break
+            lines.append(item)
+            if on_line is not None:
+                # A sink that cannot print must not lose the command: the transcript
+                # already holds the line, and the caller's reporting owns stdout.
+                on_line(item)
+        if not ended:
+            process.kill()
+            process.wait()
+            return _synthetic(
+                args, EXIT_TIMEOUT,
+                f"timed out after {limit:g}s: {args[0]}", stdout="\n".join(lines),
+            )
+        return subprocess.CompletedProcess(args, process.wait(), "\n".join(lines), "")
+
+    # --- the plain seam every probe uses -------------------------------------
+    def run(
+        self, argv: Sequence[str], *, stdin: str | None = None, timeout: float | None = None
+    ) -> subprocess.CompletedProcess:
+        args = [str(a) for a in argv]
+        if not args:
+            raise CommandError("cannot run an empty command")
+        limit = self._budget(args) if timeout is None else float(timeout)
+        try:
+            return subprocess.run(
+                args,
+                capture_output=True,
+                text=True,
+                timeout=limit,
+                input=stdin,
+                check=False,
+            )
+        except FileNotFoundError:
+            return _synthetic(args, EXIT_NOT_FOUND, f"command not found: {args[0]}")
+        except PermissionError:
+            return _synthetic(args, EXIT_NOT_FOUND, f"not executable: {args[0]}")
+        except subprocess.TimeoutExpired:
+            return _synthetic(args, EXIT_TIMEOUT, f"timed out after {limit:g}s: {args[0]}")
+        except OSError as exc:
+            # type + errno only, never the command line (B1's rule in this module).
+            return _synthetic(args, 1, f"{type(exc).__name__} running {args[0]}")
+
+    def _budget(self, argv: Sequence[str]) -> float:
+        name = Path(argv[0]).name
+        if name in _PW_SH_BINARIES:
+            # Local import on purpose: ``exo`` imports this module at its own top
+            # level, so a module-level import here would be a cycle. The value stays
+            # exo's — B4 owns the sign-in budget, this runner only applies it.
+            from .exo import PWSH_TIMEOUT
+
+            return PWSH_TIMEOUT
+        if name in _BREW_BINARIES:
+            return BREW_TIMEOUT
+        return self.timeout
+
+
+_STREAM_END: Any = object()
+
+
 # --- Process-wide seam -----------------------------------------------------
 # Same shape as micro_notify/secrets.py: one dict, `set_runner()` clears it.
 _runner_flags: dict[str, Any] = {}
@@ -303,6 +479,7 @@ def _synthetic(
 
 
 __all__ = [
+    "BREW_TIMEOUT",
     "EXIT_NOT_FOUND",
     "EXIT_TIMEOUT",
     "STDERR_QUOTE_LIMIT",
@@ -311,6 +488,7 @@ __all__ = [
     "CommandResult",
     "CommandRunner",
     "DryRunRunner",
+    "StreamingRunner",
     "SubprocessRunner",
     "get_runner",
     "parse_json_result",
