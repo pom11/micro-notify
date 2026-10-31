@@ -945,6 +945,69 @@ def test_a_second_run_reports_the_same_ids_as_the_first(
     )
 
 
+def test_an_existing_secret_auth_config_is_not_read_as_matching(
+    fake_cli: FakeAdminCli,
+    keychain_with_certificate: Any,
+    quiet_doctor: list[dict],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`auth = "secret"` is not this command's end state, so it is not "unchanged".
+
+    Without the auth term in the match, a config left over from `mnotify setup --auth
+    secret` would be reported `exists` and left alone after a run that had just
+    uploaded a certificate — the file would keep pointing at a client secret while the
+    summary claimed the certificate credential was in place. The mismatch has to
+    surface as the same refusal any other differing [mail] gets.
+    """
+    existing = Config(
+        mail=MailConfig(
+            tenant_id=TENANT_ID, client_id=APP_ID, sender=SENDER, auth="secret",
+        ),
+        allow=AllowConfig(domains=(DOMAIN,)),
+        limits=LimitsConfig(),
+        paths=PathsConfig(audit=tmp_path / "audit.jsonl", state_dir=tmp_path / "state"),
+    )
+    path = tmp_path / "secret-auth-config.toml"
+    write_config(existing, path)
+    monkeypatch.setenv("MICRO_NOTIFY_CONFIG", str(path))
+
+    assert run_admin("bootstrap", "--sender", SENDER, "--allow-domain", DOMAIN) == EXIT_USAGE
+    assert "--force-config" in capsys.readouterr().err
+    assert 'auth = "secret"' in path.read_text(encoding="utf-8")
+
+
+def test_force_config_switches_a_secret_auth_config_to_certificate(
+    fake_cli: FakeAdminCli,
+    keychain_with_certificate: Any,
+    quiet_doctor: list[dict],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half: with the flag, the file ends up on the certificate path."""
+    existing = Config(
+        mail=MailConfig(
+            tenant_id=TENANT_ID, client_id=APP_ID, sender=SENDER, auth="secret",
+        ),
+        allow=AllowConfig(domains=(DOMAIN,)),
+        limits=LimitsConfig(),
+        paths=PathsConfig(audit=tmp_path / "audit.jsonl", state_dir=tmp_path / "state"),
+    )
+    path = tmp_path / "secret-auth-config.toml"
+    write_config(existing, path)
+    monkeypatch.setenv("MICRO_NOTIFY_CONFIG", str(path))
+
+    assert (
+        run_admin(
+            "bootstrap", "--sender", SENDER, "--allow-domain", DOMAIN, "--force-config"
+        )
+        == EXIT_OK
+    )
+    text = path.read_text(encoding="utf-8")
+    assert 'auth = "certificate"' in text and 'auth = "secret"' not in text
+
+
 # ===========================================================================
 # --install-missing gate
 # ===========================================================================
