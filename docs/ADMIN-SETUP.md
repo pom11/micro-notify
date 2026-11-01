@@ -667,7 +667,7 @@ nothing, and exits 0. From a fresh tenant:
 az account show
 az account tenant list
 az rest --method GET --uri https://graph.microsoft.com/v1.0/me/memberOf
-pwsh -NoProfile -NonInteractive -Command Get-Module -ListAvailable ExchangeOnlineManagement | Select-Object -First 1 -ExpandProperty Version
+pwsh -NoProfile -NonInteractive -Command Get-Module -ListAvailable ExchangeOnlineManagement | Sort-Object Version -Descending | Select-Object -First 1 -ExpandProperty Version | ForEach-Object { $_.ToString() }
 az ad user show --id noreply@example.com
 preflight: dryrun — read-only probes recorded, none executed
 az ad app list --display-name micro-notify
