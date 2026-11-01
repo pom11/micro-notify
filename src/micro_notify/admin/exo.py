@@ -361,6 +361,35 @@ def _ps(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+# Load the module before any error baseline exists. Kept in its own unit so the
+# reason is readable next to the lines it justifies.
+#
+# ``ExchangeOnlineManagement`` lists PowerShellGet in RequiredModules, and PowerShellGet
+# 2.2.5's module init does a ``New-Item`` on ``$script:ProgramFilesInstalledScriptInfosPath``
+# = ``/usr/local/share/powershell/Scripts/InstalledScriptInfos``, because its
+# ``Test-RunningAsElevated`` hard-returns ``$true`` on CoreCLR non-Windows. On an
+# Apple-silicon Mac ``/usr/local`` is root-owned and ``/usr/local/share`` does not exist,
+# so the init raises ``UnauthorizedAccessException`` twice — non-terminating, and still
+# recorded into ``$Error`` despite the module's own ``-ErrorAction SilentlyContinue``.
+#
+# Left to autoload, that happens inside the first ``Connect-ExchangeOnline`` call, i.e.
+# INSIDE the attempt window, and the per-attempt ``$Error.Count`` delta counts it as a
+# failed connect. The live B6b run therefore died with exit 2 and "the sign-in was
+# refused ... Access to the path '/usr/local/share' is denied" (x2) on a device-code
+# sign-in that had actually succeeded. Importing here puts those records behind the
+# baseline; ``-ErrorAction Stop`` keeps a genuinely broken install a terminating failure
+# the outer catch reports with the real message, so this still fails closed.
+_MODULE_IMPORT_BLOCK: tuple[str, ...] = (
+    "    # --- 0a. load the Exchange module while no error baseline exists yet (BUG 5).",
+    "    # Its PowerShellGet dependency leaves non-terminating 'Access to the path ... is",
+    "    # denied' records in the error queue on a Mac; loading it now puts them before the",
+    "    # per-attempt baseline instead of inside it. A broken install stops here instead of",
+    "    # looking like a refused sign-in later.",
+    "    Import-Module ExchangeOnlineManagement -ErrorAction Stop",
+    "    Write-MnotifyEvent @{ event = 'module_import'; outcome = 'loaded'; errors = $Error.Count }",
+)
+
+
 # The connect, with one retry. Kept beside the generator rather than inline so the
 # block that has to stay structurally balanced is one readable unit.
 #
@@ -375,13 +404,15 @@ def _ps(value: str) -> str:
 # fresh device-code prompt for a human to type, so a second pwsh process would ask the
 # operator to sign in again for a failure that costs nothing to repeat in-process.
 _CONNECT_BLOCK: tuple[str, ...] = (
-    "    # --- 0. connect: the device-code prompt must reach the terminal now, not later.",
+    "    # --- 0b. connect: the device-code prompt must reach the terminal now, not later.",
     "    Write-MnotifyLine 'mnotify: connecting to Exchange Online (device-code sign-in).'",
     "    Write-MnotifyLine 'mnotify: open the page and enter the code below when prompted.'",
     # Two attempts, no more: each attempt is a device-code prompt for a human.
     "    $MnotifyConnectTries = 2",
     "    $MnotifyConnectError = ''",
     "    for ($MnotifyAttempt = 1; $MnotifyAttempt -le $MnotifyConnectTries; $MnotifyAttempt++) {",
+    # The baseline is taken AFTER the module import above, so the delta this attempt
+    # measures belongs to the sign-in and to nothing else (BUG 5).
     "        $MnotifyErrBefore = $Error.Count",
     "        $MnotifyAttemptFailed = $false",
     "        $MnotifyAttemptError = ''",
@@ -395,7 +426,10 @@ _CONNECT_BLOCK: tuple[str, ...] = (
     "        }",
     "        if ($Error.Count -gt $MnotifyErrBefore) {",
     "            $MnotifyAttemptFailed = $true",
-    "            $MnotifyNewErrors = @($Error | Select-Object -Skip $MnotifyErrBefore | ForEach-Object { \"$_\" })",
+    "            # $Error is NEWEST FIRST, so the records this attempt added are the",
+    "            # FIRST (count - baseline) of it. -Skip would return the oldest records",
+    "            # instead - ones recorded before the attempt started (BUG 5).",
+    "            $MnotifyNewErrors = @($Error | Select-Object -First ($Error.Count - $MnotifyErrBefore) | ForEach-Object { \"$_\" })",
     "            $MnotifyAttemptError = \"$MnotifyAttemptError $($MnotifyNewErrors -join ' ')\"",
     "        }",
     "        if (-not $MnotifyAttemptFailed -and -not (Get-ConnectionInformation)) {",
@@ -569,6 +603,8 @@ def build_script(
         "$MnotifyOk = $true",
         "",
         "try {",
+        *_MODULE_IMPORT_BLOCK,
+        "",
         *_CONNECT_BLOCK,
         "",
         "    # --- 1. Get-before-New: the Exchange-side service principal object.",
