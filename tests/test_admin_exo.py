@@ -2372,3 +2372,82 @@ def test_a_duplicate_scope_death_blames_the_cmdlet_that_threw(temp_dir: Path) ->
         "the duplicate-scope refusal IS a scope problem: the re-run advice is a lie"
     )
     assert excinfo.value.result.ok is False
+
+
+def adopted_transcript(
+    name: str = ADOPTED_SCOPE, *, with_name: bool = True
+) -> list[str]:
+    """A re-run of a tenant whose scope has ``name``: every object exists, the
+    scope step reports the name it adopted, and the authorization rows are
+    answered through that same name (that is what the tenant does).
+
+    ``with_name=False`` is a transcript from a script that predates the ``name=``
+    field, and then the rows carry the derived name - what the tenant answered is
+    keyed to the scope the run itself named.
+    """
+    row_scope = name if with_name else DERIVED_DASHED
+    lines: list[str] = [
+        "mnotify: connecting to Exchange Online (device-code sign-in).",
+        DEVICE_CODE_LINE,
+        event(event="connected"),
+        event(event="service_principal", outcome="exists", found=1),
+    ]
+    payload: dict[str, Any] = {"event": "management_scope", "outcome": "exists", "found": 1}
+    if with_name:
+        payload["name"] = name
+    lines.append(event(**payload))
+    lines.append(event(event="role_assignment", outcome="exists", found=1))
+    lines.append(
+        event(event="authz", control="sender", resource=SENDER_DASHED,
+              rows=to_json_rows([authz_row("True", scope=row_scope)]))
+    )
+    lines.append(
+        event(event="authz", control="admin", resource=ADMIN_MAILBOX,
+              rows=to_json_rows([authz_row("False", scope=row_scope)]))
+    )
+    lines.append(event(event="disconnected"))
+    lines.append(event(event="summary", ok=True))
+    return lines
+
+
+def test_the_report_carries_the_adopted_scope_name_not_the_derived_one() -> None:
+    """S3 end to end: an idempotent re-run whose tenant spells the scope differently
+    is GREEN and says so in the tenant's spelling. The scope the operator is told
+    about has to be the one that exists - reporting the derived name would point
+    them at a scope that is not on the tenant, and the authorization rows come back
+    through the adopted name, so the scope comparison has to follow it too."""
+    result = parse_pwsh_output(
+        capture_of(adopted_transcript()).lines, script=dashed_script()
+    )
+    assert result.ok is True, result.failures
+    assert result.created is False and result.outcome == OUTCOME_EXISTS
+    assert result.scope_name == ADOPTED_SCOPE
+    assert ADOPTED_SCOPE in result.detail and DERIVED_DASHED not in result.detail
+    assert "already present" in result.detail
+    payload = result.to_dict()
+    assert payload["scope_name"] == ADOPTED_SCOPE
+    # The proof is read against the adopted name: a True row through it is a pass.
+    assert result.sender_check.expected_scope == ADOPTED_SCOPE
+    assert result.sender_check.passed and result.admin_check.passed
+
+
+def test_a_created_scope_is_reported_under_the_derived_name() -> None:
+    """The fallback, and the only direction that can create: with nothing to adopt
+    the run names the scope itself, so the report keeps the derived name."""
+    lines = adopted_transcript(with_name=False)
+    lines[4] = event(event="management_scope", outcome="created", found=0)
+    lines[5] = event(event="role_assignment", outcome="created", found=0)
+    result = parse_pwsh_output(capture_of(lines).lines, script=dashed_script())
+    assert result.ok is True, result.failures
+    assert result.created is True
+    assert result.scope_name == DERIVED_DASHED
+
+
+def test_an_exists_event_without_a_name_falls_back_to_the_derived_one() -> None:
+    """A transcript from a script that predates the ``name=`` field must still read
+    as the re-run it is - the missing field is not a failure and not a rename."""
+    result = parse_pwsh_output(
+        capture_of(adopted_transcript(with_name=False)).lines, script=dashed_script()
+    )
+    assert result.ok is True, result.failures
+    assert result.scope_name == DERIVED_DASHED

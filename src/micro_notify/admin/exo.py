@@ -1406,6 +1406,27 @@ def parse_pwsh_output(
     management_scope = one_step("management scope", "management_scope")
     role_assignment = one_step("role assignment", "role_assignment")
 
+    # --- the scope name the tenant actually uses (BUG 7a) -------------------
+    # A scope built by hand carries the sender's filter under a name this tool's
+    # derivation does not reproduce (mnotify-noreply vs mnotify-no-reply), so the
+    # script adopts the tenant's name and reports it here. Everything downstream —
+    # the detail line, the --json payload, and the scope the authorization rows are
+    # compared against — has to speak that name: the tenant answers
+    # Test-ServicePrincipalAuthorization through the scope that EXISTS, and reading
+    # its rows against the name we merely derived would turn an idempotent re-run
+    # into "InScope True through scope 'mnotify-noreply' rather than
+    # 'mnotify-no-reply'". A transcript without a name (an older script, or a run
+    # that created the scope itself and therefore named it) keeps the derived one.
+    scope_name = script.scope_name
+    reported_scope_events = by_event.get("management_scope", [])
+    if reported_scope_events:
+        # The last event is the step's answer, the same one ``one_step`` read.
+        scope_event = reported_scope_events[-1]
+        if str(scope_event.get("outcome") or "").strip().casefold() == OUTCOME_EXISTS:
+            reported_name = str(scope_event.get("name") or "").strip()
+            if reported_name:
+                scope_name = reported_name
+
     checks: dict[str, AuthzCheck] = {}
     for event in by_event.get("authz", []):
         control = str(event.get("control") or "")
@@ -1416,7 +1437,7 @@ def parse_pwsh_output(
             control=control,
             resource=resource,
             expected_in_scope=expected,
-            expected_scope=script.scope_name,
+            expected_scope=scope_name,
         )
     for control, expected, label in (
         (CONTROL_SENDER, True, "the sender mailbox"),
@@ -1429,7 +1450,7 @@ def parse_pwsh_output(
                 resource=script.sender if control == CONTROL_SENDER else script.admin_mailbox,
                 in_scope=None,
                 expected_in_scope=expected,
-                expected_scope=script.scope_name,
+                expected_scope=scope_name,
             )
 
     summary = by_event.get("summary", [])
@@ -1477,7 +1498,7 @@ def parse_pwsh_output(
     ok = not failures
     return ExchangeProvisioning(
         sender=script.sender,
-        scope_name=script.scope_name,
+        scope_name=scope_name,
         app_id=script.app_id,
         sp_object_id=script.sp_object_id,
         admin_mailbox=script.admin_mailbox,
