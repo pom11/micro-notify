@@ -67,7 +67,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from .runner import CommandError, CommandRunner, run_json
+from .runner import CommandError, CommandRunner, get_runner, run_json
 
 # --- Vocabulary --------------------------------------------------------------
 # Microsoft Graph's own first-party application id — a well-known constant, the same
@@ -495,6 +495,145 @@ def consent_grant_argv(sp_object_id: str, graph_object_id: str, scopes: Sequence
 
 
 # --- The writes --------------------------------------------------------------
+# What az actually prints for a WRITE, verified against the installed azure-cli
+# (2.90.0, ``command_modules/role/custom.py``) rather than assumed:
+#
+# * ``permission add`` — NOTHING. ``add_permission`` PATCHes the registration and
+#   then emits one ``logger.warning``; there is no ``return``, so knack's invoker
+#   gets ``None`` and ``cli.py`` skips the output formatter outright
+#   (``if cmd_result and cmd_result.result is not None``). Exit 0, empty stdout,
+#   ``WARNING: Invoking `az ad app permission grant ...` is needed to make the
+#   change effective`` on stderr. That WARNING is az telling the operator about
+#   the consent step — the very next step this module runs — not an error.
+# * ``update --set`` — the same: az's generic update ends in the same
+#   ``application_update`` PATCH, whose 204 response body is empty, so ``_send``
+#   returns ``None`` and nothing is printed.
+# * ``permission grant`` — by contrast it DOES print JSON: ``grant_application``
+#   returns the created ``oauth2PermissionGrant`` (a POST with a body). That is why
+#   the consent path below keeps ``run_json`` and these two do not.
+#
+# So a delegated write's verdict is its exit code, and the *claim* of success is a
+# separate read of the tenant. Reading a silent write through
+# :func:`~micro_notify.admin.runner.run_json` inverts both: it turns az's healthiest
+# answer into ``'az' did not print JSON`` and exits 2. (B3 hit the same contract on
+# ``credential upload`` and solved it the same way — see
+# ``admin/certupload.py::_run_checked``.)
+_STDERR_QUOTE_LIMIT = 200
+
+
+def _quote_stderr(stderr: Any) -> str:
+    """One collapsed, bounded line of az's own stderr, or ``''``.
+
+    Mirrors :mod:`micro_notify.admin.runner`'s private helper rather than importing
+    it (that module is not this card's to edit, and reaching into another card's
+    underscore names is worse than six lines).
+    """
+    line = " ".join((stderr or "").split())
+    if not line:
+        return ""
+    if len(line) > _STDERR_QUOTE_LIMIT:
+        line = line[:_STDERR_QUOTE_LIMIT].rstrip() + "..."
+    return f" — {line}"
+
+
+def run_write(argv: Sequence[str], *, runner: CommandRunner | None = None, label: str = "") -> None:
+    """Run an az WRITE whose success signal is the exit code, never stdout.
+
+    Deliberately not :func:`~micro_notify.admin.runner.run_json`: for these commands
+    az prints nothing on success, so "no JSON" is the healthy answer and cannot be
+    the failure signal. A non-zero exit still raises, still quoting at most
+    :data:`_STDERR_QUOTE_LIMIT` characters of stderr — that is where az puts its own
+    diagnosis, and it is the only place the operator can learn *why*.
+    """
+    args = [str(a) for a in argv]
+    result = (runner or get_runner()).run(args)
+    returncode = getattr(result, "returncode", None)
+    if returncode is None or int(returncode) != 0:
+        code = "unknown" if returncode is None else int(returncode)
+        what = label or " ".join(args)
+        raise DelegatedSetupError(
+            f"`{what}` failed (exit {code}){_quote_stderr(getattr(result, 'stderr', None))}"
+        )
+
+
+def graph_entry_query() -> str:
+    """The ``--query`` that keeps only the Microsoft Graph entry of the permission list.
+
+    ``az ad app permission list`` returns the application's whole
+    ``requiredResourceAccess`` list. The filter is a JMESPath *filter expression*, not
+    ``<graphAppId>.resourceAccess``: a bare identifier cannot contain a ``-`` (az's own
+    bundled jmespath rejects it with ``LexerError: Unknown token '-'``) and the document
+    is a list, so key lookup on it answers ``null`` either way. Filtering on
+    ``resourceAppId`` is what :func:`declared_graph_scopes` already does in Python, so
+    the read agrees with the parser.
+    """
+    return f"[?resourceAppId=='{MS_GRAPH_APP_ID}']"
+
+
+def permission_list_argv(app_id: str) -> list[str]:
+    """The read-back: what the tenant says the registration declares right now."""
+    _check_app_id(app_id)
+    return [
+        "az",
+        "ad",
+        "app",
+        "permission",
+        "list",
+        "--id",
+        app_id,
+        "--query",
+        graph_entry_query(),
+    ]
+
+
+def read_back_graph_access_ids(
+    app_id: str, *, runner: CommandRunner | None = None
+) -> set[str]:
+    """The permission ids the tenant NOW reports as declared Scope entries on Graph.
+
+    The shape is the one :func:`declared_graph_scopes` already parses: ``az ad app
+    permission list`` returns the application's ``requiredResourceAccess`` list
+    (verified against the installed azure-cli 2.90.0, ``role/custom.py::list_permissions``
+    returns ``application['requiredResourceAccess']``), so the read-back and the
+    pre-write read are the same document read by the same two rules — one
+    ``resourceAppId`` filter, one ``Scope``-only filter — and a ``Role`` entry can
+    never look like proof that a delegated scope landed.
+
+    Compared against the ids the write *sent*, not against scope names. An id is what
+    ``requiredResourceAccess.resourceAccess`` stores, so an id comparison is evidence
+    about the exact permission this step wrote; a name comparison has to route through
+    ``id_to_name``, and where a tenant (or a fixture — see
+    ``test_the_ids_written_are_the_ones_the_tenant_published``, which deliberately
+    publishes two ids for five scopes) reuses one id for several names, a name match
+    would credit every one of them with a write that only carried one.
+
+    ``null`` or an empty list means the registration declares no Microsoft Graph entry
+    at all: an empty answer, not a malformed one.
+    """
+    payload = run_json(permission_list_argv(app_id), runner=runner)
+    if payload is None:
+        return set()
+    if not isinstance(payload, (list, tuple)):
+        raise DelegatedSetupError(
+            f"`az ad app permission list --id {app_id}` did not print the "
+            f"requiredResourceAccess list this step reads (got "
+            f"{type(payload).__name__}); refusing to guess whether the scopes landed"
+        )
+    found: set[str] = set()
+    for entry in _entries(payload):
+        if _text(entry.get("resourceAppId")).casefold() != MS_GRAPH_APP_ID.casefold():
+            # Somebody else's API: a permission on it is not evidence about Graph,
+            # even if it carried the same id.
+            continue
+        for access in _entries(entry.get("resourceAccess")):
+            if _text(access.get("type")).lower() != ACCESS_SCOPE.lower():
+                continue
+            identifier = _text(access.get("id")).lower()
+            if identifier:
+                found.add(identifier)
+    return found
+
+
 def ensure_delegated_permissions(
     app_id: str,
     scopes: Sequence[str],
@@ -512,16 +651,45 @@ def ensure_delegated_permissions(
     so a tenant that rejects exactly one of them (a verification rule blocking, say,
     ``ChatMessage.Send``) fails with the failing scope named in the argv instead of
     failing for an opaque reason with all five in the payload.
+
+    The add itself prints nothing (see the note above :func:`run_write`), so the exit
+    code decides whether it ran and a **read-back decides whether it took**. az's own
+    stdout is not evidence either way: an empty stdout is the success answer, and the
+    ``WARNING: ... permission grant ...`` it puts on stderr is a pointer at the consent
+    step, not a complaint. A zero exit whose scope then does not appear in
+    ``permission list`` is reported as a failure naming that scope — a registration that
+    looks configured but cannot send is the worse outcome, and it is the one a silently
+    dropped write would produce.
     """
     names = tuple(_check_scope(name) for name in scopes)
     resource = graph or graph_resource(names, runner=runner)
     ids = resource.require(names)
     app = show_app(app_id, runner=runner)
-    present = declared_graph_scopes(app, {i.lower(): n for n, i in ids.items()})
+    id_to_name = {i.lower(): n for n, i in ids.items()}
+    present = declared_graph_scopes(app, id_to_name)
 
     to_add = [name for name in names if name not in present]
-    for name in to_add:
-        run_json(permission_add_argv(app_id, ids[name]), runner=runner)
+    if to_add:
+        for name in to_add:
+            run_write(
+                permission_add_argv(app_id, ids[name]),
+                runner=runner,
+                label=f"az ad app permission add (scope {name})",
+            )
+        # One read for the whole batch rather than one per scope: az PATCHes each add
+        # before its process exits, so a scope still absent after the last one is
+        # absent for good — and one read names every scope that failed rather than
+        # only the first.
+        declared_ids = read_back_graph_access_ids(app_id, runner=runner)
+        not_applied = [name for name in to_add if ids[name].lower() not in declared_ids]
+        if not_applied:
+            raise DelegatedSetupError(
+                f"`az ad app permission add` exited 0 but {', '.join(not_applied)} "
+                f"{'is' if len(not_applied) == 1 else 'are'} still not declared on app "
+                f"{app_id} for Microsoft Graph — refusing to report scopes the tenant "
+                "does not show; check the registration in the portal "
+                "(Entra ID -> App registrations -> API permissions)"
+            )
     return DelegatedPermissionsOutcome(
         app_id=app_id,
         granted=tuple(to_add),
@@ -545,7 +713,14 @@ def ensure_public_client_flows(
     app = show_app(app_id, runner=runner)
     if app.get(_PUBLIC_CLIENT_PROPERTY) is True:
         return PublicClientOutcome(app_id=app_id, enabled=False)
-    run_json(public_client_enable_argv(app_id), runner=runner)
+    # The same write contract as `permission add`: az's generic update ends in the
+    # same PATCH, whose empty body leaves knack nothing to print. Through run_json
+    # this step would fail on every real run for exactly BUG6's reason.
+    run_write(
+        public_client_enable_argv(app_id),
+        runner=runner,
+        label=f"az ad app update ({_PUBLIC_CLIENT_PROPERTY})",
+    )
     return PublicClientOutcome(app_id=app_id, enabled=True)
 
 
