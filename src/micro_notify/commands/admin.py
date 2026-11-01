@@ -292,6 +292,19 @@ def add_parser(subparsers: "argparse._SubParsersAction") -> None:
         "names the thumbprint it would overwrite, because such a pair may be the "
         "live credential of a different app registration",
     )
+    # The escape hatch for a tenant whose scope predates this command: the derived name
+    # is the idempotency key for the role assignment (B4), so when the real scope was
+    # created by hand under a different name, a run that derives a name instead creates a
+    # SECOND scope and assigns the app to a scope that restricts nothing useful. The
+    # module has taken this argument since B4; only the flag was missing.
+    bootstrap.add_argument(
+        "--scope-name",
+        dest="scope_name",
+        metavar="NAME",
+        default=None,
+        help="override the derived management-scope name when the tenant's scope was "
+        "created by hand (default: `mnotify-<sender local part>`)",
+    )
     bootstrap.add_argument(
         "--dry-run",
         action="store_true",
@@ -432,6 +445,47 @@ def _valid_sender(address: str, flag: str = "--sender") -> str:
         raise BootstrapError(
             f"{flag} must be one mailbox address, e.g. noreply@example.com (got "
             f"{address!r})"
+        )
+    return value
+
+
+def _scope_name_override(args: argparse.Namespace) -> str | None:
+    """``--scope-name`` as the module should receive it: a name, or ``None``.
+
+    ``None`` means "not given" and reaches the module as "derive it" — which is why an
+    attribute a hand-built Namespace may not carry reads as the pre-flag behaviour
+    rather than as an empty scope name.
+
+    Only the typos the CLI can name without owning Exchange's grammar are checked here:
+    empty, a name with whitespace in it (Exchange splits a quoted argument on it), and
+    one over the length the derivation itself caps at. Character rules stay B4's —
+    :func:`micro_notify.admin.exo._check_scope_name` is the authority on what a scope
+    name may contain, and it refuses with the same exit 2, so a name that passes here
+    and fails there is still a refusal before anything is created.
+
+    Refused up front, before the first probe, for the same reason the empty allowlist
+    is: an operator who typo'd the name should learn it before this run has registered
+    an app and uploaded a certificate.
+    """
+    raw = getattr(args, "scope_name", None)
+    if raw is None:
+        return None
+    value = raw.strip()
+    if not value:
+        raise BootstrapError(
+            "--scope-name must name the management scope the tenant already has, or "
+            "be left off to use the derived `mnotify-<sender local part>` (got "
+            f"{raw!r})"
+        )
+    if any(ch.isspace() for ch in value):
+        raise BootstrapError(
+            f"--scope-name must be one word with no spaces, e.g. mnotify-noreply "
+            f"(got {raw!r})"
+        )
+    if len(value) > exo.SCOPE_NAME_MAX:
+        raise BootstrapError(
+            f"--scope-name must be at most {exo.SCOPE_NAME_MAX} characters, like the "
+            f"derived name (got {len(value)} in {value!r})"
         )
     return value
 
@@ -783,7 +837,15 @@ def _dry_run_app_only(
     )
 
     control = _dry_control_mailbox(args, report)
-    printer.planned(plan_commands(app_id, sp_object_id, sender, admin_mailbox=control))
+    printer.planned(
+        plan_commands(
+            app_id,
+            sp_object_id,
+            sender,
+            admin_mailbox=control,
+            scope_name=_scope_name_override(args),
+        )
+    )
     out.add(STEP_EXCHANGE, OUTCOME_DRYRUN, "planned the script; no file written or run")
 
     out.add(STEP_CONFIG, OUTCOME_DRYRUN, "no config file written")
@@ -948,9 +1010,20 @@ def _certificate_step(app_id: str, out: Report, *, force: bool = False) -> Any:
 
 
 def _exchange_step(
-    app_id: str, sp_object_id: str, sender: str, control: str, out: Report
+    app_id: str,
+    sp_object_id: str,
+    sender: str,
+    control: str,
+    out: Report,
+    scope_name: str | None = None,
 ) -> Any:
-    """4. The Exchange Online scoped role, and the proof that it holds (B4)."""
+    """4. The Exchange Online scoped role, and the proof that it holds (B4).
+
+    ``scope_name`` is ``--scope-name`` passed straight through as the module's keyword:
+    ``None`` means "derive it from the sender", which is every run that does not name a
+    scope. The step reports the name the module actually used, so ``scopeName`` in the
+    summary is what was proven rather than what a re-run would guess.
+    """
     from ..admin import exo
 
     if not supports_streaming():
@@ -962,7 +1035,7 @@ def _exchange_step(
             "appears only after the sign-in completes. " + DEVICE_CODE_HINT
         )
     result = exo.ensure_exchange_scope(
-        app_id, sp_object_id, sender, control, echo=out.echo
+        app_id, sp_object_id, sender, control, echo=out.echo, scope_name=scope_name
     )
     out.add(STEP_EXCHANGE, result.outcome, result.detail)
     out.note("scopeName", result.scope_name)
@@ -1264,6 +1337,9 @@ def bootstrap(args: argparse.Namespace) -> int:
     sender = _valid_sender(args.sender)
     domains = _valid_domains(args.allow_domain)
     mode = _mode_of(args)
+    # Read before anything runs, so a bad name is a refusal rather than a surprise three
+    # steps in (see :func:`_scope_name_override`).
+    scope_name = _scope_name_override(args)
 
     # `--admin-consent` in app mode is refused rather than ignored. The flag can only
     # do one of two things there: grant a Graph delegated consent the app-only route
@@ -1277,6 +1353,19 @@ def bootstrap(args: argparse.Namespace) -> int:
             "through the Exchange Online scoped role (ADMIN-SETUP §2) and must not "
             "gain a consented Graph permission — §3.1 removes the tenant-wide consent "
             "on purpose. Drop the flag, or run the delegated bootstrap"
+        )
+
+    if mode == MODE_DELEGATED and scope_name is not None:
+        # Same rule as `--admin-consent` above: a flag that belongs to one mode must not
+        # ride into the other unnoticed. A delegated run creates no management scope at
+        # all (neither the certificate nor the Exchange role is read by a delegated
+        # send), so accepting the name here would let an operator believe they had
+        # adopted a hand-created scope that this run never touched.
+        raise BootstrapError(
+            "`--scope-name` needs app mode: a delegated bootstrap creates no Exchange "
+            "Online management scope (neither the certificate nor the scoped role is "
+            "read by a delegated send), so there is no scope name to override. Drop "
+            "the flag, or run the app-only bootstrap"
         )
 
     # The empty-allowlist refusal comes first, before the first probe. Not tidiness:
@@ -1320,7 +1409,9 @@ def bootstrap(args: argparse.Namespace) -> int:
 
         entra = _entra_step(out)
         _certificate_step(entra.app_id, out, force=bool(getattr(args, "force", False)))
-        _exchange_step(entra.app_id, entra.sp_object_id, sender, control, out)
+        _exchange_step(
+            entra.app_id, entra.sp_object_id, sender, control, out, scope_name
+        )
         # Only now: every value the config advertises has been proven to exist.
         _config_step(
             report.tenant_id or "",

@@ -58,6 +58,10 @@ SENDER = "noreply@example.com"
 ADMIN_UPN = "admin@contoso.com"
 DOMAIN = "example.com"
 SCOPE = "mnotify-noreply"
+# A hand-created scope whose name the derivation cannot produce. Deliberately not a
+# spelling the derivation could reach from SENDER, so a test that passes because the
+# two names happen to agree cannot hide a flag that was never threaded through.
+CUSTOM_SCOPE = "mnotify-handmade-scope"
 THUMBPRINT = "AABBCCDDEEFF00112233445566778899AABBCCDD"
 TENANT_ID = "00000000-0000-0000-0000-000000000000"
 DEVICE_CODE_LINE = (
@@ -1590,3 +1594,243 @@ def test_report_is_silent_in_machine_mode_until_it_emits(
     assert capsys.readouterr().out == ""
     report.emit(ok=True)
     assert json.loads(capsys.readouterr().out)["steps"][0]["name"] == "alpha"
+
+
+# ===========================================================================
+# --scope-name (BUG7b: the operator's override for a hand-created scope)
+# ===========================================================================
+def _transcript_for_scope(scope: str) -> str:
+    """The healthy Exchange transcript, with the authorization rows naming `scope`.
+
+    B4's proof compares each ``InScope`` row's ``Scope`` against the scope the script
+    was built for, so a transcript that still names the *derived* scope would fail the
+    verification for a run that legitimately overrode it — this helper moves the
+    placeholder tenant's answer to whatever name the run asked for.
+    """
+    return pwsh_transcript().replace('"Scope":"%s"' % SCOPE, '"Scope":"%s"' % scope)
+
+
+def test_the_scope_name_override_is_a_parseable_bootstrap_flag() -> None:
+    args = cli.build_parser().parse_args(
+        [*BOOTSTRAP, "--scope-name", CUSTOM_SCOPE]
+    )
+    assert args.scope_name == CUSTOM_SCOPE
+    # The default is "not given", not "an empty name": an empty string would reach the
+    # module as a scope name the operator never typed.
+    assert cli.build_parser().parse_args(list(BOOTSTRAP)).scope_name is None
+
+
+def test_dry_run_plans_the_hand_created_scope_name(
+    keychain_with_certificate: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The plan must name the scope the operator named, not the derived one.
+
+    This is the whole point of the flag: when the tenant's scope was created by hand
+    under a name the derivation cannot produce, an operator who cannot see the name in
+    the plan cannot check it before a run that would create a second scope and a role
+    assignment pointing at it.
+    """
+    assert (
+        run_admin(
+            "bootstrap",
+            "--sender",
+            SENDER,
+            "--allow-domain",
+            DOMAIN,
+            "--dry-run",
+            "--scope-name",
+            CUSTOM_SCOPE,
+        )
+        == EXIT_OK
+    )
+    joined = "\n".join(capsys.readouterr().out.splitlines())
+    assert f"$MnotifyScope      = '{CUSTOM_SCOPE}'" in joined
+    assert f"'{SCOPE}'" not in joined, "the derived name leaked into an overridden plan"
+    # The line the override belongs to is still the real cmdlet, unchanged in shape.
+    assert "New-ManagementScope -Name $MnotifyScope" in joined
+
+
+def test_without_the_override_the_derived_scope_name_is_unchanged(
+    keychain_with_certificate: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Regression pin: the flag is additive, and the derivation stays the default."""
+    assert (
+        run_admin(
+            "bootstrap", "--sender", SENDER, "--allow-domain", DOMAIN, "--dry-run"
+        )
+        == EXIT_OK
+    )
+    joined = "\n".join(capsys.readouterr().out.splitlines())
+    assert f"$MnotifyScope      = '{SCOPE}'" in joined
+    assert CUSTOM_SCOPE not in joined
+
+
+def test_the_override_reaches_the_exchange_step_and_the_report(
+    monkeypatch: pytest.MonkeyPatch,
+    keychain_with_certificate: Any,
+    quiet_doctor: list[dict],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A real run passes the name through as a keyword and reports what it used.
+
+    Asserted at both ends: the keyword the module receives (so the flag cannot be
+    parsed-and-ignored) and `scopeName` in the ``--json`` summary (so an operator
+    scripting the bootstrap sees the name that was actually proven, not the one a
+    later run would derive).
+    """
+    seen: dict[str, Any] = {}
+    real_ensure = exo_module.ensure_exchange_scope
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return real_ensure(*args, **kwargs)
+
+    monkeypatch.setattr(exo_module, "ensure_exchange_scope", spy)
+    fake = FakeAdminCli(healthy_responses(configured=True))
+    fake.set(
+        ("pwsh", "-NoProfile", "-NonInteractive", "-File"),
+        _transcript_for_scope(CUSTOM_SCOPE),
+    )
+    admin_cmd.set_runner(fake)
+
+    code = run_admin(
+        "bootstrap",
+        "--sender",
+        SENDER,
+        "--allow-domain",
+        DOMAIN,
+        "--json",
+        "--scope-name",
+        CUSTOM_SCOPE,
+    )
+    cap = capsys.readouterr()
+    assert code == EXIT_OK, cap.out + cap.err
+    assert seen["scope_name"] == CUSTOM_SCOPE
+    assert json.loads(cap.out)["scopeName"] == CUSTOM_SCOPE
+
+
+def test_a_blank_scope_name_is_refused_before_any_probe(
+    fake_cli: FakeAdminCli, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Exit 2 naming the flag, and nothing executed.
+
+    The ordering matters more than the message: a name the operator typo'd must not be
+    discovered after the Entra step has already created an app registration.
+    """
+    assert (
+        run_admin(
+            "bootstrap",
+            "--sender",
+            SENDER,
+            "--allow-domain",
+            DOMAIN,
+            "--scope-name",
+            "   ",
+        )
+        == EXIT_USAGE
+    )
+    assert "--scope-name" in capsys.readouterr().err
+    assert not fake_cli.executed(), "an unusable scope name was caught after the first probe"
+
+
+def test_a_scope_name_with_a_space_is_refused_as_a_usage_error(
+    fake_cli: FakeAdminCli, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Same exit-2 family as `--sender`/`--allow-domain` validation failures."""
+    assert (
+        run_admin(
+            "bootstrap",
+            "--sender",
+            SENDER,
+            "--allow-domain",
+            DOMAIN,
+            "--scope-name",
+            "bad name!",
+        )
+        == EXIT_USAGE
+    )
+    err = capsys.readouterr().err
+    assert "--scope-name" in err
+    assert "bad name!" in err
+    assert not fake_cli.executed()
+
+
+def test_an_over_long_scope_name_is_refused_as_a_usage_error(
+    fake_cli: FakeAdminCli, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Exchange rejects it after the sign-in; the CLI rejects it before the probe."""
+    too_long = "mnotify-" + "x" * exo_module.SCOPE_NAME_MAX
+    assert (
+        run_admin(
+            "bootstrap",
+            "--sender",
+            SENDER,
+            "--allow-domain",
+            DOMAIN,
+            "--scope-name",
+            too_long,
+        )
+        == EXIT_USAGE
+    )
+    assert "scope-name" in capsys.readouterr().err
+    assert not fake_cli.executed()
+
+
+def test_a_scope_name_in_delegated_mode_is_refused(
+    fake_cli: FakeAdminCli, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A flag that names a scope this mode never creates is refused, not ignored.
+
+    The same reasoning as `--admin-consent` in app mode: a delegated bootstrap builds
+    no management scope at all, so a name accepted there would leave the operator
+    believing they had adopted a hand-created scope the run never touched.
+    """
+    assert (
+        run_admin(
+            "bootstrap",
+            "--sender",
+            SENDER,
+            "--allow-domain",
+            DOMAIN,
+            "--mode",
+            "delegated",
+            "--scope-name",
+            CUSTOM_SCOPE,
+        )
+        == EXIT_USAGE
+    )
+    assert "--scope-name" in capsys.readouterr().err
+    assert not fake_cli.executed()
+
+
+def test_a_name_the_module_refuses_is_still_exit_2(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_cli: FakeAdminCli,
+    keychain_with_certificate: Any,
+    quiet_doctor: list[dict],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The module stays the authority on what Exchange allows (exit 2 either way).
+
+    The CLI's early check is a fast path for typos it can name without importing rules
+    it does not own; a character Exchange forbids is still refused with the same exit
+    code by B4's own guard, so no path here can turn a bad name into a tenant change.
+    """
+    calls: list[str] = []
+
+    def refusing(*args: Any, **kwargs: Any) -> Any:
+        calls.append("ensured")
+        raise exo_module.ExchangeError("the management scope name is not allowed")
+
+    monkeypatch.setattr(exo_module, "ensure_exchange_scope", refusing)
+    code = run_admin(
+        "bootstrap",
+        "--sender",
+        SENDER,
+        "--allow-domain",
+        DOMAIN,
+        "--scope-name",
+        "mnotify;drop",
+    )
+    assert code == EXIT_USAGE
+    assert "mnotify: the management scope name is not allowed" in capsys.readouterr().err
