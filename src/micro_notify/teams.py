@@ -406,8 +406,10 @@ def post_chat_message(
 
 # GET /me/chats selects exactly the fields `teams chats list` prints. The chat
 # resource names its timestamp lastUpdatedDateTime; selecting a property it does
-# not have (lastModifiedDateTime) is an HTTP 400 for the whole request.
-CHAT_LIST_SELECT = "topic,lastUpdatedDateTime,chatType"
+# not have (lastModifiedDateTime) is an HTTP 400 for the whole request. And
+# $select returns only what it names: without id every chat comes back id-less
+# and `teams chats add --pick` would register an empty target.
+CHAT_LIST_SELECT = "id,topic,lastUpdatedDateTime,chatType"
 
 
 def get_my_chats(

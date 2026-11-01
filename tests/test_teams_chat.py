@@ -275,7 +275,7 @@ def test_chats_list_selects_the_documented_fields(delegated, fake_keychain, mock
     assert request.method == "GET"
     assert request.url.path == "/v1.0/me/chats"
     assert request.url.params["$select"] == CHAT_LIST_SELECT
-    assert CHAT_LIST_SELECT == "topic,lastUpdatedDateTime,chatType"
+    assert CHAT_LIST_SELECT == "id,topic,lastUpdatedDateTime,chatType"
     assert request.headers["authorization"] == "Bearer " + FAKE_TOKEN
 
 
