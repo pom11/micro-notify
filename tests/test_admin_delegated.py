@@ -227,7 +227,7 @@ class SigninStub:
 
 
 class TenantCli(FakeAdminCli):
-    """B5's fake plus two things a flat answer table cannot express.
+    """B5's fake plus the things a flat answer table cannot express.
 
     **A command that fails the way ``az`` really fails** (:meth:`fail`):
 
@@ -248,10 +248,28 @@ class TenantCli(FakeAdminCli):
     stay flat, which is exactly what
     :func:`test_a_consent_that_is_not_visible_after_the_write_warns_too` wants: a write that
     reported success and a tenant that still says nothing is consented.
+
+    **A tenant whose permission read-back reflects the writes it was given**
+    (``tracks_writes``, BUG6). The same statefulness for the permission half: az's
+    ``permission add`` PATCHes the same ``requiredResourceAccess`` property that
+    ``permission list`` and ``app show`` read, answers with **nothing on stdout** (and
+    its "run permission grant" WARNING on stderr), and ``update --set
+    isFallbackPublicClient=true`` writes the same property ``app show`` projects. So the
+    fake derives the ``permission list`` answer from the tenant's own stored state plus
+    the adds it actually accepted, and flips the public-client flag on a successful
+    update. A flat table could not model either, and a read-back frozen at the pre-write
+    answer would make BUG6's fix untestable.
     """
 
     GRANT_PREFIX = ("az", "ad", "app", "permission", "grant")
     READ_PREFIX = ("az", "ad", "app", "permission", "list-grants")
+    ADD_PREFIX = ("az", "ad", "app", "permission", "add")
+    # NOT ``list-grants``: ``list`` is a distinct 5th token, so the two commands
+    # never match each other's prefix.
+    LIST_PREFIX = ("az", "ad", "app", "permission", "list")
+    UPDATE_PREFIX = ("az", "ad", "app", "update")
+    APP_SHOW_PREFIX = ("az", "ad", "app", "show")
+    PUBLIC_CLIENT_SET = "isFallbackPublicClient=true"
 
     def __init__(
         self,
@@ -259,6 +277,7 @@ class TenantCli(FakeAdminCli):
         *,
         grants_track_grants: bool = False,
         grants_after: str | None = None,
+        tracks_writes: bool = True,
     ) -> None:
         super().__init__(responses)
         self._failures: dict[tuple[str, ...], str] = {}
@@ -266,6 +285,9 @@ class TenantCli(FakeAdminCli):
         # What the tenant reports once a grant has succeeded. Defaults to "everything".
         self.grants_after = grants_after if grants_after is not None else grants_json(True)
         self._granted = False
+        self.tracks_writes = tracks_writes
+        # Scope ids the tenant actually accepted via `permission add`.
+        self._added_ids: list[str] = []
 
     def fail(self, prefix: tuple[str, ...], message: str = "ERROR: refused") -> None:
         for key in [k for k in self.responses if tuple(k[: len(prefix)]) == prefix]:
@@ -279,10 +301,38 @@ class TenantCli(FakeAdminCli):
             if len(prefix) <= len(args) and tuple(args[: len(prefix)]) == prefix:
                 self.calls.append(args)
                 return subprocess.CompletedProcess(args, 1, "", message)
+        if self._matches(args, self.ADD_PREFIX):
+            result = super().run(args, stdin=stdin, **kwargs)
+            if result.returncode == 0 and self.tracks_writes:
+                identifier = _api_permission_id(args)
+                if identifier:
+                    self._added_ids.append(identifier)
+            # az prints NOTHING on stdout for a successful add (see
+            # test_a_permission_add_that_prints_nothing_is_not_a_failure), and its
+            # stderr note is informational. The table may still force a non-zero rc.
+            return subprocess.CompletedProcess(
+                args,
+                result.returncode,
+                "",
+                result.stderr if result.returncode else PERMISSION_ADD_WARNING,
+            )
+        if self._matches(args, self.LIST_PREFIX):
+            answer = self._permission_list_answer()
+            if answer is not None:
+                self.calls.append(args)
+                return subprocess.CompletedProcess(args, 0, answer, "")
+
         if self.grants_track_grants and self._matches(args, self.READ_PREFIX) and self._granted:
             self.calls.append(args)
             return subprocess.CompletedProcess(args, 0, self.grants_after, "")
         result = super().run(args, stdin=stdin, **kwargs)
+        if (
+            self.tracks_writes
+            and result.returncode == 0
+            and self._matches(args, self.UPDATE_PREFIX)
+            and self.PUBLIC_CLIENT_SET in args
+        ):
+            self._mark_public_client_on()
         if (
             self.grants_track_grants
             and self._matches(args, self.GRANT_PREFIX)
@@ -290,6 +340,55 @@ class TenantCli(FakeAdminCli):
         ):
             self._granted = True
         return result
+
+    def _permission_list_answer(self) -> str | None:
+        """The Graph entry of ``requiredResourceAccess``, as az would print it now.
+
+        Same stored state the ``app show`` answer is built from, plus every add the
+        tenant accepted — one source of truth for both reads, so the fake cannot say
+        "declared" to one command and "not declared" to another unless it means it.
+        """
+        raw = self.responses.get(self.APP_SHOW_PREFIX)
+        if raw is None:
+            return None
+        try:
+            document = json.loads(raw)
+        except ValueError:
+            return None
+        access: list[dict[str, str]] = []
+        for entry in document.get("requiredResourceAccess", []):
+            if entry.get("resourceAppId", "").casefold() != GRAPH_APP_ID.casefold():
+                continue
+            access = [dict(a) for a in entry.get("resourceAccess", [])]
+        # Appended unconditionally, exactly as az does (`resourceAccess += [...]`): no
+        # de-duplication here. The canned tenant carries a Graph `Role` entry whose id
+        # is shared with one of the delegated scopes — the same id can appear with both
+        # types, and it is `declared_graph_scopes` that decides a `Scope` entry counts
+        # and a `Role` one does not.
+        for identifier in self._added_ids:
+            access.append({"id": identifier, "type": "Scope"})
+        graph_entry = {"resourceAppId": GRAPH_APP_ID, "resourceAccess": access}
+        # A second API's entry rides along because az's `permission list` does not
+        # project: the reader's resourceAppId filter has to earn its keep.
+        decoy = {
+            "resourceAppId": "some-other-api",
+            "resourceAccess": [{"id": "some-other-permission", "type": "Scope"}],
+        }
+        return json.dumps([graph_entry, decoy])
+
+    def _mark_public_client_on(self) -> None:
+        """Apply a successful ``--set isFallbackPublicClient=true`` to the stored app."""
+        raw = self.responses.get(self.APP_SHOW_PREFIX)
+        if raw is None:
+            return
+        try:
+            document = json.loads(raw)
+        except ValueError:
+            return
+        if not isinstance(document, dict):
+            return
+        document[delegated_setup._PUBLIC_CLIENT_PROPERTY] = True
+        self.responses[self.APP_SHOW_PREFIX] = json.dumps(document)
 
     @staticmethod
     def _matches(args: list[str], prefix: tuple[str, ...]) -> bool:
@@ -306,9 +405,13 @@ class Stub:
         *,
         grants_track_grants: bool = True,
         grants_after: str | None = None,
+        tracks_writes: bool = True,
     ) -> None:
         self.cli = TenantCli(
-            tenant, grants_track_grants=grants_track_grants, grants_after=grants_after
+            tenant,
+            grants_track_grants=grants_track_grants,
+            grants_after=grants_after,
+            tracks_writes=tracks_writes,
         )
         self.signin = signin
         self._raw: str | None = None
