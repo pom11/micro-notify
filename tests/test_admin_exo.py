@@ -2111,7 +2111,7 @@ def scope_row(name: str, *, filter_prop: str = "RecipientRestrictionFilter",
 
 # The generated candidate predicate: `Get-ManagementScope | Where-Object { ... }`.
 _STEP2_PREDICATE_RE = re.compile(
-    r"\$MnotifyScopes\s*=\s*@\(\s*Get-ManagementScope\s*\|\s*Where-Object\s*\{(?P<pred>[^}]*)\}",
+    r"\$MnotifyScopes\s*=\s*@\(\s*Get-ManagementScope\s*\|\s*Where-Object\s*\{(?P<pred>.*?)\n\s*\}\)",
     re.S,
 )
 # One term of that predicate: `"$($_.SomeProperty)" -eq $MnotifySomething`.
@@ -2168,14 +2168,14 @@ def scope_step2(text: str, scopes: list[dict], *, sender: str) -> tuple[str, Any
     )
     assert ambiguous, "step 2 has no ambiguity guard for several matching scopes"
     guard = ambiguous.group("guard")
-    adoption = text.index('$MnotifyScope = "$($MnotifyScopes[0].Name)"')
-    assert text.index("if ($MnotifyScopes.Count -gt 1) {") < adoption, (
+    adoption_line = text.index('$MnotifyScope = "$($MnotifyScopes[0].Name)"')
+    assert text.index("if ($MnotifyScopes.Count -gt 1) {") < adoption_line, (
         "the ambiguity guard must throw before a scope is adopted"
     )
     assert "Stop-Mnotify 'management_scope'" in guard, (
         "an ambiguous scope match must stop the step, not carry on to the assignment"
     )
-    assert text.index(adoption) < text.index("Get-ManagementRoleAssignment"), (
+    assert adoption_line < text.index("Get-ManagementRoleAssignment"), (
         "the adopted name must be in place before step 3 matches on it"
     )
 
