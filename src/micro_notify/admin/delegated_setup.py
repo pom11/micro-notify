@@ -591,18 +591,27 @@ def read_back_graph_access_ids(
 ) -> set[str]:
     """The permission ids the tenant NOW reports as declared Scope entries on Graph.
 
-    Compared against the ids the write sent, not against scope names: an id is what
-    ``requiredResourceAccess.resourceAccess`` stores, so an id comparison cannot be
-    confused by a tenant that publishes the same id for two names (impossible in a
-    real directory, possible in a fixture — and a fixture must not be able to make a
-    dropped write look applied). Only a ``Scope`` entry counts: a ``Role``
-    entry is another mode's application permission, and it is never evidence that a
-    delegated scope landed.
+    The shape is the one :func:`declared_graph_scopes` already parses: ``az ad app
+    permission list`` returns the application's ``requiredResourceAccess`` list
+    (verified against the installed azure-cli 2.90.0, ``role/custom.py::list_permissions``
+    returns ``application['requiredResourceAccess']``), so the read-back and the
+    pre-write read are the same document read by the same two rules — one
+    ``resourceAppId`` filter, one ``Scope``-only filter — and a ``Role`` entry can
+    never look like proof that a delegated scope landed.
+
+    Compared against the ids the write *sent*, not against scope names. An id is what
+    ``requiredResourceAccess.resourceAccess`` stores, so an id comparison is evidence
+    about the exact permission this step wrote; a name comparison has to route through
+    ``id_to_name``, and where a tenant (or a fixture — see
+    ``test_the_ids_written_are_the_ones_the_tenant_published``, which deliberately
+    publishes two ids for five scopes) reuses one id for several names, a name match
+    would credit every one of them with a write that only carried one.
+
+    ``null`` or an empty list means the registration declares no Microsoft Graph entry
+    at all: an empty answer, not a malformed one.
     """
     payload = run_json(permission_list_argv(app_id), runner=runner)
     if payload is None:
-        # az prints `null` for a projection that matched nothing — the tenant has no
-        # Microsoft Graph entry at all, which is an empty answer, not a malformed one.
         return set()
     if not isinstance(payload, (list, tuple)):
         raise DelegatedSetupError(
@@ -613,8 +622,8 @@ def read_back_graph_access_ids(
     found: set[str] = set()
     for entry in _entries(payload):
         if _text(entry.get("resourceAppId")).casefold() != MS_GRAPH_APP_ID.casefold():
-            # Somebody else API: a permission on it is not evidence about Graph, even
-            # if it carried the same id.
+            # Somebody else's API: a permission on it is not evidence about Graph,
+            # even if it carried the same id.
             continue
         for access in _entries(entry.get("resourceAccess")):
             if _text(access.get("type")).lower() != ACCESS_SCOPE.lower():
@@ -670,11 +679,9 @@ def ensure_delegated_permissions(
         # One read for the whole batch rather than one per scope: az PATCHes each add
         # before its process exits, so a scope still absent after the last one is
         # absent for good — and one read names every scope that failed rather than
-        # only the first. Same parser as the pre-write read (`Scope` entries under the
-        # Microsoft Graph resource only), so the two answers are comparable by
-        # construction and a `Role` entry can never satisfy a delegated scope here.
-        present = read_back_graph_scopes(app_id, id_to_name, runner=runner)
-        not_applied = [name for name in to_add if name not in present]
+        # only the first.
+        declared_ids = read_back_graph_access_ids(app_id, runner=runner)
+        not_applied = [name for name in to_add if ids[name].lower() not in declared_ids]
         if not_applied:
             raise DelegatedSetupError(
                 f"`az ad app permission add` exited 0 but {', '.join(not_applied)} "
@@ -706,7 +713,14 @@ def ensure_public_client_flows(
     app = show_app(app_id, runner=runner)
     if app.get(_PUBLIC_CLIENT_PROPERTY) is True:
         return PublicClientOutcome(app_id=app_id, enabled=False)
-    run_json(public_client_enable_argv(app_id), runner=runner)
+    # The same write contract as `permission add`: az's generic update ends in the
+    # same PATCH, whose empty body leaves knack nothing to print. Through run_json
+    # this step would fail on every real run for exactly BUG6's reason.
+    run_write(
+        public_client_enable_argv(app_id),
+        runner=runner,
+        label=f"az ad app update ({_PUBLIC_CLIENT_PROPERTY})",
+    )
     return PublicClientOutcome(app_id=app_id, enabled=True)
 
 

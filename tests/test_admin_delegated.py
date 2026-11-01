@@ -1345,7 +1345,12 @@ def test_a_partial_declaration_adds_only_the_missing_scopes(
     assert outcome.outcome == "created"
     adds = _adds(fake)
     assert len(adds) == 4, adds
-    assert not [c for c in adds if SCOPE_IDS["Mail.Send"] in " ".join(c)], (
+    # Compared against the `--api-permissions <id>=Scope` value, not against the whole
+    # argv: scope id 0 is derived from the all-zero placeholder and so is byte-identical
+    # to APP_ID, which every add carries as `--id`. A substring check over the joined
+    # argv would therefore fail on all four adds whatever this step wrote.
+    written = {_api_permission_id(c) for c in adds}
+    assert SCOPE_IDS["Mail.Send"].lower() not in written, (
         "a scope the registration already declared was written again"
     )
 
@@ -1374,10 +1379,19 @@ def test_a_refused_permission_add_quotes_what_az_said(
     The empty stdout must not turn a genuine refusal into "did not print JSON": the
     exit code is the signal, stderr is the diagnosis, and the scope is the thing to
     name (one add per scope is what makes that possible).
+
+    The tenant declares ``Mail.Send`` on BOTH sides — in the registration the step
+    reads first and in the read-back — so the first add it attempts really is
+    ``ChatMessage.Send``. Setting only the read-back side would leave the pre-write
+    read empty, make the first add ``Mail.Send``, and name the wrong scope.
     """
+    tenant = tenant_answers(public_client=True)
+    tenant[("az", "ad", "app", "show")] = app_json_partial(
+        ["Mail.Send"], public_client=True
+    )
     stub = permission_stub(
         monkeypatch,
-        tenant_answers(public_client=True),
+        tenant,
         declared=["Mail.Send"],
         adopt=False,
         add_returncode=1,
