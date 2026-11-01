@@ -2027,3 +2027,36 @@ def test_the_transient_gate_reads_only_the_attempt_error_not_the_whole_queue() -
         assert "Test-MnotifyTransient $Error" not in call, (
             "the gate would then be deciding the retry on records that predate the attempt"
         )
+
+
+def test_the_b6b_transcript_shape_is_a_green_run_not_a_refused_sign_in(
+    temp_dir: Path,
+) -> None:
+    """The operator's exact B6b scenario, end to end through ``ensure_exchange_scope``.
+
+    The sign-in succeeded; the only things PowerShellGet's module init recorded were
+    two 'Access to the path ... is denied' records. On main (no explicit import, so
+    the module autoloads inside the attempt window) those two records land inside the
+    delta, the attempt is declared failed, 'access denied' classifies as permanent,
+    and the run dies exit 2 reporting a refused sign-in. With the fix the import comes
+    first, the delta is empty, and the same sign-in is a green run.
+    """
+    noise_event = event(event="module_import", outcome="loaded", errors=2)
+    lines = [
+        "mnotify: connecting to Exchange Online (device-code sign-in).",
+        DEVICE_CODE_LINE,
+        noise_event,
+        ok_attempt(1),
+    ] + [ln for ln in pwsh_lines() if ln.startswith(EVENT_PREFIX)]
+    fake = StreamingFakePwsh(lines)
+    result = ensure_exchange_scope(
+        APP_ID, SP_OBJECT_ID, SENDER, ADMIN_MAILBOX, runner=fake
+    )
+    # Not "connect: the sign-in was refused" for a sign-in that worked.
+    assert not any("sign-in was refused" in f for f in result.failures)
+    assert result.ok is True and result.verified is True
+    assert result.reason == "" and result.connect_failures == 0
+    # The generator now loads the module before the baseline, so those two records
+    # can never be inside an attempt's delta again.
+    assert "Import-Module ExchangeOnlineManagement -ErrorAction Stop" in script().text
+    assert "Select-Object -First ($Error.Count - $MnotifyErrBefore)" in script().text
