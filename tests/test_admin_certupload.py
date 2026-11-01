@@ -30,6 +30,7 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -1753,3 +1754,145 @@ def test_refusal_is_not_a_credential_failure() -> None:
     """The pair is fine — the invocation is what changes (ruling: usage family)."""
     assert not issubclass(StaleKeyPairRefusal, CertUploadError)
     assert issubclass(StaleKeyPairRefusal, UsageError)
+
+
+def test_no_has_based_probe_survives_in_the_certificate_step() -> None:
+    """The module's own guard: this file must never *call* has() about the pair again.
+
+    Every other `secrets.has()` caller left in the package reports presence and
+    nothing else — `doctor`'s PASS/FAIL lines, `config show`, `teams list`, and
+    `setup`'s post-write summary — so a wrong answer there costs an inaccurate line.
+    This module is the one place "missing" triggers a key generation, a keychain
+    rewrite and an upload, which is why it alone is forbidden from asking.
+
+    Parsed from the AST rather than grepped: the module's docstrings discuss
+    `secrets.has()` by name (the B6 post-mortem is the reason this code looks the
+    way it does), and a text match would either trip on that prose or have to
+    ignore it. A future edit that re-adds the call is what this catches.
+    """
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(certupload))
+    offenders: list[int] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute) or func.attr != "has":
+            continue
+        owner = func.value
+        if isinstance(owner, ast.Name) and owner.id == "secrets":
+            offenders.append(node.lineno)
+    assert offenders == [], (
+        "certupload must decide pair presence with secrets.probe(); "
+        f"secrets.has() is called at line(s) {offenders}"
+    )
+
+
+# =============================================================================
+# The CLI half: `mnotify admin bootstrap --force`
+# =============================================================================
+# Wired here rather than in tests/test_admin_cli.py because that module owns the
+# step-ORDER contract and drives the certificate step down its *exists* path on
+# purpose; the flag's meaning belongs with the module whose behaviour it changes.
+
+
+def bootstrap_argv(*extra: str) -> list[str]:
+    return ["admin", "bootstrap", "--sender", "noreply@example.com", *extra]
+
+
+def parse_bootstrap(*extra: str) -> Any:
+    from micro_notify.cli import build_parser
+
+    return build_parser().parse_args(bootstrap_argv(*extra))
+
+
+def test_force_flag_parses_and_defaults_to_false() -> None:
+    """The flag exists, is a store_true, and is off by default.
+
+    The default matters more than the flag: an operator who types nothing must get
+    the refusal, so a default of True would make the guard decorative.
+    """
+    assert parse_bootstrap().force is False
+    assert parse_bootstrap("--force").force is True
+
+
+def test_force_is_a_separate_flag_from_force_config() -> None:
+    """One flag may not silently authorise the other.
+
+    `--force-config` overwrites a file the run could rebuild; `--force` authorises
+    destroying a key pair it could not. An operator who meant only the config must
+    not find the keychain re-keyed.
+    """
+    args = parse_bootstrap("--force-config")
+    assert (args.force_config, args.force) == (True, False)
+    args = parse_bootstrap("--force")
+    assert (args.force_config, args.force) == (False, True)
+
+
+def test_certificate_step_forwards_force_to_the_module(
+    pair: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wiring itself: `force` reaches `ensure_certificate_credential`.
+
+    Asserted at the call site rather than by reading the source, so renaming the
+    module parameter or dropping the argument from the command layer is a failure.
+    """
+    from micro_notify.commands import admin as admin_commands
+
+    seen: list[dict[str, Any]] = []
+
+    def spy(app_id: str, **kwargs: Any) -> CertificateProvisioning:
+        seen.append({"app_id": app_id, **kwargs})
+        return CertificateProvisioning(
+            app_id=app_id, thumbprint=pair["thumbprint"], created=False
+        )
+
+    monkeypatch.setattr(certupload, "ensure_certificate_credential", spy)
+    report = admin_commands.Report(False)
+
+    admin_commands._certificate_step(APP_ID, report, force=True)
+    admin_commands._certificate_step(APP_ID, report)
+
+    assert [call["force"] for call in seen] == [True, False]
+    assert all(call["app_id"] == APP_ID for call in seen)
+
+
+def test_refusal_from_the_certificate_step_exits_2_through_the_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exit code an operator actually sees, through the real dispatch path.
+
+    Two claims, one run: the command layer must not swallow the refusal into its
+    own ``BootstrapError`` (it propagates unchanged), and the CLI's error handler
+    must map it to exit 2 — the code the config and state refusals produce — so a
+    script can tell "re-run with --force" from "the keychain is broken" (exit 4).
+    """
+    from micro_notify import cli
+    from micro_notify.admin import preflight
+    from micro_notify.commands import admin as admin_commands
+
+    # The real report type, not a stub: `bootstrap` calls `report.to_dict()` before
+    # any step runs, and a hand-rolled stand-in would be testing the stub.
+    report = preflight.PreflightReport(
+        sender="noreply@example.com",
+        tenant_id=APP_ID,
+        tenant_name="contoso.com",
+        signed_in_upn="someone@contoso.com",
+    )
+    monkeypatch.setattr(admin_commands, "_preflight_step", lambda *a, **k: report)
+    monkeypatch.setattr(
+        admin_commands,
+        "_entra_step",
+        lambda out: SimpleNamespace(app_id=APP_ID, sp_object_id=APP_ID),
+    )
+
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        raise StaleKeyPairRefusal("would replace a keychain pair: pass --force")
+
+    monkeypatch.setattr(admin_commands, "_certificate_step", refuse)
+
+    code = cli.main(bootstrap_argv("--allow-domain", "contoso.com"))
+
+    assert code == EXIT_USAGE

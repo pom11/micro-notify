@@ -279,6 +279,19 @@ def add_parser(subparsers: "argparse._SubParsersAction") -> None:
         help="overwrite an existing config file ([paths] and Teams targets are "
         "preserved, as with `mnotify setup --force`)",
     )
+    # The certificate half of the same idea, as its own flag: `--force-config`
+    # overwrites a file this run could rebuild, while this one authorises replacing
+    # a key pair it could not. Keeping them apart means an operator who only meant
+    # the config never discovers the keychain was re-keyed too (see
+    # admin.certupload.StaleKeyPairRefusal for why the step refuses by default).
+    bootstrap.add_argument(
+        "--force",
+        action="store_true",
+        help="replace a keychain certificate that matches no credential on this "
+        "app registration. Without it the certificate step refuses (exit 2) and "
+        "names the thumbprint it would overwrite, because such a pair may be the "
+        "live credential of a different app registration",
+    )
     bootstrap.add_argument(
         "--dry-run",
         action="store_true",
@@ -885,11 +898,19 @@ def _entra_step(out: Report) -> Any:
     return result
 
 
-def _certificate_step(app_id: str, out: Report) -> Any:
-    """3. The certificate credential on the app registration (B3)."""
+def _certificate_step(app_id: str, out: Report, *, force: bool = False) -> Any:
+    """3. The certificate credential on the app registration (B3).
+
+    ``force`` is the CLI's ``--force``, passed straight through: it is the only
+    thing that lets the step replace a keychain pair that matches no credential on
+    this app (see :class:`~micro_notify.admin.certupload.StaleKeyPairRefusal`). It
+    is keyword-only and defaults to False so every existing caller — including
+    delegated mode, which has no certificate step at all — behaves exactly as it
+    did before the flag existed.
+    """
     from ..admin import certupload
 
-    result = certupload.ensure_certificate_credential(app_id)
+    result = certupload.ensure_certificate_credential(app_id, force=force)
     out.add(STEP_CERTIFICATE, result.outcome, result.detail)
     out.note("thumbprint", result.thumbprint)
     if result.expires_at:
@@ -1269,7 +1290,7 @@ def bootstrap(args: argparse.Namespace) -> int:
         out.note("controlMailbox", control)
 
         entra = _entra_step(out)
-        _certificate_step(entra.app_id, out)
+        _certificate_step(entra.app_id, out, force=bool(getattr(args, "force", False)))
         _exchange_step(entra.app_id, entra.sp_object_id, sender, control, out)
         # Only now: every value the config advertises has been proven to exist.
         _config_step(
