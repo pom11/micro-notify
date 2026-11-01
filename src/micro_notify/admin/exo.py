@@ -151,6 +151,33 @@ REASON_CONNECT_TRANSIENT = "connect-transient"  # the network blipped: re-run
 REASON_CONNECT_FAILED = "connect-failed"        # re-running will not help
 REASON_SCRIPT_DIED = "script-died"              # threw before answering
 REASON_CHECK_UNANSWERED = "check-unanswered"    # a check came back 'Not Run'
+REASON_SCOPE_DUPLICATE = "scope-duplicate"      # Exchange refused a duplicate scope
+
+# Exchange's duplicate-scope refusal (BUG 7a, live re-run). ``New-ManagementScope``
+# answers this when a scope with the same RecipientRoot and RecipientFilter already
+# exists under another name — which is what the hand-built ADMIN-SETUP 2.4 scope
+# does for any sender whose local part sanitises differently from the name a human
+# typed. Two markers, both required: the first is Exchange's own "these two are the
+# same scope" sentence, the second is the advice only that refusal carries. A single
+# loose word would catch unrelated cmdlet errors and hand them the wrong advice.
+_DUPLICATE_SCOPE_MARKERS: tuple[str, ...] = (
+    "same recipientroot",
+    "use the existing management scope",
+)
+
+
+def is_duplicate_scope_refusal(text: str) -> bool:
+    """Whether an error reads as Exchange refusing a scope as a duplicate.
+
+    The one case where the death IS about the scope, and where "this is not a
+    scope problem, re-run" sends the operator somewhere else: the tenant already
+    has the scope and the run tried to make a second copy of it.
+    """
+    if not text:
+        return False
+    folded = text.casefold()
+    return all(marker in folded for marker in _DUPLICATE_SCOPE_MARKERS)
+
 
 # The one list of what counts as a transient connect failure. The generated
 # script's retry gate and the Python-side classifier both read it, so the retry
@@ -617,11 +644,31 @@ def build_script(
         "    }",
         "",
         "    # --- 2. Get-before-New: a scope that matches exactly the one sender mailbox.",
-        "    $MnotifyScopes = @(Get-ManagementScope | Where-Object { \"$($_.Name)\" -eq $MnotifyScope })",
+        "    #      The match is on the FILTER as well as on the name. A scope built by hand",
+        "    #      (ADMIN-SETUP 2.4) carries this sender's filter under a name the local",
+        "    #      derivation does not reproduce - no-reply@... gives mnotify-no-reply while",
+        "    #      the doc names mnotify-noreply - and matching the name alone then misses it,",
+        "    #      so the create below answers Exchange's duplicate-scope refusal instead of",
+        "    #      the re-run continuing. Adopting the tenant's real name is the only",
+        "    #      idempotent answer; renaming a live scope is not on the table.",
+        "    $MnotifyFilter = \"PrimarySmtpAddress -eq '$MnotifySender'\"",
+        "    $MnotifyScopes = @(Get-ManagementScope | Where-Object {",
+        "        \"$($_.Name)\" -eq $MnotifyScope -or",
+        "        \"$($_.RecipientRestrictionFilter)\" -eq $MnotifyFilter -or",
+        "        \"$($_.RecipientFilter)\" -eq $MnotifyFilter",
+        "    })",
+        "    if ($MnotifyScopes.Count -gt 1) {",
+        "        # Two scopes on one filter: either answer is a guess about the tenant, and the",
+        "        # one we did not pick keeps deciding what this app can send as. Fail loud.",
+        "        $MnotifyAmbiguous = ($MnotifyScopes.Name -join ', ')",
+        "        Stop-Mnotify 'management_scope' \"several management scopes already filter on $MnotifySender ($MnotifyAmbiguous); refusing to pick one - keep exactly one scope for this sender, then re-run\"",
+        "    }",
         "    if ($MnotifyScopes.Count -gt 0) {",
-        "        Write-MnotifyEvent @{ event = 'management_scope'; outcome = 'exists'; found = $MnotifyScopes.Count }",
+        "        # From here on the step uses the name the tenant actually has, so step 3's",
+        "        # -CustomResourceScope and its CustomResourceScopeName match line up with it.",
+        "        if ($MnotifyScopes[0].Name -ne $MnotifyScope) { $MnotifyScope = \"$($MnotifyScopes[0].Name)\" }",
+        "        Write-MnotifyEvent @{ event = 'management_scope'; outcome = 'exists'; found = $MnotifyScopes.Count; name = $MnotifyScope }",
         "    } else {",
-        "        $MnotifyFilter = \"PrimarySmtpAddress -eq '$MnotifySender'\"",
         "        $null = New-ManagementScope -Name $MnotifyScope -RecipientRestrictionFilter $MnotifyFilter",
         "        Write-MnotifyEvent @{ event = 'management_scope'; outcome = 'created' }",
         "    }",
@@ -877,6 +924,19 @@ COULD_NOT_VERIFY_HINTS: dict[str, str] = {
         "the authorization checks were asked and did not answer ('Not Run', or no "
         "rows), so the restriction is unproven. This is NOT a scope problem — re-run; "
         "a check that did not answer can never be read as a pass"
+    ),
+    # The one entry that does not say "NOT a scope problem", because it is not true
+    # here: the run died inside New-ManagementScope, and what refused it was a scope
+    # the tenant already has. The sentence names the cmdlet that threw and what to
+    # do about the tenant, instead of sending the operator off to re-run a run that
+    # cannot change (the live BUG 7a report did exactly that).
+    REASON_SCOPE_DUPLICATE: (
+        "New-ManagementScope refused the scope as a duplicate of an existing scope "
+        "with the same recipient filter — the tenant already has a management scope "
+        "for this sender under another name, and this run could not match it by "
+        "name or filter. This IS the scope problem: list the scopes filtering on "
+        "this sender (Get-ManagementScope) and keep exactly the one whose filter "
+        "matches, then re-run"
     ),
 }
 
@@ -1386,6 +1446,27 @@ def parse_pwsh_output(
     management_scope = one_step("management scope", "management_scope")
     role_assignment = one_step("role assignment", "role_assignment")
 
+    # --- the scope name the tenant actually uses (BUG 7a) -------------------
+    # A scope built by hand carries the sender's filter under a name this tool's
+    # derivation does not reproduce (mnotify-noreply vs mnotify-no-reply), so the
+    # script adopts the tenant's name and reports it here. Everything downstream —
+    # the detail line, the --json payload, and the scope the authorization rows are
+    # compared against — has to speak that name: the tenant answers
+    # Test-ServicePrincipalAuthorization through the scope that EXISTS, and reading
+    # its rows against the name we merely derived would turn an idempotent re-run
+    # into "InScope True through scope 'mnotify-noreply' rather than
+    # 'mnotify-no-reply'". A transcript without a name (an older script, or a run
+    # that created the scope itself and therefore named it) keeps the derived one.
+    scope_name = script.scope_name
+    reported_scope_events = by_event.get("management_scope", [])
+    if reported_scope_events:
+        # The last event is the step's answer, the same one ``one_step`` read.
+        scope_event = reported_scope_events[-1]
+        if str(scope_event.get("outcome") or "").strip().casefold() == OUTCOME_EXISTS:
+            reported_name = str(scope_event.get("name") or "").strip()
+            if reported_name:
+                scope_name = reported_name
+
     checks: dict[str, AuthzCheck] = {}
     for event in by_event.get("authz", []):
         control = str(event.get("control") or "")
@@ -1396,7 +1477,7 @@ def parse_pwsh_output(
             control=control,
             resource=resource,
             expected_in_scope=expected,
-            expected_scope=script.scope_name,
+            expected_scope=scope_name,
         )
     for control, expected, label in (
         (CONTROL_SENDER, True, "the sender mailbox"),
@@ -1409,7 +1490,7 @@ def parse_pwsh_output(
                 resource=script.sender if control == CONTROL_SENDER else script.admin_mailbox,
                 in_scope=None,
                 expected_in_scope=expected,
-                expected_scope=script.scope_name,
+                expected_scope=scope_name,
             )
 
     summary = by_event.get("summary", [])
@@ -1441,9 +1522,16 @@ def parse_pwsh_output(
     elif not checks_ran:
         # Connected, then the script threw before a control was tested: the
         # restriction is unproven, and re-running may or may not help - the quoted
-        # exception is what the operator has to go on.
+        # exception is what the operator has to go on. One death gets different
+        # advice: an Exchange duplicate-scope refusal was raised *by* the scope step,
+        # so calling it "NOT a scope problem, re-run" (the live BUG 7a report) sent
+        # the operator away from the one thing on the tenant that was wrong.
         verified = False
-        reason = REASON_SCRIPT_DIED
+        reason = (
+            REASON_SCOPE_DUPLICATE
+            if any(is_duplicate_scope_refusal(text) for text in error_texts)
+            else REASON_SCRIPT_DIED
+        )
     elif not answered:
         # Both controls were asked and at least one came back with no usable InScope
         # ('Not Run', an empty row set, rows of null). The B4 rule, extended to the
@@ -1457,7 +1545,7 @@ def parse_pwsh_output(
     ok = not failures
     return ExchangeProvisioning(
         sender=script.sender,
-        scope_name=script.scope_name,
+        scope_name=scope_name,
         app_id=script.app_id,
         sp_object_id=script.sp_object_id,
         admin_mailbox=script.admin_mailbox,
@@ -1578,6 +1666,7 @@ __all__ = [
     "REASON_CHECK_UNANSWERED",
     "REASON_CONNECT_FAILED",
     "REASON_CONNECT_TRANSIENT",
+    "REASON_SCOPE_DUPLICATE",
     "REASON_SCRIPT_DIED",
     "SERVICE_PRINCIPAL_DISPLAY_NAME",
     "StreamingCommandRunner",
@@ -1587,6 +1676,7 @@ __all__ = [
     "build_script",
     "ensure_exchange_scope",
     "is_transient_connect_error",
+    "is_duplicate_scope_refusal",
     "parse_authz_rows",
     "parse_pwsh_output",
     "plan_commands",
