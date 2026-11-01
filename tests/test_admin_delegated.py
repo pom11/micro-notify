@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -1046,3 +1047,299 @@ def test_dry_run_installs_no_streaming_runner(
     admin_cmd.set_runner(_dry())
     assert cli.main(_dry_argv("--mode", "delegated", "--dry-run")) == EXIT_OK
     assert not any(isinstance(runner, admin_runner.StreamingRunner) for runner in installed)
+
+
+# ===========================================================================
+# BUG6 — `az ad app permission add` prints NOTHING on stdout
+# ===========================================================================
+# Verified against azure-cli 2.90.0's own source
+# (``command_modules/role/custom.py``::``add_permission``): it PATCHes the
+# registration and then emits ONE ``logger.warning`` — there is no ``return``
+# statement, so knack's invoker gets ``None`` and ``cli.py`` skips the formatter
+# entirely (``if cmd_result and cmd_result.result is not None``). Exit 0, empty
+# stdout, the "run permission grant" note on stderr.
+#
+# The old code read that through ``run_json``, whose whole contract is "stdout is a
+# JSON document", so it refused with ``'az' did not print JSON — WARNING: Invoking
+# `az ad app permission grant ...``` on EVERY real delegated run. Same class as the
+# ``az ad app update`` write below, and the reason the success claim must come from
+# the tenant's own list rather than from az's stdout.
+
+PERMISSION_ADD_PREFIX = ("az", "ad", "app", "permission", "add")
+# NOT ``list-grants``: the fifth element distinguishes the two commands.
+PERMISSION_LIST_PREFIX = ("az", "ad", "app", "permission", "list")
+PUBLIC_CLIENT_UPDATE_PREFIX = ("az", "ad", "app", "update")
+
+# az's own words on a SUCCESSFUL add (assembled from the module under test so this
+# file keeps no extra GUID literal — design §5).
+PERMISSION_ADD_WARNING = (
+    "WARNING: Invoking `az ad app permission grant --id <appId> --api "
+    + GRAPH_APP_ID
+    + "` is needed to make the change effective"
+)
+
+SCOPE_ID_TO_NAME = {identifier.lower(): name for name, identifier in SCOPE_IDS.items()}
+
+
+def permission_list_json(declared: Sequence[str]) -> str:
+    """What ``az ad app permission list --id <app>`` prints.
+
+    az does **not** project this one: it returns the application's whole
+    ``requiredResourceAccess`` list, so a decoy entry for another API is part of the
+    shape and proves the Microsoft Graph filter is doing its job.
+    """
+    graph_entry = {
+        "resourceAppId": GRAPH_APP_ID,
+        "resourceAccess": [
+            {"id": SCOPE_IDS[name], "type": "Scope"} for name in declared if name in SCOPE_IDS
+        ],
+    }
+    other_api = {
+        # Somebody else's API: this step must neither read it as declared nor write it.
+        "resourceAppId": GRAPH_SP_OBJECT_ID,
+        "resourceAccess": [{"id": SP_OBJECT_ID, "type": "Scope"}],
+    }
+    return json.dumps([graph_entry, other_api])
+
+
+def app_json_partial(declared: Sequence[str], *, public_client: bool = False) -> str:
+    """The projected registration with EXACTLY ``declared`` delegated Graph scopes.
+
+    This is the operator's live tenant after the first run died halfway: one of the
+    five (``Mail.Send``) declared, the other four not.
+    """
+    access: list[dict[str, str]] = [{"id": SCOPE_IDS[SCOPES[0]], "type": "Role"}]
+    access += [{"id": SCOPE_IDS[name], "type": "Scope"} for name in declared if name in SCOPE_IDS]
+    return json.dumps(
+        {
+            "requiredResourceAccess": [
+                {"resourceAppId": GRAPH_APP_ID, "resourceAccess": access}
+            ],
+            delegated_setup._PUBLIC_CLIENT_PROPERTY: public_client,
+        }
+    )
+
+
+def _api_permission_id(argv: Sequence[str]) -> str:
+    """The scope id out of ``--api-permissions <id>=Scope``."""
+    if "--api-permissions" not in argv:
+        return ""
+    value = argv[argv.index("--api-permissions") + 1]
+    return value.split("=", 1)[0].strip().lower()
+
+
+class PermissionCli(TenantCli):
+    """``TenantCli`` plus the two things a flat answer table cannot say about the write.
+
+    * ``permission add`` answers the way az really does — exit 0, **nothing** on stdout,
+      az's own WARNING on stderr. Every previous fixture answered it with ``"{}"``
+      (:data:`NO_CONTENT`), which is a document az never prints, and that is exactly why
+      the bug was invisible to the suite: the fake was more generous than the tool.
+    * ``permission list`` (the read-back) reflects the adds the tenant was handed.
+      ``adopt=False`` is the tenant that accepted the write and then did not show it —
+      the state the success claim must catch.
+    """
+
+    def __init__(
+        self,
+        responses: dict[tuple[str, ...], str] | None = None,
+        *,
+        add_stdout: str = "",
+        add_stderr: str = PERMISSION_ADD_WARNING,
+        add_returncode: int = 0,
+        declared: Sequence[str] = (),
+        adopt: bool = True,
+    ) -> None:
+        super().__init__(responses)
+        self.add_stdout = add_stdout
+        self.add_stderr = add_stderr
+        self.add_returncode = add_returncode
+        self.declared = {name for name in declared if name in SCOPE_IDS}
+        self.adopt = adopt
+        self.added: list[str] = []
+
+    def run(self, argv: Any, *, stdin: str | None = None, **kwargs: Any) -> Any:
+        args = [str(a) for a in argv]
+        if tuple(args[: len(PERMISSION_ADD_PREFIX)]) == PERMISSION_ADD_PREFIX:
+            self.calls.append(args)
+            if self.add_returncode == 0 and self.adopt:
+                name = SCOPE_ID_TO_NAME.get(_api_permission_id(args), "")
+                if name:
+                    self.added.append(name)
+            return subprocess.CompletedProcess(
+                args, self.add_returncode, self.add_stdout, self.add_stderr
+            )
+        if tuple(args[: len(PERMISSION_LIST_PREFIX)]) == PERMISSION_LIST_PREFIX:
+            self.calls.append(args)
+            return subprocess.CompletedProcess(
+                args, 0, permission_list_json(sorted(self.declared | set(self.added))), ""
+            )
+        return super().run(args, stdin=stdin, **kwargs)
+
+
+def permission_stub(
+    monkeypatch: pytest.MonkeyPatch,
+    tenant: dict[tuple[str, ...], str],
+    **cli_kwargs: Any,
+) -> Stub:
+    """A :class:`Stub` whose fake tenant is a :class:`PermissionCli`."""
+    signin = SigninStub()
+    signin.install(monkeypatch)
+    stub = Stub(tenant, signin)
+    stub.cli = PermissionCli(tenant, **cli_kwargs)
+    admin_cmd.set_runner(stub.cli)
+    return stub
+
+
+def _adds(fake: PermissionCli) -> list[list[str]]:
+    return [
+        call
+        for call in fake.calls
+        if tuple(call[: len(PERMISSION_ADD_PREFIX)]) == PERMISSION_ADD_PREFIX
+    ]
+
+
+def test_a_permission_add_that_prints_nothing_is_not_a_failure(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The bug, end to end: exit 0 + empty stdout + a WARNING on stderr means SUCCESS.
+
+    On the pre-fix code this run dies at the first scope with
+    ``'az' did not print JSON — WARNING: Invoking `az ad app permission grant ...```
+    and exits 2, which is what the operator hit twice on a real tenant.
+    """
+    stub = permission_stub(monkeypatch, tenant_answers(), declared=())
+    assert stub.delegated("--json") == EXIT_OK
+    payload = stub.summary(capsys)
+    assert payload["ok"] is True and payload["exitCode"] == EXIT_OK
+    assert len(_adds(stub.cli)) == len(SCOPES)
+    assert stub.outcome(capsys, admin_cmd.STEP_PERMISSIONS) == "created"
+    text = json.dumps(payload)
+    assert "did not print JSON" not in text, "az's healthy write was read as a failure"
+    assert "needed to make the change effective" not in text, (
+        "az's informational WARNING was surfaced as this step's failure"
+    )
+
+
+def test_a_partial_declaration_adds_only_the_missing_scopes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The operator's live tenant: one of five declared, four not.
+
+    The read-back has to be idempotent against a PARTIAL declaration, which is a
+    different case from "nothing declared" (the first run) and "all declared" (a
+    re-run): exactly the four missing scopes are written, and the one that was already
+    there is reported as ``already_present`` rather than rewritten or ignored.
+    """
+    tenant = tenant_answers(public_client=True)
+    tenant[("az", "ad", "app", "show")] = app_json_partial(["Mail.Send"], public_client=True)
+    fake = PermissionCli(tenant, declared=["Mail.Send"])
+
+    outcome = delegated_setup.ensure_delegated_permissions(APP_ID, SCOPES, runner=fake)
+
+    assert outcome.already_present == ("Mail.Send",)
+    assert outcome.granted == tuple(name for name in SCOPES if name != "Mail.Send")
+    assert outcome.outcome == "created"
+    adds = _adds(fake)
+    assert len(adds) == 4, adds
+    assert not [c for c in adds if SCOPE_IDS["Mail.Send"] in " ".join(c)], (
+        "a scope the registration already declared was written again"
+    )
+
+
+def test_an_add_the_tenant_did_not_apply_names_the_scope(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Exit 0 is not the verdict — the tenant's own list is.
+
+    A write that reported success and a read-back that still lacks the scope is the
+    disagreement this step must refuse rather than report ``created``: the bootstrap
+    would otherwise hand ``doctor`` and the sign-in a registration that cannot send.
+    """
+    stub = permission_stub(monkeypatch, tenant_answers(), declared=(), adopt=False)
+    assert stub.delegated("--json") == 2
+    text = json.dumps(stub.summary(capsys))
+    assert SCOPES[0] in text, f"the scope that failed to appear was not named: {text}"
+    assert "did not print JSON" not in text
+
+
+def test_a_refused_permission_add_quotes_what_az_said(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A non-zero add still fails — and the operator gets az's own explanation.
+
+    The empty stdout must not turn a genuine refusal into "did not print JSON": the
+    exit code is the signal, stderr is the diagnosis, and the scope is the thing to
+    name (one add per scope is what makes that possible).
+    """
+    stub = permission_stub(
+        monkeypatch,
+        tenant_answers(public_client=True),
+        declared=["Mail.Send"],
+        adopt=False,
+        add_returncode=1,
+        add_stderr="ERROR: At least one permission assigned to your app is invalid.",
+    )
+    assert stub.delegated("--json") == 2
+    text = json.dumps(stub.summary(capsys))
+    assert "permission assigned to your app is invalid" in text, text
+    assert "ChatMessage.Send" in text, "the failing scope was not named"
+
+
+def test_a_public_client_update_that_prints_nothing_is_not_a_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same az contract one step later: ``az ad app update`` prints nothing either.
+
+    ``--set`` goes through az's generic update, whose setter is the same PATCH call, so
+    knack again has nothing to print. Proven by the same reading of the installed
+    azure-cli: the update is a PATCH whose 204 body is empty, ``_send`` returns
+    ``None``, and the formatter is skipped.
+    """
+    tenant = tenant_answers(public_client=False)
+    fake = PermissionCli(tenant)
+    fake.set(PUBLIC_CLIENT_UPDATE_PREFIX, "", 0)
+
+    outcome = delegated_setup.ensure_public_client_flows(APP_ID, runner=fake)
+
+    assert outcome.enabled is True and outcome.outcome == "created"
+    sets = [
+        call
+        for call in fake.calls
+        if tuple(call[: len(PUBLIC_CLIENT_UPDATE_PREFIX)]) == PUBLIC_CLIENT_UPDATE_PREFIX
+    ]
+    assert len(sets) == 1, sets
+
+
+def test_the_shipped_dry_run_answers_plan_a_whole_delegated_run(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--dry-run`` on a machine with no ``az``: the shipped table alone must suffice.
+
+    Deliberately built from :data:`admin_cmd.DRY_RUN_RESPONSES` rather than this
+    module's ``_dry()`` — that dict is what a real ``--dry-run`` installs, and it was
+    missing the two answers the delegated reads need (``az ad app show`` and
+    ``az ad sp show``), which is why the operator's own dry run died at the same step
+    as the real one.
+    """
+    recorder = admin_runner.DryRunRunner(admin_cmd.DRY_RUN_RESPONSES)
+    admin_cmd.set_runner(recorder)
+    assert cli.main(_dry_argv("--mode", "delegated", "--dry-run")) == EXIT_OK
+    assert recorder.executed_anything is False
+    printed = capsys.readouterr().out
+    assert "permission add" in printed
+    assert "isFallbackPublicClient=true" in printed
+    assert "permission grant" not in printed, "planned a consent nobody asked for"
+    assert "ManagementScope" not in printed, "planned app mode's Exchange work"
+
+
+def test_the_shipped_dry_run_plans_the_consent_it_was_asked_for(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    recorder = admin_runner.DryRunRunner(admin_cmd.DRY_RUN_RESPONSES)
+    admin_cmd.set_runner(recorder)
+    assert (
+        cli.main(_dry_argv("--mode", "delegated", "--dry-run", "--admin-consent")) == EXIT_OK
+    )
+    assert recorder.executed_anything is False
+    assert "permission grant" in capsys.readouterr().out
