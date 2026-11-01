@@ -722,9 +722,16 @@ process. `az login` and `Connect-ExchangeOnline` are never run on your behalf.
 | `--control-mailbox ADDR` | the negative control for 2.4. Must not be the sender. Default: the address `az` is signed in as |
 | `--install-missing` | offer to `brew install` what pre-flight found missing (`azure-cli`, `powershell`). Needs a `y` at a prompt; **refused outright with no terminal** |
 | `--force-config` | overwrite an existing config file that says something different |
+| `--force` | replace a keychain certificate that matches no credential on this app registration. Without it the certificate step refuses (exit 2) and names the thumbprint it would overwrite |
 | `--dry-run` | print the plan, execute nothing, exit 0 |
 | `--json` | one machine-readable summary on stdout |
 | `--send-test ADDR` | one real test mail at the end, through the normal mail path (spends one unit of the daily cap) |
+
+`--force-config` and `--force` are two flags, not one: the first authorises overwriting a
+config file this run could rebuild, the second authorises destroying a key pair it could not
+rebuild (the keychain holds only the private half). Passing one does not grant the other, and
+each refusal names only the flag for the step it stopped at, so a run that needs both learns
+them one at a time.
 
 About `--control-mailbox`: step 2.4 only proves the scope is narrow if a *second*
 mailbox comes back `InScope False`. An address that does not resolve also answers
@@ -744,7 +751,16 @@ pass `--control-mailbox` explicitly.
 | the 2.4 proof does not hold | exit 2 — and the config is **not** written |
 | `--sender` equals `--control-mailbox` | exit 2 before anything is written |
 | existing config holds a different sender/allowlist | exit 2 unless `--force-config` |
+| the keychain certificate matches no credential on this app registration | exit 2 naming the thumbprint it would overwrite, unless `--force` |
 | `doctor` fails afterwards | doctor's own exit code (4 keychain/token, 3 guard, 5 remote, 6 daily cap) |
+
+The two `--force`-family rows above are separate refusals with separate flags, and each names
+only its own. The certificate one is the one worth reading before you reach for the flag: the
+pair is not broken, it just is not a credential on *this* app, and it may be the live
+credential of a different registration. `--force` generates and uploads a fresh pair and then
+reports the thumbprint it replaced, so the orphan stays visible. A keychain that cannot be
+*read* at all is a different case and is not force-overridable (exit 4, naming the accounts) —
+a force flag answers "may I replace this?", not "may I guess?".
 
 ### Re-running it is the normal thing to do
 
@@ -834,7 +850,11 @@ as success when it was not.
   The two steps with a local half that bypasses the command runner (the key generation,
   the temporary `.ps1`) refuse a recording runner by design and print their published
   plan instead; replacing your private key during a run that promised to change nothing
-  is the bug that rule prevents.
+  is the bug that rule prevents. That refusal also comes first inside the certificate
+  step, ahead of the stale-pair refusal above, so a `--dry-run` against a stale pair is
+  told it was a dry run — never "re-run with `--force`", which would be the wrong advice
+  for a run that promised to change nothing. `tests/test_admin_certupload.py` pins the
+  order.
 
 ### After it finishes, still yours to do
 
@@ -903,6 +923,13 @@ Two steps app mode has and this one does not, and neither is an omission:
 For the same reason `--control-mailbox` is not part of this mode, and the two `pwsh`
 pre-flight checks are skipped: a route that never calls PowerShell must not be refused by
 a machine that cannot run it. App mode still requires both.
+
+`--force` belongs to the certificate step and therefore does nothing here: with no certificate
+step there is no key pair for it to replace and nothing for it to authorise. It is accepted
+rather than refused — a delegated run parses the same flag set as app mode — so nothing in the
+table below should be read as needing it. The certificate row in app mode's refusal table has
+no delegated counterpart, and the config refusal is answered by `--force-config` exactly as in
+app mode.
 
 ### `Allow public client flows` — conditional, and this is the only place it is set
 
