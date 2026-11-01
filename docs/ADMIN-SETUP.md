@@ -723,6 +723,7 @@ process. `az login` and `Connect-ExchangeOnline` are never run on your behalf.
 | `--install-missing` | offer to `brew install` what pre-flight found missing (`azure-cli`, `powershell`). Needs a `y` at a prompt; **refused outright with no terminal** |
 | `--force-config` | overwrite an existing config file that says something different |
 | `--force` | replace a keychain certificate that matches no credential on this app registration. Without it the certificate step refuses (exit 2) and names the thumbprint it would overwrite |
+| `--scope-name NAME` | adopt a management scope the tenant **already has** when it was created by hand (2.2) under a name the derivation cannot produce. Default: the derived `mnotify-<sender local part>` |
 | `--dry-run` | print the plan, execute nothing, exit 0 |
 | `--json` | one machine-readable summary on stdout |
 | `--send-test ADDR` | one real test mail at the end, through the normal mail path (spends one unit of the daily cap) |
@@ -739,6 +740,22 @@ False, so the command resolves it to a real user mailbox first, and it refuses a
 sender/control pair that are the same mailbox. If `az` is signed in as the sender,
 pass `--control-mailbox` explicitly.
 
+About `--scope-name`: the scope name is the idempotency key for the role assignment. Step 4
+looks for the scope before it creates one — by name, and by a recipient filter equal to this
+sender — and assigns the role inside whatever it finds, so when what it finds is not the
+scope the operator means the run does not fail: it creates a **second** scope and assigns
+the app to one that restricts nothing the operator meant. A scope created by hand (2.2) can
+carry a filter the sender match cannot see — a mail-enabled security group, or any filter
+that is not this sender's exact primary-address equality — and then only the name identifies
+it, while the derived `mnotify-<sender local part>` is a name the tenant does not have. Pass
+the existing name and the run adopts that scope instead of duplicating it. The name is
+checkable before anything is written: `--dry-run` prints the name it was given in the plan,
+and `--json` reports as `scopeName` the name the step actually used (when the tenant's own
+scope is found by its filter, that is the tenant's name, not the one passed). Character
+rules stay Exchange's: a name that clears the checks below but holds a character Exchange
+forbids in a scope name is refused with the same exit 2, and that refusal lands later than
+these three do — which is exactly why the typos below are caught before the first probe.
+
 ### What it refuses, and with which exit code
 
 | Situation | Result |
@@ -752,6 +769,7 @@ pass `--control-mailbox` explicitly.
 | `--sender` equals `--control-mailbox` | exit 2 before anything is written |
 | existing config holds a different sender/allowlist | exit 2 unless `--force-config` |
 | the keychain certificate matches no credential on this app registration | exit 2 naming the thumbprint it would overwrite, unless `--force` |
+| `--scope-name` empty (or spaces only), containing whitespace, or longer than the derived name's 64-character cap | exit 2 **naming the flag**, before the first probe — nothing is created to unwind |
 | `doctor` fails afterwards | doctor's own exit code (4 keychain/token, 3 guard, 5 remote, 6 daily cap) |
 
 The two `--force`-family rows above are separate refusals with separate flags, and each names
@@ -1012,6 +1030,7 @@ tenant write, so you are asked once, at the point where the tenant is ready for 
 | Situation | Result |
 | --------- | ------ |
 | `--admin-consent` without `--mode delegated` | exit 2, before the first probe |
+| `--scope-name` with `--mode delegated` | exit 2 before the first probe: a delegated bootstrap creates no Exchange Online management scope, so there is no scope name to override |
 | the tenant's Graph service principal does not publish one of the five scopes | exit 2 naming it, **before** any permission is written |
 | signed-in UPN is not the configured `--sender` | exit 2, both fixes named; `doctor` is not reached |
 | `--admin-consent` refused by the tenant | the step reports `skipped` with the reason; the run still exits 0 |
