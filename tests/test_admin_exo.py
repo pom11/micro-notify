@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import subprocess
 from pathlib import Path
@@ -1768,3 +1769,261 @@ def test_a_wrong_scope_still_uses_the_failed_verification_sentence(temp_dir: Pat
     assert "verification failed" in excinfo.value.message
     assert "could not be verified" not in excinfo.value.message
     assert excinfo.value.result.verified is True
+
+
+# ===========================================================================
+# BUG 5 (live run B6b, on the branch of main that carried BUG 4): the module's
+# own init noise was counted as a refused sign-in
+#
+# ``ExchangeOnlineManagement`` lists PowerShellGet in ``RequiredModules``, and
+# PowerShellGet 2.2.5's module init does a ``New-Item`` on
+# ``/usr/local/share/powershell/Scripts/InstalledScriptInfos`` (its
+# ``Test-RunningAsElevated`` hard-returns ``$true`` on CoreCLR non-Windows). On
+# an Apple-silicon Mac that path is root-owned and absent, so the module init
+# leaves TWO non-terminating ``UnauthorizedAccessException`` records in ``$Error``
+# - and the module's own ``-ErrorAction SilentlyContinue`` does not stop records
+# being appended. The module autoloads inside the *first* ``Connect-ExchangeOnline``
+# call, i.e. inside the attempt window, so the BUG 4 error delta saw 2 new errors,
+# declared the connect failed, classified "access denied" as permanent and gave up
+# - exit 2, "the sign-in was refused" - on a run whose device-code sign-in had
+# actually succeeded.
+#
+# The two shapes the fix pins:
+#
+# 1. the module is imported EXPLICITLY, with ``-ErrorAction Stop``, before the
+#    attempt loop, so its noise is already in ``$Error`` when the baseline is
+#    taken (and a genuinely broken install becomes a terminating failure the outer
+#    catch reports with the real message);
+# 2. the per-attempt slice reads ``$Error`` the way PowerShell stores it -
+#    NEWEST FIRST - so ``-Skip`` (which returns the oldest records) cannot be used
+#    to name the new ones.
+# ===========================================================================
+
+# The two records PowerShellGet's module init leaves behind on a Mac, newest first
+# (index 0 is the last one appended, which is how PowerShell's $Error is ordered).
+POWERSHELLGET_NOISE_NEWEST = (
+    "Exception calling \"Create\" with \"1\" argument(s): \"Access to the path "
+    "'/usr/local/share/powershell/Scripts/InstalledScriptInfos' is denied.\""
+)
+POWERSHELLGET_NOISE_OLDER = "New-Item: Access to the path '/usr/local/share' is denied."
+POWERSHELLGET_NOISE = (POWERSHELLGET_NOISE_OLDER, POWERSHELLGET_NOISE_NEWEST)
+
+# The generated script's own slice of $Error, e.g.
+#   $MnotifyNewErrors = @($Error | Select-Object -Skip $MnotifyErrBefore | ...)
+_SLICE_RE = re.compile(
+    r"\$MnotifyNewErrors\s*=\s*@\(\s*\$Error\s*\|\s*Select-Object\s+(?P<clause>[^|]+?)\s*\|"
+)
+
+
+def attributed_new_errors(
+    text: str, queue: list[str], baseline: int
+) -> list[str]:
+    """The records the generated script would blame on one connect attempt.
+
+    ``queue`` is ``$Error`` as PowerShell keeps it: **newest first**, so a record
+    appended during the attempt sits at index 0 and the records that were already
+    there sit at the end. ``baseline`` is ``$Error.Count`` at the moment the
+    attempt started. The slice clause is read out of the generated script so the
+    verdict is the script's, not the test's.
+    """
+    match = _SLICE_RE.search(text)
+    assert match, "the connect block no longer slices $Error for the attempt's records"
+    clause = match.group("clause").strip()
+    if clause.startswith("-First"):
+        assert "($Error.Count - $MnotifyErrBefore)" in clause, (
+            "-First must count the attempt's own new records, not a constant: " + clause
+        )
+        return queue[: len(queue) - baseline]
+    if clause.startswith("-Skip"):
+        assert "$MnotifyErrBefore" in clause, clause
+        # -Skip drops the FIRST n items of a newest-first queue: the newest ones.
+        # What is left is the oldest records - exactly the ones that predate the
+        # attempt.
+        return queue[baseline:]
+    raise AssertionError(f"unrecognised $Error slice clause: {clause!r}")
+
+
+def attempt_error_text(text: str, queue: list[str], baseline: int) -> str:
+    """What the script would hand ``Test-MnotifyTransient`` for this attempt."""
+    return " ".join(attributed_new_errors(text, queue, baseline))
+
+
+def test_the_generated_script_imports_the_module_before_the_attempt_loop() -> None:
+    """The module is loaded explicitly, before any baseline is taken.
+
+    Without the explicit import the module autoloads inside the first
+    ``Connect-ExchangeOnline``, i.e. *inside* the attempt window, and its
+    PowerShellGet init noise is then indistinguishable from a failed connect.
+    ``-ErrorAction Stop`` is what turns a genuinely broken install into a
+    terminating failure the outer catch can report.
+    """
+    text = script().text
+    assert "Import-Module ExchangeOnlineManagement -ErrorAction Stop" in text, (
+        "the module must be imported explicitly before the attempt loop"
+    )
+    import_at = text.index("Import-Module ExchangeOnlineManagement")
+    loop_at = text.index("for ($MnotifyAttempt = 1;")
+    assert import_at < loop_at, "the import must precede the attempt loop"
+    assert import_at < text.index("Connect-ExchangeOnline"), (
+        "the import must come before the cmdlet that would autoload the module"
+    )
+    # The baseline that gates the delta has to be taken with the noise already in.
+    assert import_at < text.index("$MnotifyErrBefore = $Error.Count"), (
+        "$Error baseline taken before the module import also counts its init noise"
+    )
+    # And it must sit where a throw is caught: inside the outer try, which opens
+    # before it and is guarded by the one finally.
+    assert text.index("try {") < import_at < text.index("} finally {")
+
+
+def test_the_generated_script_reports_the_module_load_and_its_noise_count() -> None:
+    """A machine-readable line saying the module loaded, and how many records its
+    init left behind. It is the difference between "the module is broken" and "the
+    module loaded and its installer noise was ignored", which is exactly what the
+    B6b operator could not tell."""
+    text = script().text
+    assert "Import-Module ExchangeOnlineManagement" in text, (
+        "the module load is a reported step of its own"
+    )
+    import_at = text.index("Import-Module ExchangeOnlineManagement")
+    segment = text[import_at : import_at + 600]
+    assert "module_import" in segment, (
+        "the load of the module is a step of its own and must be reported"
+    )
+    assert "$Error.Count" in segment, "the noise the module init recorded must be visible"
+
+
+def test_the_per_attempt_error_slice_reads_the_newest_first_error_queue() -> None:
+    """``$Error`` is NEWEST FIRST, so ``-Skip $baseline`` is the wrong end.
+
+    With two PowerShellGet records already queued and one real error recorded by
+    the attempt, the correct slice is the one new record; ``-Skip 2`` returns the
+    OLDEST pre-existing record instead - a record from before the attempt started,
+    which the attempt never caused.
+    """
+    text = script().text
+    assert "Select-Object -Skip $MnotifyErrBefore" not in text, (
+        "-Skip on a newest-first queue returns the OLDEST records, not the new ones"
+    )
+    assert "Select-Object -First ($Error.Count - $MnotifyErrBefore)" in text, (
+        "the new records are the first (count - baseline) of a newest-first queue"
+    )
+    queue = [DEAD_CONNECT_ERROR, *POWERSHELLGET_NOISE]  # newest first
+    assert attributed_new_errors(text, queue, baseline=2) == [DEAD_CONNECT_ERROR]
+
+
+def test_the_connect_attempt_can_never_blame_a_record_from_before_it_started() -> None:
+    """The card's newest-first pin, as a scenario.
+
+    The module init noise is in the queue before the attempt (that is the point of
+    importing the module first), the attempt records a real transient failure, and
+    the text the script hands the transient gate is only that failure. The noise
+    - which classifies as permanent, "access denied", and is what killed B6b - can
+    never reach the gate.
+    """
+    text = script().text
+    queue = [DEAD_CONNECT_ERROR, *POWERSHELLGET_NOISE]  # newest first
+    reported = attempt_error_text(text, queue, baseline=len(POWERSHELLGET_NOISE))
+    assert reported == DEAD_CONNECT_ERROR
+    assert "denied" not in reported
+    assert exo.is_transient_connect_error(reported) is True, (
+        "the attempt's own transient error must still be retried, noise or no noise"
+    )
+
+
+def test_module_init_noise_alone_is_never_read_as_a_failed_attempt() -> None:
+    """The B6b transcript, modelled.
+
+    The sign-in succeeded and the only records appended while the module autoloaded
+    are PowerShellGet's. With the baseline taken after the import the delta is zero,
+    so nothing is attributed to the connect. On the pre-fix slice (``-Skip``, noise
+    inside the window with an empty baseline) the same records come back as the
+    attempt's error and are classified permanent - the exit-2 the operator saw.
+    """
+    text = script().text
+    import_at = text.index("Import-Module ExchangeOnlineManagement")
+    baseline_at = text.index("$MnotifyErrBefore = $Error.Count")
+    assert import_at < baseline_at, (
+        "the module autoloaded inside the attempt window, so its noise is inside "
+        "the delta and a successful sign-in reads as a refusal"
+    )
+    queue: list[str] = list(POWERSHELLGET_NOISE)  # newest first; nothing new during the attempt
+    reported = attempt_error_text(text, queue, baseline=len(POWERSHELLGET_NOISE))
+    assert reported == "", f"nothing may be attributed, got {reported!r}"
+    # The pre-fix shape, kept visible: this is the text that was reported as the
+    # refused sign-in, and it is why one more record in $Error killed the run.
+    pre_fix = " ".join(POWERSHELLGET_NOISE)
+    assert "denied" in pre_fix and exo.is_transient_connect_error(pre_fix) is False
+
+
+def test_a_broken_module_install_still_fails_closed_with_the_real_message(
+    temp_dir: Path,
+) -> None:
+    """``-ErrorAction Stop`` on the import must not turn a broken install into a pass.
+
+    The import throwing is a terminating failure: the outer catch prints it, no
+    session exists, no check answers. Exit 2 with the real pwsh message quoted and
+    the could-not-verify sentence that points at the Exchange module.
+    """
+    import_failure = (
+        "The specified module 'ExchangeOnlineManagement' was not loaded because "
+        "no valid module file was found in any module directory."
+    )
+    lines = [
+        event(event="error", reason=import_failure),
+    ]
+    fake = FakePwsh(lines, returncode=1)
+    with pytest.raises(ExchangeError) as excinfo:
+        ensure_exchange_scope(APP_ID, SP_OBJECT_ID, SENDER, ADMIN_MAILBOX, runner=fake)
+    result = excinfo.value.result
+    assert result is not None
+    assert result.ok is False and result.verified is False
+    assert excinfo.value.exit_code == 2
+    assert import_failure in excinfo.value.message
+    assert result.reason == exo.REASON_CONNECT_FAILED
+    assert result.connect_attempts == 0, "no attempt was made: the module never loaded"
+    assert list(temp_dir.iterdir()) == []
+
+
+def test_a_clean_import_then_success_reports_the_connect_as_one_good_attempt(
+    temp_dir: Path,
+) -> None:
+    """The transcript the fixed script emits for the B6b run: the module loaded with
+    its 2 records of installer noise, the device-code sign-in then succeeded, the
+    checks ran. One attempt, ok, verified - and the noise is visible in the report
+    as what it was."""
+    lines = [
+        "mnotify: connecting to Exchange Online (device-code sign-in).",
+        DEVICE_CODE_LINE,
+        event(event="module_import", outcome="loaded", errors=2),
+        ok_attempt(1),
+    ] + [ln for ln in pwsh_lines() if ln.startswith(EVENT_PREFIX)]
+    fake = StreamingFakePwsh(lines)
+    result = ensure_exchange_scope(
+        APP_ID, SP_OBJECT_ID, SENDER, ADMIN_MAILBOX, runner=fake
+    )
+    assert result.ok is True and result.verified is True and result.reason == ""
+    assert result.connect_attempts == 1 and result.connect_failures == 0
+    assert result.device_code_surfaced is True
+
+
+def test_the_transient_gate_reads_only_the_attempt_error_not_the_whole_queue() -> None:
+    """Pre-existing records must not be able to tip the retry decision.
+
+    The gate is handed ``$MnotifyAttemptError`` - the slice of this attempt's own
+    records - and never ``$Error`` itself, or a module's leftover noise would
+    decide whether the tenant gets a retry.
+    """
+    text = script().text
+    loop_body = text[text.index("for ($MnotifyAttempt = 1;") :]
+    calls = [
+        ln.strip()
+        for ln in loop_body.splitlines()
+        if "Test-MnotifyTransient" in ln and ln.strip().startswith("$")
+    ]
+    assert calls, "the retry gate is not calling the classifier"
+    for call in calls:
+        assert "Test-MnotifyTransient $MnotifyAttemptError" in call, call
+        assert "Test-MnotifyTransient $Error" not in call, (
+            "the gate would then be deciding the retry on records that predate the attempt"
+        )
