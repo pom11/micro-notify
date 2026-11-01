@@ -58,7 +58,7 @@ from typing import Any
 
 from cryptography import x509
 
-from .. import AuthError, certgen, secrets
+from .. import EXIT_USAGE, AuthError, UsageError, certgen, secrets
 from .runner import STDERR_QUOTE_LIMIT, CommandRunner, get_runner, run_json
 
 # --- Vocabulary --------------------------------------------------------------
@@ -94,6 +94,23 @@ class CertUploadError(AuthError):
     is a credential problem the operator fixes in the keychain or in Entra, not a
     bad flag. The message names accounts, app ids and thumbprints — never a key.
     """
+
+
+class StaleKeyPairRefusal(UsageError):
+    """A keychain pair matches no app credential and replacement was not forced -> exit 2.
+
+    A refusal, not a credential failure: the pair is not broken, this command was
+    simply not told it may destroy it. A stale pair may be the *live* credential of
+    a different app registration — B6 (2026-10-31) proved what silently replacing
+    one costs — so replacing it is an operator decision, expressed by an explicit
+    flag, exactly like the config and state refusals behind
+    ``mnotify admin bootstrap --force-config``. That family is why this is a
+    :class:`~micro_notify.UsageError` (exit 2) and not a
+    :class:`CertUploadError` (exit 4): the credential itself is fine, the
+    invocation is what has to change.
+    """
+
+    exit_code = EXIT_USAGE
 
 
 # --- Result shapes (declared seam for B5) ------------------------------------
@@ -217,26 +234,40 @@ class CertificateProvisioning:
 def keychain_thumbprint() -> str | None:
     """The thumbprint of the keychain certificate pair, or ``None`` if there is none.
 
-    Presence is checked with :func:`micro_notify.secrets.has`, so the private key's
-    *value* is never returned from this function — it is not needed to decide
-    anything here, and keeping it out of the return type is what lets a test assert
-    the key never reaches ``az``.
+    Three-way, never two-way. Presence is decided with
+    :func:`micro_notify.secrets.probe`, which tells "provably absent" (``security``
+    exit 44) from "could not be read" — and an unreadable read is a hard
+    :class:`CertUploadError`, never the "no pair" answer. That distinction is the
+    whole reason this function looks like this: on 2026-10-31 a transient keychain
+    failure read as "no pair" through ``secrets.has()``, the step generated a fresh
+    pair, overwrote both accounts and uploaded it, and the tenant's working
+    certificate credential was replaced (B6 — the RSA modulus of the keychain key
+    versus ``~/.config/mnotify/entra-certificate.pem`` proved the swap).
+
+    The value comes out of the same probe that decided presence, so there is no
+    second read: reading again after the verdict would compare a thumbprint that is
+    not provably the one whose presence was just established. The private half is
+    probed with ``read_value=False`` — this module needs to know only that it is
+    there, and the promise in the module docstring that the key's *value* is never
+    carried out of the keychain is stronger for being literally true.
 
     A half-stored pair is refused rather than repaired: overwriting
     ``graph.certificate_pem`` because its thumbprint account went missing would
     destroy the private half of a certificate some other machine may still be
     presenting to Entra.
     """
-    pem_present = secrets.has(secrets.ACCOUNT_CERT_PEM)
-    thumbprint_present = secrets.has(secrets.ACCOUNT_CERT_THUMBPRINT)
-    if pem_present != thumbprint_present:
+    pem = secrets.probe(secrets.ACCOUNT_CERT_PEM, read_value=False)
+    thumbprint = secrets.probe(secrets.ACCOUNT_CERT_THUMBPRINT)
+    _refuse_unreadable_pair_read(pem, thumbprint)
+
+    if pem.is_present != thumbprint.is_present:
         missing = (
             secrets.ACCOUNT_CERT_THUMBPRINT
-            if pem_present
+            if pem.is_present
             else secrets.ACCOUNT_CERT_PEM
         )
         present = (
-            secrets.ACCOUNT_CERT_PEM if pem_present else secrets.ACCOUNT_CERT_THUMBPRINT
+            secrets.ACCOUNT_CERT_PEM if pem.is_present else secrets.ACCOUNT_CERT_THUMBPRINT
         )
         raise CertUploadError(
             f"the keychain holds '{present}' but not '{missing}' (service "
@@ -244,16 +275,38 @@ def keychain_thumbprint() -> str | None:
             "is only half stored. Delete both accounts, or re-run "
             "`mnotify setup --gen-cert` on the machine that owns the key"
         )
-    if not pem_present:
+    if not pem.is_present:
         return None
-    value = (secrets.get(secrets.ACCOUNT_CERT_THUMBPRINT) or "").strip()
-    thumbprint = _normalise_thumbprint(value)
-    if not thumbprint:
+    value = _normalise_thumbprint(thumbprint.value.strip())
+    if not value:
         raise CertUploadError(
             f"'{secrets.ACCOUNT_CERT_THUMBPRINT}' (service '{secrets.SERVICE}') is "
             "not a SHA-1 thumbprint; re-run `mnotify setup --gen-cert`"
         )
-    return thumbprint
+    return value
+
+
+def _refuse_unreadable_pair_read(*probes: secrets.SecretProbe) -> None:
+    """An unreadable pair probe is a credential failure, never a "no pair".
+
+    The one sentence that matters is the second one: "absent" and "could not tell"
+    have opposite consequences here, and the message has to say which occurred so
+    the operator unlocks a keychain instead of regenerating a key. ``security``'s
+    own stderr is never quoted — see :func:`micro_notify.secrets._check` for why.
+    """
+    unreadable = [p for p in probes if p.is_unreadable]
+    if not unreadable:
+        return
+    accounts = ", ".join(f"'{p.account}'" for p in unreadable)
+    raise CertUploadError(
+        f"the keychain could not answer whether the certificate pair exists for "
+        f"{accounts} (service '{secrets.SERVICE}', binary "
+        f"'{secrets.SECURITY_BINARY}'): unreadable — "
+        f"{unreadable[0].reason}. Refusing to treat an unreadable keychain as 'no "
+        "certificate pair': that reading is what regenerates and replaces a working "
+        "key pair. Unlock the keychain (or fix its access control) and re-run; "
+        "the pair itself was not touched"
+    )
 
 
 def list_uploaded_credentials(
@@ -477,6 +530,7 @@ def ensure_certificate_credential(
     cert_runner: Callable[..., Any] | None = None,
     common_name: str = certgen.DEFAULT_COMMON_NAME,
     now: datetime.datetime | None = None,
+    force: bool = False,
 ) -> CertificateProvisioning:
     """Make the app hold the public half of the keychain certificate. Idempotent.
 
@@ -489,12 +543,22 @@ def ensure_certificate_credential(
 
     * keychain pair whose thumbprint is among the app's credentials -> ``exists``,
       nothing generated, nothing written (the card's "do not regenerate" rule);
-    * keychain pair that does **not** match -> the pair is useless for this app (the
-      public certificate cannot be rebuilt from the keychain, which holds only the
-      private half), so a fresh pair is generated and uploaded, and the thumbprint
-      that got replaced is reported so the orphan is visible;
+    * keychain pair that does **not** match -> refused with
+      :class:`StaleKeyPairRefusal` (exit 2) unless ``force`` is set. The pair is
+      useless *for this app* — the public certificate cannot be rebuilt from the
+      keychain, which holds only the private half — but it may be the live
+      credential of a *different* app registration, and B6 (2026-10-31) showed what
+      replacing one unasked costs. With ``force`` (the CLI's ``--force``) a fresh
+      pair is generated and uploaded and the thumbprint that got replaced is
+      reported, so the orphan stays visible;
     * no keychain pair at all -> generate and upload, the same path
-      ``mnotify setup --gen-cert`` + §1.3 take by hand.
+      ``mnotify setup --gen-cert`` + §1.3 take by hand. Nothing exists to destroy,
+      so this path needs no force.
+
+    An *unreadable* keychain never reaches any of those decisions:
+    :func:`keychain_thumbprint` fails closed naming ``security`` and the accounts,
+    which is the B6 fail-open closed at the read. ``force`` cannot override it
+    either — a force flag answers "may I replace this?", not "may I guess?".
 
     ``cert_runner`` is passed straight to
     :func:`micro_notify.certgen.generate_certificate` (which drives ``openssl`` with
@@ -545,6 +609,21 @@ def ensure_certificate_credential(
     # (openssl, the keychain) does not go through the runner seam and would really
     # run, replacing the operator's private key during a `--dry-run`.
     _refuse_recording_runner(runner)
+    # Second gate on the write path, and deliberately after the first: a dry run
+    # must hear "this was a dry run, print the plan" — not "re-run with --force",
+    # advice that would be wrong for a run that promised to change nothing.
+    if existing is not None and not force:
+        raise StaleKeyPairRefusal(
+            f"the keychain certificate (thumbprint {existing}) is not a credential "
+            f"on app {checked}, and this step will not replace it unasked: a pair "
+            "that matches no credential here may be the live credential of a "
+            "different app registration. Options: upload this certificate's public "
+            "half to the registration it belongs to (docs/ADMIN-SETUP.md §1.3), "
+            "re-run `mnotify setup --gen-cert` on the machine that owns the key "
+            "for *this* app, or — knowing the old pair becomes an orphan here and "
+            "stays live wherever it was uploaded — re-run `mnotify admin bootstrap "
+            "--force` to generate and upload a fresh pair and replace it."
+        )
     generated = certgen.generate_certificate(common_name=common_name, runner=cert_runner)
     secrets.set_secret(secrets.ACCOUNT_CERT_PEM, generated.private_key_pem)
     secrets.set_secret(secrets.ACCOUNT_CERT_THUMBPRINT, generated.certificate_thumbprint)
@@ -834,6 +913,7 @@ __all__ = [
     "PUBLIC_CERT_PREFIX",
     "CertUploadError",
     "CertificateProvisioning",
+    "StaleKeyPairRefusal",
     "UploadedCredential",
     "certificate_end_date",
     "ensure_certificate_credential",

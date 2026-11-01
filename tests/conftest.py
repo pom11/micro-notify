@@ -525,12 +525,34 @@ class FakeKeychain:
     No ``/usr/bin/security`` process is ever spawned: the fake is installed as
     the process-wide subprocess runner and answers the exact argv shapes the real
     module builds. It also records every invocation for assertions.
+
+    :meth:`get` keeps the real signature — the keyword-only ``runner`` included —
+    because :func:`micro_notify.secrets.probe` reads through ``get`` with that
+    keyword. A fake whose signature is narrower makes every probe fail with
+    ``TypeError``; a fake that raises the plain :class:`~micro_notify.secrets.KeychainError`
+    for a *missing* item instead of
+    :class:`~micro_notify.secrets.KeychainItemMissing` makes a genuinely absent
+    account read as an unreadable one. Both mistakes are invisible to a test that
+    only ever calls ``has``.
     """
 
     def __init__(self) -> None:
         self.items: dict[str, str] = {}
         self.calls: list[list[str]] = []
         self.audit: list[str] = []  # account names touched, in order
+        # account -> exit code ``find`` must answer instead of 0/44. Stands in for
+        # the unreadable keychain (locked keychain, denied ACL) that
+        # :func:`micro_notify.secrets.probe` has to tell apart from a missing item.
+        self.read_failures: dict[str, int] = {}
+        self.probe_reads: list[str] = []  # accounts read through get/probe
+
+    def fail_read(self, account: str, returncode: int = 60) -> None:
+        """Make reads of ``account`` fail with a non-44 exit code.
+
+        60 is a real ``security(1)`` failure exit and, like every code other than
+        44, must read as "could not tell" rather than "not there".
+        """
+        self.read_failures[account] = returncode
 
     # --- subprocess runner stand-in ------------------------------------
     def __call__(self, args, **_kwargs):
@@ -542,6 +564,12 @@ class FakeKeychain:
         if service != secrets.SERVICE or account is None:
             return SimpleNamespace(returncode=2, stdout="", stderr="wrong service")
         if verb == "find-generic-password":
+            if str(account) in self.read_failures:
+                # stdout/stderr stay empty on purpose: a fail-closed message must
+                # have nothing of the item's to echo back.
+                return SimpleNamespace(
+                    returncode=self.read_failures[str(account)], stdout="", stderr=""
+                )
             if str(account) not in self.items:
                 return SimpleNamespace(returncode=44, stdout="", stderr="item not found")
             return SimpleNamespace(returncode=0, stdout=self.items[str(account)], stderr="")
@@ -560,10 +588,41 @@ class FakeKeychain:
         return argv[argv.index(flag) + 1] if flag in argv and argv.index(flag) + 1 < len(argv) else None
 
     # --- public surface mirroring micro_notify.secrets ------------------
-    def get(self, account: str) -> str:
+    # ``runner`` is accepted (and ignored) so a caller that passes it — as
+    # :func:`micro_notify.secrets.probe` does — reaches the fake instead of
+    # tripping over the signature. Absence raises the *typed*
+    # :class:`micro_notify.secrets.KeychainItemMissing`, matching what the real
+    # module raises for ``security`` exit 44, and :meth:`fail_read` raises the
+    # plain :class:`~micro_notify.secrets.KeychainError`. That is the whole
+    # contract: this fake stays the in-memory source of truth (nothing goes down
+    # the subprocess path at all), while the real :func:`secrets.probe` /
+    # :func:`secrets.has` run unchanged on top of it and decide the verdict.
+    def get(self, account: str, **_kwargs: Any) -> str:
         self.audit.append(account)
+        # Separate from `audit` because a test pins *how often* a pair probe reads
+        # each account: one read that yields both the verdict and the value is the
+        # no-TOCTOU rule, and `audit` also carries writes and deletes.
+        self.probe_reads.append(account)
+        # The same exit-code rule the real module applies to security(1): 44 is a
+        # proven absence, anything else is a read that could not be answered. A
+        # fake that got this backwards would let a fail-closed caller pass its own
+        # reducer, which is precisely the B6 bug.
+        if account in self.read_failures:
+            code = self.read_failures[account]
+            error = (
+                secrets.KeychainItemMissing
+                if code == secrets.EXIT_ITEM_NOT_FOUND
+                else secrets.KeychainError
+            )
+            raise error(
+                f"keychain read failed for account '{account}' "
+                f"(service '{secrets.SERVICE}', exit {code})"
+            )
         if account not in self.items:
-            raise secrets.KeychainError(f"keychain read failed for account '{account}'")
+            raise secrets.KeychainItemMissing(
+                f"keychain read failed for account '{account}' "
+                f"(service '{secrets.SERVICE}', exit {secrets.EXIT_ITEM_NOT_FOUND})"
+            )
         return self.items[account]
 
     def set_secret(self, account: str, value: str) -> None:
@@ -573,10 +632,6 @@ class FakeKeychain:
     def delete(self, account: str) -> bool:
         self.audit.append(account)
         return self.items.pop(account, None) is not None
-
-    def has(self, account: str) -> bool:
-        self.audit.append(account)
-        return bool(self.items.get(account))
 
     def seed(self, account: str, value: str) -> None:
         """Preset a value (use placeholder-looking values in tests)."""
@@ -592,12 +647,16 @@ class FakeKeychain:
 def fake_keychain(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeKeychain]:
     """Install an in-memory keychain; assert on exit that nothing real ran."""
     fake = FakeKeychain()
-    # Every command module reads secrets through the module attributes, so this
-    # single patch covers get/set_secret/delete/has for the whole CLI.
+    # The fake replaces only the *storage*: `get`/`set_secret`/`delete` are the three
+    # functions that touch the binary. `has` and `probe` are deliberately left alone,
+    # so the absent-vs-unreadable verdict every fail-closed caller depends on is the
+    # production rule deciding it on top of this fake, not a copy of it kept here.
+    # (Patching `has` is what hid the B6 fail-open for as long as it took a fake to
+    # exist: a fake `has` returning a bool cannot be wrong in the way the real one
+    # is, and a fake `get` whose signature rejects `runner=` breaks `probe` instead.)
     monkeypatch.setattr(secrets, "get", fake.get)
     monkeypatch.setattr(secrets, "set_secret", fake.set_secret)
     monkeypatch.setattr(secrets, "delete", fake.delete)
-    monkeypatch.setattr(secrets, "has", fake.has)
     # Belt and braces: even a direct low-level call must not reach /usr/bin/security.
     secrets.set_runner(fake)
     try:
