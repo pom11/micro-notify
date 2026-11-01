@@ -640,6 +640,30 @@ DRY_RUN_RESPONSES: dict[tuple[str, ...], str] = {
     ("az", "ad", "sp", "list"): "[]",
     ("az", "ad", "app", "create"): '{"appId": "00000000-0000-0000-0000-000000000000"}',
     ("az", "ad", "sp", "create"): '{"id": "ffffffff-ffff-ffff-ffff-ffffffffffff"}',
+    # The three reads delegated mode makes (BUG6). Without them a delegated --dry-run
+    # dies inside run_json with "'az' did not print JSON" on a machine that has no az
+    # at all -- the canned answer, not the tenant, is what a dry run reads -- and the
+    # operator never sees the plan. The shapes below are what the projected reads
+    # return (see delegated_setup.graph_query / app_show_argv):
+    #   * sp show -> the Graph service principal id plus the five scope ids, canned as
+    #     the markers the plan prints anyway (a real scope id is not earned until the
+    #     tenant is read, so the plan shows <scopeId>; the shape only has to parse);
+    #   * app show -> nothing declared: a FRESH tenant, so the plan shows the five
+    #     adds a first run makes rather than a no-op;
+    #   * permission list -> the empty read-back: the same fresh-tenant story from the
+    #     tenant's side, and the answer the real step would get before any write.
+    ("az", "ad", "sp", "show"): (
+        '{"id": "ffffffff-ffff-ffff-ffff-ffffffffffff", "scopes": ['
+        + ", ".join(
+            f'{{"value": "{name}", "id": "{DRY_SCOPE_ID}"}}'
+            for name in delegation.DELEGATED_SCOPES
+        )
+        + "]}"
+    ),
+    ("az", "ad", "app", "show"): (
+        '{"requiredResourceAccess": [], "isFallbackPublicClient": false}'
+    ),
+    ("az", "ad", "app", "permission", "list"): "[]",
     ("pwsh",): "3.11.0",
 }
 
@@ -806,6 +830,11 @@ def _dry_run_delegated(
     printer.flush()
     for name in scopes:
         printer.planned([_command_line(delegated_setup.permission_add_argv(app_id, DRY_SCOPE_ID))])
+    # The confirming read BUG6 added: the exit code says the add ran, the tenant's own
+    # list says it took. It belongs in the plan because it is a command the step runs,
+    # and an operator reading a plan that omits it cannot tell a claim of success from
+    # a verified one.
+    printer.planned([_command_line(delegated_setup.permission_list_argv(app_id))])
     out.add(
         STEP_PERMISSIONS,
         OUTCOME_DRYRUN,
