@@ -59,6 +59,16 @@ DELEGATED_SCOPES: tuple[str, ...] = (
     "offline_access",
 )
 
+# msal reserves these and adds them to every request itself; passing one to
+# initiate_device_flow or acquire_token_silent raises ValueError ("You cannot use
+# any scope value that is reserved"). offline_access stays in DELEGATED_SCOPES
+# because that tuple is also what the app registration declares, but every msal
+# call gets REQUEST_SCOPES: the same scopes, same order, minus the reserved ones.
+MSAL_RESERVED_SCOPES: frozenset[str] = frozenset({"openid", "profile", "offline_access"})
+REQUEST_SCOPES: tuple[str, ...] = tuple(
+    scope for scope in DELEGATED_SCOPES if scope not in MSAL_RESERVED_SCOPES
+)
+
 # The single keychain account holding the serialised cache (A.2 / A.4). The value
 # lives in secrets.py — the file that names every keychain account — and is re-exported
 # here because delegation.py is its only reader and `from micro_notify.delegation
@@ -265,7 +275,7 @@ def login(
         account = _only_account(app)
         if account is None:
             raise AuthError(f"no delegated sign-in cached; {LOGIN_HINT}")
-        result = app.acquire_token_silent(list(DELEGATED_SCOPES), account)
+        result = app.acquire_token_silent(list(REQUEST_SCOPES), account)
         _persist(cache)
         if not isinstance(result, dict) or not result.get("access_token"):
             code = (result or {}).get("error", "not_refreshable")
@@ -275,7 +285,7 @@ def login(
             expires_at=_access_expiry(cache),
         )
 
-    flow = app.initiate_device_flow(scopes=list(DELEGATED_SCOPES))
+    flow = app.initiate_device_flow(scopes=list(REQUEST_SCOPES))
     if not isinstance(flow, dict) or flow.get("error") or "device_code" not in flow:
         code = (flow or {}).get("error", "flow_not_started")
         raise AuthError(f"device-code sign-in could not start ({code}); {LOGIN_HINT}")
@@ -370,7 +380,7 @@ def get_delegated_token() -> str:
     if account is None:
         raise AuthError(f"no delegated sign-in cached; {LOGIN_HINT}")
 
-    result = app.acquire_token_silent(list(DELEGATED_SCOPES), account)
+    result = app.acquire_token_silent(list(REQUEST_SCOPES), account)
     _persist(cache)
     if not isinstance(result, dict) or not result.get("access_token"):
         code = (result or {}).get("error", "no_token")
@@ -384,6 +394,8 @@ __all__ = [
     "DEVICE_FLOW_TIMEOUT_SECONDS",
     "LOGIN_HINT",
     "LoginResult",
+    "MSAL_RESERVED_SCOPES",
+    "REQUEST_SCOPES",
     "WhoamiResult",
     "get_delegated_token",
     "login",

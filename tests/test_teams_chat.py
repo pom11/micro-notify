@@ -185,7 +185,7 @@ def chats_payload(count: int = 2) -> dict:
                 "id": chat_id_with(f"chat{index}"),
                 "topic": f"Ops thread {index}",
                 "chatType": "group" if index % 2 else "person",
-                "lastModifiedDateTime": "2026-10-30T09:00:0" + str(index) + "Z",
+                "lastUpdatedDateTime": "2026-10-30T09:00:0" + str(index) + "Z",
             }
             for index in range(1, count + 1)
         ]
@@ -275,7 +275,7 @@ def test_chats_list_selects_the_documented_fields(delegated, fake_keychain, mock
     assert request.method == "GET"
     assert request.url.path == "/v1.0/me/chats"
     assert request.url.params["$select"] == CHAT_LIST_SELECT
-    assert CHAT_LIST_SELECT == "topic,lastModifiedDateTime,chatType"
+    assert CHAT_LIST_SELECT == "id,topic,lastUpdatedDateTime,chatType"
     assert request.headers["authorization"] == "Bearer " + FAKE_TOKEN
 
 

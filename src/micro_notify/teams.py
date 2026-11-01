@@ -404,8 +404,12 @@ def post_chat_message(
     )
 
 
-# GET /me/chats selects exactly the fields `teams chats list` prints.
-CHAT_LIST_SELECT = "topic,lastModifiedDateTime,chatType"
+# GET /me/chats selects exactly the fields `teams chats list` prints. The chat
+# resource names its timestamp lastUpdatedDateTime; selecting a property it does
+# not have (lastModifiedDateTime) is an HTTP 400 for the whole request. And
+# $select returns only what it names: without id every chat comes back id-less
+# and `teams chats add --pick` would register an empty target.
+CHAT_LIST_SELECT = "id,topic,lastUpdatedDateTime,chatType"
 
 
 def get_my_chats(
@@ -418,7 +422,7 @@ def get_my_chats(
 
     Same delegated gate as the send: listing chats with app-only credentials is
     not a thing Graph offers, so the answer is the login hint, not an empty list.
-    Returns the ``value`` entries (id/topic/chatType/lastModifiedDateTime); a
+    Returns the ``value`` entries (id/topic/chatType/lastUpdatedDateTime); a
     missing or non-list ``value`` is treated as an empty collection, never a
     crash.
     """

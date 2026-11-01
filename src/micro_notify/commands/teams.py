@@ -430,7 +430,7 @@ def _chats_list(args: argparse.Namespace) -> int:
             "id": str(chat.get("id", "")),
             "topic": str(chat.get("topic") or ""),
             "type": str(chat.get("chatType") or ""),
-            "last_modified": str(chat.get("lastModifiedDateTime") or ""),
+            "last_modified": str(chat.get("lastUpdatedDateTime") or ""),
         }
         for chat in chats
     ]

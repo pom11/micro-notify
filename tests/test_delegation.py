@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import json
 import time
+import types
 
 import msal
 import pytest
@@ -99,6 +100,17 @@ def token_response(
     return response
 
 
+def _reject_reserved(scopes) -> None:
+    """Refuse reserved scopes the way real msal does (``_decorate_scope``).
+
+    Without this the fake accepted ``offline_access`` and the suite stayed green
+    while every real ``mnotify login`` died with msal's ValueError.
+    """
+    reserved = set(scopes or []) & {"openid", "profile", "offline_access"}
+    if reserved:
+        raise ValueError(f"You cannot use any scope value that is reserved: {sorted(reserved)}")
+
+
 def ingest(cache: msal.SerializableTokenCache, response: dict, *, upn: str = PERSON) -> None:
     """Put a token response into a real msal cache the way msal itself does."""
     cache.add(
@@ -145,6 +157,7 @@ class FakeApp:
         self.cache = kwargs["token_cache"]
 
     def initiate_device_flow(self, scopes=None, **_kwargs):
+        _reject_reserved(scopes)
         self.stub.flows.append(list(scopes or []))
         return dict(self.stub.flow)
 
@@ -158,6 +171,7 @@ class FakeApp:
         return dict(result)
 
     def acquire_token_silent(self, scopes, account=None, **_kwargs):
+        _reject_reserved(scopes)
         self.stub.silent_calls.append((list(scopes), account))
         # Real msal answers from the cache first, and the cache here is real, so a
         # live access token is served from it rather than from a script. Only a
@@ -262,17 +276,32 @@ def test_scopes_are_exactly_the_five_granted_by_the_amendment() -> None:
     )
 
 
+def test_request_scopes_are_the_five_minus_msal_reserved() -> None:
+    """msal adds offline_access itself; the request carries the other four, in order."""
+    assert delegation.REQUEST_SCOPES == ("Mail.Send", "ChatMessage.Send", "Chat.ReadBasic", "User.Read")
+
+
+def test_real_msal_accepts_request_scopes_and_refuses_the_declared_five() -> None:
+    """Pin the tuple against msal's own scope check, not only against the fake."""
+    stub = types.SimpleNamespace(_exclude_scopes=frozenset())
+    decorate = msal.ClientApplication._decorate_scope
+    decorated = decorate(stub, list(delegation.REQUEST_SCOPES))
+    assert "offline_access" in decorated  # msal adds it, so refresh still works
+    with pytest.raises(ValueError, match="reserved"):
+        decorate(stub, list(delegation.DELEGATED_SCOPES))
+
+
 def test_scopes_are_requested_verbatim_by_the_device_flow(fake_msal, fake_keychain) -> None:
-    """The device flow must ask for exactly the amendment's five, in order."""
+    """The device flow must ask for exactly the request scopes, in order."""
     delegation.login(mail=mail_config(), printer=lambda _text: None)
-    assert fake_msal.flows == [list(delegation.DELEGATED_SCOPES)]
+    assert fake_msal.flows == [list(delegation.REQUEST_SCOPES)]
 
 
 def test_scopes_are_requested_verbatim_by_the_silent_path(signed_in, fake_msal) -> None:
     """A silent refresh may not widen or reorder the scopes either."""
     fake_msal.silent_result = token_response()
     delegation.get_delegated_token()
-    assert [call[0] for call in fake_msal.silent_calls] == [list(delegation.DELEGATED_SCOPES)]
+    assert [call[0] for call in fake_msal.silent_calls] == [list(delegation.REQUEST_SCOPES)]
 
 
 def test_cache_account_is_the_one_the_amendment_named() -> None:
