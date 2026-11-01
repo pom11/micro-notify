@@ -46,6 +46,7 @@ from micro_notify.admin.certupload import (
     OUTCOME_EXISTS,
     CertUploadError,
     CertificateProvisioning,
+    StaleKeyPairRefusal,
     UploadedCredential,
     certificate_end_date,
     ensure_certificate_credential,
@@ -374,7 +375,12 @@ def seed_pair(fake_keychain: Any, pair: dict[str, str]) -> None:
 
 @pytest.fixture
 def keychain_writes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
-    """Records ``(account, value)`` for every keychain write this module attempts."""
+    """Records ``(account, value)`` for every keychain write this module attempts.
+
+    The recorder is deliberately a spy rather than an absence check: a test that
+    asserts *which* accounts were written and with *what* needs the values, and the
+    refusal tests below assert the same list is empty — one mechanism, two claims.
+    """
     recorded: list[tuple[str, str]] = []
 
     def spy(account: str, value: str, **kwargs: Any) -> None:
@@ -382,6 +388,18 @@ def keychain_writes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
 
     monkeypatch.setattr(certupload.secrets, "set_secret", spy)
     return recorded
+
+
+@pytest.fixture
+def forbid_keychain_writes(keychain_writes: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """The same recorder, named for the claim a refusal test makes with it.
+
+    Every refusal test's whole point is that it stopped *before* a write, so its
+    assertion is ``== []``; a name that reads as a prohibition says so at the call
+    site without a comment. One recorder, two names — the spy lives in
+    :func:`keychain_writes` so a fix to it cannot land in only one of them.
+    """
+    return keychain_writes
 
 
 # =============================================================================
@@ -745,7 +763,7 @@ def test_other_uploaded_credentials_are_counted(
         }
     )
     result = ensure_certificate_credential(
-        APP_ID, runner=fake, cert_runner=FakeOpenssl(pair)
+        APP_ID, runner=fake, cert_runner=FakeOpenssl(pair), force=True
     )
     assert (result.created, result.generated) == (True, True)  # the seeded pair was not uploaded
     assert result.other_credentials == 2
@@ -790,16 +808,44 @@ def test_verify_uploaded_refuses_an_empty_thumbprint() -> None:
         verify_uploaded(APP_ID, "  ", runner=FakeAz())
 
 
-def test_mismatch_with_the_keychain_pair_regenerates_and_reports_the_orphan(
+def test_mismatch_with_the_keychain_pair_refuses_and_names_the_pair(
     pair: dict[str, str], fake_keychain: Any
 ) -> None:
-    """A key that does not match this app is useless here — and must be named."""
+    """A key that does not match this app is useless here — and must be named.
+
+    BEHAVIOUR CHANGE (card t_9bac19ba, ORCH ruling on t_362c34cc comment 102): this
+    path used to generate and upload a fresh pair unasked. It now refuses, because a
+    pair that matches no credential *here* may be the live credential of a different
+    app registration, and B6 (2026-10-31) is the record of what replacing one
+    unasked costs. The replace behaviour this test used to pin moved to
+    :func:`test_mismatch_with_the_keychain_pair_regenerates_when_forced`, whose
+    assertions are the ones PR #27 (merged as 8671d2b) pinned — unchanged.
+    """
     stale = make_pair(days=200)
     seed_pair(fake_keychain, stale)
     fake = FakeAz(upload_succeeds(pair))
     openssl = FakeOpenssl(pair)
 
-    result = ensure_certificate_credential(APP_ID, runner=fake, cert_runner=openssl)
+    with pytest.raises(StaleKeyPairRefusal) as excinfo:
+        ensure_certificate_credential(APP_ID, runner=fake, cert_runner=openssl)
+
+    assert stale["thumbprint"] in str(excinfo.value)
+    assert openssl.invoked is False
+    assert fake.reset_calls == []
+
+
+def test_mismatch_with_the_keychain_pair_regenerates_when_forced(
+    pair: dict[str, str], fake_keychain: Any
+) -> None:
+    """The PR #27 pins, byte-for-byte: forced replacement reports the orphan."""
+    stale = make_pair(days=200)
+    seed_pair(fake_keychain, stale)
+    fake = FakeAz(upload_succeeds(pair))
+    openssl = FakeOpenssl(pair)
+
+    result = ensure_certificate_credential(
+        APP_ID, runner=fake, cert_runner=openssl, force=True
+    )
 
     assert (result.created, result.generated) == (True, True)
     assert result.thumbprint == pair["thumbprint"]
@@ -1352,3 +1398,358 @@ def test_live_az_shape_expired_still_reports_exists_not_a_rekey(
     assert "expired" in result.detail
     assert generated["calls"] == 0
     assert fake.reset_calls == []
+
+
+# =============================================================================
+# Absent vs unreadable: the B6 fail-open closed (card t_9bac19ba)
+# =============================================================================
+# On 2026-10-31 a transient keychain failure — locked keychain, denied ACL — read
+# as "no certificate pair" through `secrets.has()`, and `mnotify admin bootstrap`
+# generated a fresh pair, rewrote both accounts and uploaded it over a tenant that
+# was already configured. `secrets.probe()` (PR #31, merged as 4474d74) can tell the
+# two apart; these tests pin that the *certificate step* is the caller that stops
+# using the difference to decide "generate".
+def test_transient_keychain_failure_never_regenerates_the_pair(
+    pair: dict[str, str],
+    fake_keychain: Any,
+    forbid_keychain_writes: list[tuple[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE reducer this card exists for — red-first against the has()-based probe.
+
+    Both certificate accounts answer a non-44 exit (60: the shape a locked keychain
+    or a denied ACL produces) while the app answers "no credentials" — the most
+    dangerous combination for the fail-open, because "no credentials" is the other
+    half of the answer that makes the step generate. The step must refuse outright,
+    and none of the four destructive effects may happen.
+    """
+    seed_pair(fake_keychain, pair)
+    fake_keychain.fail_read(secrets.ACCOUNT_CERT_PEM, 60)
+    fake_keychain.fail_read(secrets.ACCOUNT_CERT_THUMBPRINT, 60)
+    fake = FakeAz(NO_CREDENTIALS)
+    openssl = FakeOpenssl(pair)
+    generated = _forbid_generate(monkeypatch)
+
+    with pytest.raises(CertUploadError) as excinfo:
+        ensure_certificate_credential(APP_ID, runner=fake, cert_runner=openssl)
+
+    message = str(excinfo.value)
+    assert secrets.SECURITY_BINARY in message or "security" in message
+    assert secrets.ACCOUNT_CERT_PEM in message
+    assert secrets.ACCOUNT_CERT_THUMBPRINT in message
+    assert "unreadable" in message.lower()
+    # The destructive quartet, each pinned at its own seam.
+    assert fake_keychain.probe_reads, "the probe never attempted the read it was refused for"
+    assert generated["calls"] == 0
+    assert openssl.invoked is False
+    assert forbid_keychain_writes == []
+    assert fake.reset_calls == []
+
+
+def test_unreadable_read_is_never_given_the_items_it_could_not_read(
+    pair: dict[str, str], fake_keychain: Any
+) -> None:
+    """The refusal's own leak rule: an unreadable read carries nothing to echo.
+
+    ``security``'s stdout and stderr are dropped inside
+    :mod:`micro_notify.secrets` for exactly this reason; a message that quoted them
+    would put keychain content into an operator-visible error on the one path where
+    the content was never legitimately read.
+    """
+    fake_keychain.seed(secrets.ACCOUNT_CERT_PEM, pair["private_key_pem"])
+    fake_keychain.fail_read(secrets.ACCOUNT_CERT_PEM, 60)
+
+    with pytest.raises(CertUploadError) as excinfo:
+        keychain_thumbprint()
+
+    assert pair["private_key_pem"] not in str(excinfo.value)
+
+
+def test_unreadable_thumbprint_account_alone_is_not_reported_as_half_stored(
+    pair: dict[str, str], fake_keychain: Any
+) -> None:
+    """PEM readable + thumbprint exit 60 is *not* "half stored".
+
+    Under the old has()-based probe this shape raised the half-stored message — a
+    wrong diagnosis that told the operator to delete a pair whose thumbprint was
+    merely unreadable. The failure must be named as an unreadable read.
+    """
+    fake_keychain.seed(secrets.ACCOUNT_CERT_PEM, pair["private_key_pem"])
+    fake_keychain.fail_read(secrets.ACCOUNT_CERT_THUMBPRINT, 60)
+
+    with pytest.raises(CertUploadError) as excinfo:
+        keychain_thumbprint()
+
+    message = str(excinfo.value)
+    assert secrets.ACCOUNT_CERT_THUMBPRINT in message
+    assert "unreadable" in message.lower()
+    assert "half stored" not in message
+
+
+def test_provably_absent_accounts_still_report_no_pair(fake_keychain: Any) -> None:
+    """Fail-closed must not become fail-always: exit 44 on both accounts is the
+    documented "nothing stored" answer, and the generation path stays allowed."""
+    fake_keychain.fail_read(secrets.ACCOUNT_CERT_PEM, secrets.EXIT_ITEM_NOT_FOUND)
+    fake_keychain.fail_read(
+        secrets.ACCOUNT_CERT_THUMBPRINT, secrets.EXIT_ITEM_NOT_FOUND
+    )
+    assert keychain_thumbprint() is None
+
+
+def test_first_run_with_absent_accounts_generates_and_uploads(
+    pair: dict[str, str],
+    fake_keychain: Any,
+    forbid_keychain_writes: list[tuple[str, str]],
+) -> None:
+    """End-to-end half of the same pin: an honest "absent" still generates — so
+    closing the fail-open did not break the documented first-run path."""
+    fake_keychain.fail_read(secrets.ACCOUNT_CERT_PEM, secrets.EXIT_ITEM_NOT_FOUND)
+    fake_keychain.fail_read(
+        secrets.ACCOUNT_CERT_THUMBPRINT, secrets.EXIT_ITEM_NOT_FOUND
+    )
+    fake = FakeAz(upload_succeeds(pair))
+    openssl = FakeOpenssl(pair)
+
+    result = ensure_certificate_credential(APP_ID, runner=fake, cert_runner=openssl)
+
+    assert (result.created, result.generated) == (True, True)
+    assert [account for account, _ in forbid_keychain_writes] == [
+        secrets.ACCOUNT_CERT_PEM,
+        secrets.ACCOUNT_CERT_THUMBPRINT,
+    ]
+
+
+def test_pair_probe_verdicts_are_three_way_not_bool(
+    pair: dict[str, str], fake_keychain: Any
+) -> None:
+    """keychain_thumbprint() must see PRESENT/ABSENT/UNREADABLE, not bool.
+
+    The unit the e2e reducer runs through: a readable pair yields the normalised
+    thumbprint, one unreadable account raises. Written against the verdict constants
+    so a probe that collapsed to a bool cannot pass it.
+    """
+    seed_pair(fake_keychain, pair)
+    assert keychain_thumbprint() == pair["thumbprint"]
+
+    fake_keychain.fail_read(secrets.ACCOUNT_CERT_PEM, 1)
+    with pytest.raises(CertUploadError, match="unreadable"):
+        keychain_thumbprint()
+
+
+def test_the_pair_probe_reads_value_once_and_from_the_probe(
+    pair: dict[str, str], fake_keychain: Any
+) -> None:
+    """One read per account, and the value comes from that read.
+
+    Two reads of the thumbprint account would be a TOCTOU window: the value the
+    step compares against Entra would not be the value whose presence was just
+    established. Asserting the exact read count is what makes a re-read
+    (`secrets.get` after `secrets.has`) a test failure rather than a race.
+    """
+    seed_pair(fake_keychain, pair)
+
+    assert keychain_thumbprint() == pair["thumbprint"]
+    assert fake_keychain.probe_reads.count(secrets.ACCOUNT_CERT_THUMBPRINT) == 1
+    assert fake_keychain.probe_reads.count(secrets.ACCOUNT_CERT_PEM) == 1
+
+
+def test_pair_probe_never_reaches_the_real_subprocess_layer(
+    pair: dict[str, str],
+    fake_keychain: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pair probe must go through the injectable runner seam, or a test cannot
+    hold it still.
+
+    The shared fixture answers keychain reads in memory; a probe that decided
+    presence through its own ``subprocess.run`` (or any path that bypasses
+    :mod:`micro_notify.secrets`) would read the *operator's* keychain during a test.
+    The tripwire below makes that an immediate failure rather than a wrong answer,
+    and the assertion afterwards proves the tripwire had something to catch.
+    """
+
+    def tripwire(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("a keychain pair probe reached the real subprocess layer")
+
+    monkeypatch.setattr("micro_notify.secrets.subprocess.run", tripwire)
+    seed_pair(fake_keychain, pair)
+
+    assert keychain_thumbprint() == pair["thumbprint"]
+    assert fake_keychain.security_binaries_invoked == []
+
+
+# =============================================================================
+# Stale keychain pair: refuse unless forced (ORCH ruling, t_362c34cc comment 102)
+# =============================================================================
+def stale_pair() -> dict[str, str]:
+    """A second throwaway pair, deliberately different from the ``pair`` fixture."""
+    return make_pair(days=200)
+
+
+def app_holding_only(*pairs: dict[str, str]) -> FakeAz:
+    """An ``az`` answer listing exactly these pairs' certificates as uploaded."""
+    return FakeAz(
+        {
+            (
+                "az",
+                "ad",
+                "app",
+                "credential",
+                "list",
+            ): credential_list(
+                *[cert_entry(p["thumbprint"], p["not_after"]) for p in pairs]
+            )
+        }
+    )
+
+
+def test_stale_keychain_pair_refuses_without_force(
+    pair: dict[str, str],
+    fake_keychain: Any,
+    forbid_keychain_writes: list[tuple[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ruling (a): a pair matching nothing is refused, not silently replaced.
+
+    The B6 lesson generalised: a stale pair may be the live credential of a
+    *different* app registration, and replacing it destroys a working setup
+    elsewhere. Exit 2 — the refusal family, same class as the ``--force-config``
+    config and state refusals — naming the keychain thumbprint and the fix.
+    """
+    stale = stale_pair()
+    seed_pair(fake_keychain, stale)
+    fake = app_holding_only(pair)  # the app holds a *different* certificate
+    openssl = FakeOpenssl(pair)
+    generated = _forbid_generate(monkeypatch)
+
+    with pytest.raises(StaleKeyPairRefusal) as excinfo:
+        ensure_certificate_credential(APP_ID, runner=fake, cert_runner=openssl)
+
+    assert isinstance(excinfo.value, UsageError)
+    assert excinfo.value.exit_code == EXIT_USAGE
+    message = str(excinfo.value)
+    # This module's leak rule makes a thumbprint public (Entra displays it, and
+    # ADMIN-SETUP §1.3 asks the operator to compare it), so it can be named in full.
+    assert stale["thumbprint"] in message
+    assert "--force" in message
+    assert pair["private_key_pem"] not in message
+    assert generated["calls"] == 0
+    assert openssl.invoked is False
+    assert forbid_keychain_writes == []
+    assert fake.reset_calls == []
+
+
+def test_stale_keychain_pair_is_replaced_only_when_forced(
+    pair: dict[str, str],
+    fake_keychain: Any,
+    forbid_keychain_writes: list[tuple[str, str]],
+) -> None:
+    """Ruling (c): ``force`` restores the pre-ruling replace behaviour verbatim.
+
+    Byte-identical to what PR #27 (merged as 8671d2b) pins for the mismatch path:
+    created+generated, the new thumbprint reported, the replaced one reported too.
+    """
+    stale = stale_pair()
+    seed_pair(fake_keychain, stale)
+    fake = FakeAz(upload_succeeds(pair))
+    openssl = FakeOpenssl(pair)
+
+    result = ensure_certificate_credential(
+        APP_ID, runner=fake, cert_runner=openssl, force=True
+    )
+
+    assert (result.created, result.generated) == (True, True)
+    assert result.thumbprint == pair["thumbprint"]
+    assert result.replaced_thumbprint == stale["thumbprint"]
+    assert stale["thumbprint"] in result.detail
+    assert openssl.invoked is True
+    assert [account for account, _ in forbid_keychain_writes] == [
+        secrets.ACCOUNT_CERT_PEM,
+        secrets.ACCOUNT_CERT_THUMBPRINT,
+    ]
+
+
+def test_forced_replacement_reports_the_orphan_in_the_json_payload(
+    pair: dict[str, str], fake_keychain: Any
+) -> None:
+    """The operator always sees which certificate just became an orphan."""
+    stale = stale_pair()
+    seed_pair(fake_keychain, stale)
+    result = ensure_certificate_credential(
+        APP_ID,
+        runner=FakeAz(upload_succeeds(pair)),
+        cert_runner=FakeOpenssl(pair),
+        force=True,
+    )
+    assert result.replaced_thumbprint == stale["thumbprint"]
+    assert result.to_dict()["replaced_thumbprint"] == stale["thumbprint"]
+
+
+def test_matching_pair_needs_no_force(
+    pair: dict[str, str],
+    fake_keychain: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The refusal guards *replacement*, not the step.
+
+    A pair whose thumbprint IS an app credential takes the ``exists`` path whether
+    or not ``force`` is set: forcing must not turn an idempotent re-run into a
+    re-key, which is the exact failure BUG2 was about.
+    """
+    seed_pair(fake_keychain, pair)
+    fake = app_holding_only(pair)
+    generated = _forbid_generate(monkeypatch)
+
+    result = ensure_certificate_credential(
+        APP_ID, runner=fake, cert_runner=FakeOpenssl(pair), force=True
+    )
+
+    assert result.outcome == OUTCOME_EXISTS
+    assert generated["calls"] == 0
+    assert fake.reset_calls == []
+
+
+def test_no_keychain_pair_needs_no_force(
+    pair: dict[str, str], fake_keychain: Any
+) -> None:
+    """The refusal protects *existing* material: with nothing stored there is
+    nothing to destroy, so the documented generate+upload path stands."""
+    fake = FakeAz(upload_succeeds(pair))
+    result = ensure_certificate_credential(
+        APP_ID, runner=fake, cert_runner=FakeOpenssl(pair)
+    )
+    assert (result.created, result.generated) == (True, True)
+
+
+def test_refusal_order_recording_runner_first_then_force(
+    pair: dict[str, str],
+    fake_keychain: Any,
+    forbid_keychain_writes: list[tuple[str, str]],
+) -> None:
+    """A dry run must still get the *dry-run* refusal even on the write path.
+
+    Without this order a ``--dry-run`` against a stale pair would raise the
+    force-refusal, whose "re-run with --force" advice is exactly the wrong
+    suggestion for a run that promised to change nothing.
+    """
+    stale = stale_pair()
+    seed_pair(fake_keychain, stale)
+    dry = DryRunRunner({("az", "ad", "app", "credential", "list"): "[]"})
+
+    with pytest.raises(CertUploadError, match="records commands instead of executing"):
+        ensure_certificate_credential(APP_ID, runner=dry, cert_runner=FakeOpenssl(pair))
+
+    assert forbid_keychain_writes == []
+
+
+def test_stale_pair_refusal_is_exported_from_the_admin_package() -> None:
+    """B5 prints one column per step; the refusal has to be reachable from there."""
+    from micro_notify.admin import certupload as package_certupload
+
+    assert package_certupload.StaleKeyPairRefusal is StaleKeyPairRefusal
+
+
+def test_refusal_is_not_a_credential_failure() -> None:
+    """The pair is fine — the invocation is what changes (ruling: usage family)."""
+    assert not issubclass(StaleKeyPairRefusal, CertUploadError)
+    assert issubclass(StaleKeyPairRefusal, UsageError)

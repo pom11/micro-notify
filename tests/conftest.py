@@ -599,10 +599,24 @@ class FakeKeychain:
     # :func:`secrets.has` run unchanged on top of it and decide the verdict.
     def get(self, account: str, **_kwargs: Any) -> str:
         self.audit.append(account)
+        # Separate from `audit` because a test pins *how often* a pair probe reads
+        # each account: one read that yields both the verdict and the value is the
+        # no-TOCTOU rule, and `audit` also carries writes and deletes.
+        self.probe_reads.append(account)
+        # The same exit-code rule the real module applies to security(1): 44 is a
+        # proven absence, anything else is a read that could not be answered. A
+        # fake that got this backwards would let a fail-closed caller pass its own
+        # reducer, which is precisely the B6 bug.
         if account in self.read_failures:
-            raise secrets.KeychainError(
+            code = self.read_failures[account]
+            error = (
+                secrets.KeychainItemMissing
+                if code == secrets.EXIT_ITEM_NOT_FOUND
+                else secrets.KeychainError
+            )
+            raise error(
                 f"keychain read failed for account '{account}' "
-                f"(service '{secrets.SERVICE}', exit {self.read_failures[account]})"
+                f"(service '{secrets.SERVICE}', exit {code})"
             )
         if account not in self.items:
             raise secrets.KeychainItemMissing(
