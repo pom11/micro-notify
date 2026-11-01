@@ -2451,3 +2451,58 @@ def test_an_exists_event_without_a_name_falls_back_to_the_derived_one() -> None:
     )
     assert result.ok is True, result.failures
     assert result.scope_name == DERIVED_DASHED
+
+
+def test_a_script_death_that_is_not_a_duplicate_keeps_the_re_run_advice() -> None:
+    """The re-run sentence stays exactly where it is true. A transient stream death
+    or any other cmdlet that threw is not a scope problem, and dressing it up as one
+    would send the operator to Get-ManagementScope for a network blip - the reverse
+    of the mistake being fixed."""
+    for text in (
+        DEAD_CONNECT_ERROR,
+        "Get-Mailbox: The operation has timed out",
+        "Test-ServicePrincipalAuthorization: Cannot bind argument to parameter "
+        "'Identity' because it is an empty string.",
+    ):
+        assert exo.is_duplicate_scope_refusal(text) is False, text
+        lines = [
+            DEVICE_CODE_LINE,
+            event(event="connected"),
+            event(event="service_principal", outcome="exists", found=1),
+            event(event="error", reason=text),
+        ]
+        result = parse_pwsh_output(capture_of(lines).lines, script=dashed_script())
+        assert result.reason == exo.REASON_SCRIPT_DIED, text
+
+
+def test_the_duplicate_refusal_needs_both_halves_of_the_sentence() -> None:
+    """The markers are two, and both have to be present. ``recipientroot`` alone
+    appears in ordinary parameter-binding errors, and "management scope" appears in
+    almost every scope error - either one on its own would hand a random cmdlet death
+    the duplicate-scope verdict, which is the misreporting this slice removes."""
+    assert exo.is_duplicate_scope_refusal(DUPLICATE_SCOPE_ERROR) is True
+    assert exo.is_duplicate_scope_refusal(
+        "New-ManagementScope: cannot bind the RecipientRoot parameter"
+    ) is False
+    assert exo.is_duplicate_scope_refusal(
+        "Get-ManagementScope: use the existing management scope cmdlet instead"
+    ) is False
+    assert exo.is_duplicate_scope_refusal("") is False
+
+
+def test_the_duplicate_reason_is_a_hint_of_its_own_and_names_no_re_run_lie() -> None:
+    """The verdict table, not just the string: the new reason is a key of its own,
+    and it is the only entry that does not tell the operator the scope is fine. The
+    other four keep their text verbatim, so the advice that was true before is the
+    advice that is true now."""
+    assert exo.REASON_SCOPE_DUPLICATE in exo.COULD_NOT_VERIFY_HINTS
+    hint = exo.COULD_NOT_VERIFY_HINTS[exo.REASON_SCOPE_DUPLICATE]
+    assert "New-ManagementScope" in hint and "duplicate" in hint.casefold()
+    assert "NOT a scope problem" not in hint
+    for reason in (
+        exo.REASON_CONNECT_TRANSIENT,
+        exo.REASON_CONNECT_FAILED,
+        exo.REASON_SCRIPT_DIED,
+        exo.REASON_CHECK_UNANSWERED,
+    ):
+        assert "NOT a scope problem" in exo.COULD_NOT_VERIFY_HINTS[reason], reason

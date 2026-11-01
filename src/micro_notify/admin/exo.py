@@ -151,6 +151,33 @@ REASON_CONNECT_TRANSIENT = "connect-transient"  # the network blipped: re-run
 REASON_CONNECT_FAILED = "connect-failed"        # re-running will not help
 REASON_SCRIPT_DIED = "script-died"              # threw before answering
 REASON_CHECK_UNANSWERED = "check-unanswered"    # a check came back 'Not Run'
+REASON_SCOPE_DUPLICATE = "scope-duplicate"      # Exchange refused a duplicate scope
+
+# Exchange's duplicate-scope refusal (BUG 7a, live re-run). ``New-ManagementScope``
+# answers this when a scope with the same RecipientRoot and RecipientFilter already
+# exists under another name — which is what the hand-built ADMIN-SETUP 2.4 scope
+# does for any sender whose local part sanitises differently from the name a human
+# typed. Two markers, both required: the first is Exchange's own "these two are the
+# same scope" sentence, the second is the advice only that refusal carries. A single
+# loose word would catch unrelated cmdlet errors and hand them the wrong advice.
+_DUPLICATE_SCOPE_MARKERS: tuple[str, ...] = (
+    "same recipientroot",
+    "use the existing management scope",
+)
+
+
+def is_duplicate_scope_refusal(text: str) -> bool:
+    """Whether an error reads as Exchange refusing a scope as a duplicate.
+
+    The one case where the death IS about the scope, and where "this is not a
+    scope problem, re-run" sends the operator somewhere else: the tenant already
+    has the scope and the run tried to make a second copy of it.
+    """
+    if not text:
+        return False
+    folded = text.casefold()
+    return all(marker in folded for marker in _DUPLICATE_SCOPE_MARKERS)
+
 
 # The one list of what counts as a transient connect failure. The generated
 # script's retry gate and the Python-side classifier both read it, so the retry
@@ -898,6 +925,19 @@ COULD_NOT_VERIFY_HINTS: dict[str, str] = {
         "rows), so the restriction is unproven. This is NOT a scope problem — re-run; "
         "a check that did not answer can never be read as a pass"
     ),
+    # The one entry that does not say "NOT a scope problem", because it is not true
+    # here: the run died inside New-ManagementScope, and what refused it was a scope
+    # the tenant already has. The sentence names the cmdlet that threw and what to
+    # do about the tenant, instead of sending the operator off to re-run a run that
+    # cannot change (the live BUG 7a report did exactly that).
+    REASON_SCOPE_DUPLICATE: (
+        "New-ManagementScope refused the scope as a duplicate of an existing scope "
+        "with the same recipient filter — the tenant already has a management scope "
+        "for this sender under another name, and this run could not match it by "
+        "name or filter. This IS the scope problem: list the scopes filtering on "
+        "this sender (Get-ManagementScope) and keep exactly the one whose filter "
+        "matches, then re-run"
+    ),
 }
 
 
@@ -1482,9 +1522,16 @@ def parse_pwsh_output(
     elif not checks_ran:
         # Connected, then the script threw before a control was tested: the
         # restriction is unproven, and re-running may or may not help - the quoted
-        # exception is what the operator has to go on.
+        # exception is what the operator has to go on. One death gets different
+        # advice: an Exchange duplicate-scope refusal was raised *by* the scope step,
+        # so calling it "NOT a scope problem, re-run" (the live BUG 7a report) sent
+        # the operator away from the one thing on the tenant that was wrong.
         verified = False
-        reason = REASON_SCRIPT_DIED
+        reason = (
+            REASON_SCOPE_DUPLICATE
+            if any(is_duplicate_scope_refusal(text) for text in error_texts)
+            else REASON_SCRIPT_DIED
+        )
     elif not answered:
         # Both controls were asked and at least one came back with no usable InScope
         # ('Not Run', an empty row set, rows of null). The B4 rule, extended to the
@@ -1619,6 +1666,7 @@ __all__ = [
     "REASON_CHECK_UNANSWERED",
     "REASON_CONNECT_FAILED",
     "REASON_CONNECT_TRANSIENT",
+    "REASON_SCOPE_DUPLICATE",
     "REASON_SCRIPT_DIED",
     "SERVICE_PRINCIPAL_DISPLAY_NAME",
     "StreamingCommandRunner",
@@ -1628,6 +1676,7 @@ __all__ = [
     "build_script",
     "ensure_exchange_scope",
     "is_transient_connect_error",
+    "is_duplicate_scope_refusal",
     "parse_authz_rows",
     "parse_pwsh_output",
     "plan_commands",
