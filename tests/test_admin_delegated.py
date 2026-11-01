@@ -1445,6 +1445,9 @@ def test_the_shipped_dry_run_answers_plan_a_whole_delegated_run(
     assert recorder.executed_anything is False
     printed = capsys.readouterr().out
     assert "permission add" in printed
+    # The confirming read is part of the plan too: an operator who cannot see it
+    # cannot tell "the add exited 0" from "the tenant shows the scope declared".
+    assert "az ad app permission list --id" in printed, printed
     assert "isFallbackPublicClient=true" in printed
     assert "permission grant" not in printed, "planned a consent nobody asked for"
     assert "ManagementScope" not in printed, "planned app mode's Exchange work"
