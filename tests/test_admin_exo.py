@@ -2060,3 +2060,449 @@ def test_the_b6b_transcript_shape_is_a_green_run_not_a_refused_sign_in(
     # can never be inside an attempt's delta again.
     assert "Import-Module ExchangeOnlineManagement -ErrorAction Stop" in script().text
     assert "Select-Object -First ($Error.Count - $MnotifyErrBefore)" in script().text
+
+
+# ===========================================================================
+# BUG 7a (live re-run, operator-verified on c324d8f): the scope was already
+# there under a DIFFERENT name
+#
+# The hand-built ADMIN-SETUP §2.4 scope for a `no-reply@…` sender is called
+# ``mnotify-noreply``; ``scope_name_for()`` derives ``mnotify-no-reply`` from
+# the same address, because a dash is a legal scope character and is therefore
+# kept. Step 2's Get-before-New matched on the NAME alone, missed the existing
+# scope, and ``New-ManagementScope`` answered with Exchange's duplicate-scope
+# refusal ("has the same RecipientRoot, RecipientFilter ... Use the existing
+# management scope instead"). The idempotency contract - re-run on a configured
+# tenant, every step exists, exit 0 - broke for every sender whose local part
+# sanitises differently from the name a human typed.
+#
+# The fix is to look the scope up by what it IS (its sender filter) and adopt
+# its real name, never to rename anything on the tenant. Three shapes are
+# pinned: exactly one match (adopt, never create), more than one (refuse loudly,
+# never pick), and the death itself (say what threw instead of blaming the scope).
+# ===========================================================================
+
+# The live shape: the address has a dash, the hand-created scope name dropped it.
+SENDER_DASHED = "no-reply@example.com"
+DERIVED_DASHED = exo.scope_name_for(SENDER_DASHED)   # 'mnotify-no-reply'
+ADOPTED_SCOPE = "mnotify-noreply"                    # what the tenant actually calls it
+
+# Exchange's refusal, in the words the live run printed (placeholders only).
+DUPLICATE_SCOPE_ERROR = (
+    "New-ManagementScope: Cannot bind parameter because management scope "
+    "'mnotify-no-reply' has the same RecipientRoot, RecipientFilter or "
+    "ConfigurationSet as the existing scope 'mnotify-noreply'. Use the "
+    "existing management scope instead."
+)
+
+
+def sender_filter(sender: str) -> str:
+    """The one filter string that identifies the scope for one sender mailbox."""
+    return f"PrimarySmtpAddress -eq '{sender}'"
+
+
+def scope_row(name: str, *, filter_prop: str = "RecipientRestrictionFilter",
+              filter_value: str | None = None) -> dict:
+    """One ``Get-ManagementScope`` result, as the tenant would return it."""
+    row: dict[str, Any] = {"Name": name}
+    row[filter_prop] = sender_filter(SENDER_DASHED) if filter_value is None else filter_value
+    return row
+
+
+# The generated candidate predicate: `Get-ManagementScope | Where-Object { ... }`.
+_STEP2_PREDICATE_RE = re.compile(
+    r"\$MnotifyScopes\s*=\s*@\(\s*Get-ManagementScope\s*\|\s*Where-Object\s*\{(?P<pred>.*?)\n\s*\}\)",
+    re.S,
+)
+# One term of that predicate: `"$($_.SomeProperty)" -eq $MnotifySomething`.
+_TERM_RE = re.compile(
+    r'"\$\(\$_\.(?P<prop>\w+)\)"\s+-eq\s+\$(?P<var>Mnotify\w+)'
+)
+
+
+def scope_candidate_predicate(text: str) -> list[tuple[str, str]]:
+    """The (property, script-variable) pairs step 2 matches a scope on.
+
+    Read out of the generated script and interpreted here, the same way the
+    ``$Error`` slice test above reads the retry gate: the verdict is the script's,
+    not the test's. Only ``"$($_.Prop)" -eq $Var`` terms joined by ``-or`` are
+    understood - anything else (a fuzzy ``-like``, a tenant-side filter the local
+    match cannot see) fails the pin loudly rather than being silently skipped.
+    """
+    match = _STEP2_PREDICATE_RE.search(text)
+    assert match, "step 2 no longer enumerates Get-ManagementScope through a Where-Object"
+    pred = match.group("pred")
+    terms = [(m.group("prop"), m.group("var")) for m in _TERM_RE.finditer(pred)]
+    remainder = _TERM_RE.sub(" ", pred)
+    for junk in ("-and", "-like", "-match", "-contains", "-not", "-replace"):
+        assert junk not in remainder.lower(), f"unsupported operator {junk} in the candidate test"
+    assert remainder.replace("-or", " ").strip() == "", (
+        f"the candidate predicate carries text that is not a `-eq` term or an `-or`: "
+        f"{remainder!r}"
+    )
+    assert terms, "the candidate predicate matches on nothing at all"
+    return terms
+
+
+def scope_step2(text: str, scopes: list[dict], *, sender: str) -> tuple[str, Any]:
+    """What generated step 2 would do with ``scopes``: adopt, refuse, or create.
+
+    Mirrors the branch structure the same function pins (a ``-gt 0`` guard, an
+    ambiguity guard that throws before anything is adopted, and an else-branch
+    ``New-ManagementScope``), so the answer is the script's decision.
+    """
+    terms = scope_candidate_predicate(text)
+    variables = {"MnotifyScope": DERIVED_DASHED, "MnotifyFilter": sender_filter(sender)}
+    candidates = []
+    for row in scopes:
+        for prop, var in terms:
+            if str(row.get(prop, "") or "").casefold() == variables[var].casefold():
+                candidates.append(row)
+                break
+
+    assert "if ($MnotifyScopes.Count -gt 0) {" in text, (
+        "step 2 lost the count guard that keeps New-ManagementScope behind the Get"
+    )
+    ambiguous = re.search(
+        r"if \(\$MnotifyScopes\.Count -gt 1\) \{(?P<guard>.*?)\}", text, re.S
+    )
+    assert ambiguous, "step 2 has no ambiguity guard for several matching scopes"
+    guard = ambiguous.group("guard")
+    adoption_line = text.index('$MnotifyScope = "$($MnotifyScopes[0].Name)"')
+    assert text.index("if ($MnotifyScopes.Count -gt 1) {") < adoption_line, (
+        "the ambiguity guard must throw before a scope is adopted"
+    )
+    assert "Stop-Mnotify 'management_scope'" in guard, (
+        "an ambiguous scope match must stop the step, not carry on to the assignment"
+    )
+    assert adoption_line < text.index("Get-ManagementRoleAssignment"), (
+        "the adopted name must be in place before step 3 matches on it"
+    )
+
+    if len(candidates) > 1:
+        return ("ambiguous", [str(row["Name"]) for row in candidates])
+    if len(candidates) == 1:
+        return ("exists", str(candidates[0]["Name"]))
+    return ("created", None)
+
+
+def ambiguity_reason(text: str, *, sender: str, names: list[str]) -> str:
+    """The reason string the generated script would print for these candidates."""
+    guard = re.search(r"if \(\$MnotifyScopes\.Count -gt 1\) \{(?P<guard>.*?)\}", text, re.S)
+    assert guard, "step 2 has no ambiguity guard"
+    line = re.search(r"Stop-Mnotify\s+'management_scope'\s+\"(?P<reason>[^\"]+)\"", guard.group("guard"))
+    assert line, "the ambiguity guard does not report a reason naming the scopes"
+    reason = line.group("reason")
+    for token, value in (
+        ("$MnotifyAmbiguous", ", ".join(names)),
+        ("$MnotifySender", sender),
+    ):
+        assert token in reason, f"the ambiguity reason never names {token}"
+        reason = reason.replace(token, value)
+    return reason
+
+
+def adopted_scope_lines(name: str = ADOPTED_SCOPE) -> list[str]:
+    """A re-run transcript whose scope step reports the name it actually adopted.
+
+    The authorization rows keep the scope they were answered for - the tenant's
+    real name - so the check only holds if the parser reads that name too.
+    """
+    lines = pwsh_lines(sp=OUTCOME_EXISTS, scope=OUTCOME_EXISTS, role=OUTCOME_EXISTS)
+    for index, line in enumerate(lines):
+        if '"event":"management_scope"' in line:
+            lines[index] = event(
+                event="management_scope", outcome="exists", found=1, name=name
+            )
+    return lines
+
+
+def dashed_script() -> ExchangeScript:
+    """The script for the sender the live tenant has: a dash in the local part."""
+    return build_script(
+        APP_ID, SP_OBJECT_ID, SENDER_DASHED, admin_mailbox=ADMIN_MAILBOX
+    )
+
+
+def test_the_derived_scope_name_is_not_the_name_the_tenant_uses() -> None:
+    """The premise of every test below, pinned so a change to the derivation is
+    noticed here and not on a live tenant: for ``no-reply@…`` the derived name is
+    ``mnotify-no-reply`` and the hand-built scope is ``mnotify-noreply``."""
+    assert DERIVED_DASHED == "mnotify-no-reply"
+    assert ADOPTED_SCOPE == "mnotify-noreply"
+    assert DERIVED_DASHED != ADOPTED_SCOPE
+    assert dashed_script().scope_name == DERIVED_DASHED
+
+
+def test_step2_adopts_the_existing_scope_that_filters_on_the_same_sender() -> None:
+    """One scope, right filter, different name: adopt it, create nothing.
+
+    This is the live re-run. The tenant already has ``mnotify-noreply`` carrying
+    ``PrimarySmtpAddress -eq 'no-reply@example.com'``; the run that derives
+    ``mnotify-no-reply`` must find the first one by its filter, report it under
+    its real name, and never call ``New-ManagementScope`` - which is the call
+    that produced the duplicate-scope refusal.
+    """
+    text = dashed_script().text
+    action, name = scope_step2(
+        text, [scope_row(ADOPTED_SCOPE)], sender=SENDER_DASHED
+    )
+    assert action == "exists", f"step 2 chose {action!r} instead of adopting the scope"
+    assert name == ADOPTED_SCOPE, name
+    # The candidate test looks at the filter as well as the name, and the filter
+    # is the one this sender's address produces.
+    props = {prop for prop, _ in scope_candidate_predicate(text)}
+    assert "RecipientRestrictionFilter" in props, props
+    assert "Name" in props, props
+
+
+def test_step2_adopts_a_scope_whose_filter_lives_on_recipientfilter() -> None:
+    """Some scopes carry the filter on ``RecipientFilter`` instead. The lookup has
+    to read either property, or the same tenant answers differently depending on
+    how the scope was built."""
+    text = dashed_script().text
+    action, name = scope_step2(
+        text,
+        [scope_row(ADOPTED_SCOPE, filter_prop="RecipientFilter")],
+        sender=SENDER_DASHED,
+    )
+    assert (action, name) == ("exists", ADOPTED_SCOPE)
+
+
+def test_step2_creates_when_no_scope_matches_the_name_or_the_filter() -> None:
+    """The untouched path: a fresh tenant has neither the derived name nor the
+    sender filter, so ``New-ManagementScope`` still runs with the derived name."""
+    text = dashed_script().text
+    unrelated = scope_row(
+        "mnotify-other", filter_value="PrimarySmtpAddress -eq 'someone@contoso.com'"
+    )
+    action, name = scope_step2(text, [unrelated], sender=SENDER_DASHED)
+    assert (action, name) == ("created", None)
+    assert (
+        "$null = New-ManagementScope -Name $MnotifyScope "
+        "-RecipientRestrictionFilter $MnotifyFilter" in text
+    )
+
+
+def test_step3_binds_the_role_assignment_to_the_adopted_scope_name() -> None:
+    """Adoption is worthless if step 3 still asks for the derived name: Exchange
+    would refuse the assignment, and the re-run would create a second scope-or-
+    assignment every time. The reassignment must land before step 3 runs."""
+    text = dashed_script().text
+    adoption = text.index('$MnotifyScope = "$($MnotifyScopes[0].Name)"')
+    step3 = text.index("Get-ManagementRoleAssignment")
+    assert adoption < step3
+    assignment = [ln for ln in text.splitlines() if "New-ManagementRoleAssignment" in ln]
+    assert assignment and " -CustomResourceScope $MnotifyScope" in assignment[0]
+    assert '"$($_.CustomResourceScopeName)" -eq $MnotifyScope' in text[step3:]
+
+
+def test_the_scope_exists_event_reports_the_adopted_name_in_its_real_name() -> None:
+    """The generated event for the adopt path carries ``name=``: the operator (and
+    the Python report) must see the name the tenant uses, not the one we guessed."""
+    text = dashed_script().text
+    event_line = [
+        ln for ln in text.splitlines()
+        if "event = 'management_scope'" in ln and "exists" in ln
+    ]
+    assert event_line, "step 2 no longer reports an exists event"
+    assert "name = $MnotifyScope" in event_line[0], event_line[0]
+
+
+def test_an_ambiguous_scope_match_refuses_and_names_every_candidate() -> None:
+    """Two scopes, same sender filter: picking one would bind the app to a scope
+    this run did not choose, and the other one keeps the tenant's behaviour. The
+    step must fail loudly and name both, so the operator can resolve the tenant."""
+    text = dashed_script().text
+    names = ["mnotify-noreply", "mnotify-noreply-2"]
+    scopes = [scope_row(n) for n in names]
+    action, picked = scope_step2(text, scopes, sender=SENDER_DASHED)
+    assert action == "ambiguous", f"step 2 picked {picked!r} out of two candidates"
+    reason = ambiguity_reason(text, sender=SENDER_DASHED, names=names)
+    for name in names:
+        assert name in reason, f"the failure reason does not name {name!r}: {reason!r}"
+
+
+def test_an_ambiguous_scope_failure_is_reported_loudly_by_the_parser() -> None:
+    """The same transcript, end to end: ``ok`` False, both names in the report, and
+    nothing read as created - a refused step is not a step that succeeded."""
+    lines = [ln for ln in pwsh_lines(sp=OUTCOME_EXISTS, role=OUTCOME_EXISTS)
+             if '"event":"management_scope"' not in ln]
+    names = ["mnotify-noreply", "mnotify-noreply-2"]
+    lines.insert(
+        len(lines) - 1,
+        event(
+            event="failure",
+            step="management_scope",
+            reason=ambiguity_reason(dashed_script().text, sender=SENDER_DASHED, names=names),
+        ),
+    )
+    result = parse_pwsh_output(capture_of(lines).lines, script=dashed_script())
+    assert result.ok is False
+    assert any("management_scope" in f for f in result.failures)
+    joined = " ".join(result.failures)
+    for name in names:
+        assert name in joined, f"{name!r} missing from the report: {result.failures}"
+    assert result.management_scope.created is False
+    assert result.created is False, "a refused scope step must not read as created"
+
+
+def test_a_duplicate_scope_death_blames_the_cmdlet_that_threw(temp_dir: Path) -> None:
+    """The verdict the live operator got was wrong twice over: it said "this is NOT
+    a scope problem - re-run" for a failure that WAS about the scope, and it never
+    said which cmdlet refused. When the transcript carries Exchange's duplicate-
+    scope refusal the message has to name ``New-ManagementScope`` and the
+    duplication, and must not tell anyone to re-run a run that cannot change."""
+    lines = [
+        "mnotify: connecting to Exchange Online (device-code sign-in).",
+        DEVICE_CODE_LINE,
+        event(event="connected"),
+        event(event="service_principal", outcome="exists", found=1),
+        event(event="error", reason=DUPLICATE_SCOPE_ERROR),
+    ]
+    fake = FakePwsh(lines, returncode=1)
+    with pytest.raises(ExchangeError) as excinfo:
+        ensure_exchange_scope(
+            APP_ID, SP_OBJECT_ID, SENDER_DASHED, ADMIN_MAILBOX, runner=fake
+        )
+    message = excinfo.value.message
+    assert "New-ManagementScope" in message
+    assert "duplicate" in message.casefold()
+    assert "NOT a scope problem" not in message, (
+        "the duplicate-scope refusal IS a scope problem: the re-run advice is a lie"
+    )
+    assert excinfo.value.result.ok is False
+
+
+def adopted_transcript(
+    name: str = ADOPTED_SCOPE, *, with_name: bool = True
+) -> list[str]:
+    """A re-run of a tenant whose scope has ``name``: every object exists, the
+    scope step reports the name it adopted, and the authorization rows are
+    answered through that same name (that is what the tenant does).
+
+    ``with_name=False`` is a transcript from a script that predates the ``name=``
+    field, and then the rows carry the derived name - what the tenant answered is
+    keyed to the scope the run itself named.
+    """
+    row_scope = name if with_name else DERIVED_DASHED
+    lines: list[str] = [
+        "mnotify: connecting to Exchange Online (device-code sign-in).",
+        DEVICE_CODE_LINE,
+        event(event="connected"),
+        event(event="service_principal", outcome="exists", found=1),
+    ]
+    payload: dict[str, Any] = {"event": "management_scope", "outcome": "exists", "found": 1}
+    if with_name:
+        payload["name"] = name
+    lines.append(event(**payload))
+    lines.append(event(event="role_assignment", outcome="exists", found=1))
+    lines.append(
+        event(event="authz", control="sender", resource=SENDER_DASHED,
+              rows=to_json_rows([authz_row("True", scope=row_scope)]))
+    )
+    lines.append(
+        event(event="authz", control="admin", resource=ADMIN_MAILBOX,
+              rows=to_json_rows([authz_row("False", scope=row_scope)]))
+    )
+    lines.append(event(event="disconnected"))
+    lines.append(event(event="summary", ok=True))
+    return lines
+
+
+def test_the_report_carries_the_adopted_scope_name_not_the_derived_one() -> None:
+    """S3 end to end: an idempotent re-run whose tenant spells the scope differently
+    is GREEN and says so in the tenant's spelling. The scope the operator is told
+    about has to be the one that exists - reporting the derived name would point
+    them at a scope that is not on the tenant, and the authorization rows come back
+    through the adopted name, so the scope comparison has to follow it too."""
+    result = parse_pwsh_output(
+        capture_of(adopted_transcript()).lines, script=dashed_script()
+    )
+    assert result.ok is True, result.failures
+    assert result.created is False and result.outcome == OUTCOME_EXISTS
+    assert result.scope_name == ADOPTED_SCOPE
+    assert ADOPTED_SCOPE in result.detail and DERIVED_DASHED not in result.detail
+    assert "already present" in result.detail
+    payload = result.to_dict()
+    assert payload["scope_name"] == ADOPTED_SCOPE
+    # The proof is read against the adopted name: a True row through it is a pass.
+    assert result.sender_check.expected_scope == ADOPTED_SCOPE
+    assert result.sender_check.passed and result.admin_check.passed
+
+
+def test_a_created_scope_is_reported_under_the_derived_name() -> None:
+    """The fallback, and the only direction that can create: with nothing to adopt
+    the run names the scope itself, so the report keeps the derived name."""
+    lines = adopted_transcript(with_name=False)
+    lines[4] = event(event="management_scope", outcome="created", found=0)
+    lines[5] = event(event="role_assignment", outcome="created", found=0)
+    result = parse_pwsh_output(capture_of(lines).lines, script=dashed_script())
+    assert result.ok is True, result.failures
+    assert result.created is True
+    assert result.scope_name == DERIVED_DASHED
+
+
+def test_an_exists_event_without_a_name_falls_back_to_the_derived_one() -> None:
+    """A transcript from a script that predates the ``name=`` field must still read
+    as the re-run it is - the missing field is not a failure and not a rename."""
+    result = parse_pwsh_output(
+        capture_of(adopted_transcript(with_name=False)).lines, script=dashed_script()
+    )
+    assert result.ok is True, result.failures
+    assert result.scope_name == DERIVED_DASHED
+
+
+def test_a_script_death_that_is_not_a_duplicate_keeps_the_re_run_advice() -> None:
+    """The re-run sentence stays exactly where it is true. A transient stream death
+    or any other cmdlet that threw is not a scope problem, and dressing it up as one
+    would send the operator to Get-ManagementScope for a network blip - the reverse
+    of the mistake being fixed."""
+    for text in (
+        DEAD_CONNECT_ERROR,
+        "Get-Mailbox: The operation has timed out",
+        "Test-ServicePrincipalAuthorization: Cannot bind argument to parameter "
+        "'Identity' because it is an empty string.",
+    ):
+        assert exo.is_duplicate_scope_refusal(text) is False, text
+        lines = [
+            DEVICE_CODE_LINE,
+            event(event="connected"),
+            event(event="service_principal", outcome="exists", found=1),
+            event(event="error", reason=text),
+        ]
+        result = parse_pwsh_output(capture_of(lines).lines, script=dashed_script())
+        assert result.reason == exo.REASON_SCRIPT_DIED, text
+
+
+def test_the_duplicate_refusal_needs_both_halves_of_the_sentence() -> None:
+    """The markers are two, and both have to be present. ``recipientroot`` alone
+    appears in ordinary parameter-binding errors, and "management scope" appears in
+    almost every scope error - either one on its own would hand a random cmdlet death
+    the duplicate-scope verdict, which is the misreporting this slice removes."""
+    assert exo.is_duplicate_scope_refusal(DUPLICATE_SCOPE_ERROR) is True
+    assert exo.is_duplicate_scope_refusal(
+        "New-ManagementScope: cannot bind the RecipientRoot parameter"
+    ) is False
+    assert exo.is_duplicate_scope_refusal(
+        "Get-ManagementScope: use the existing management scope cmdlet instead"
+    ) is False
+    assert exo.is_duplicate_scope_refusal("") is False
+
+
+def test_the_duplicate_reason_is_a_hint_of_its_own_and_names_no_re_run_lie() -> None:
+    """The verdict table, not just the string: the new reason is a key of its own,
+    and it is the only entry that does not tell the operator the scope is fine. The
+    other four keep their text verbatim, so the advice that was true before is the
+    advice that is true now."""
+    assert exo.REASON_SCOPE_DUPLICATE in exo.COULD_NOT_VERIFY_HINTS
+    hint = exo.COULD_NOT_VERIFY_HINTS[exo.REASON_SCOPE_DUPLICATE]
+    assert "New-ManagementScope" in hint and "duplicate" in hint.casefold()
+    assert "NOT a scope problem" not in hint
+    for reason in (
+        exo.REASON_CONNECT_TRANSIENT,
+        exo.REASON_CONNECT_FAILED,
+        exo.REASON_SCRIPT_DIED,
+        exo.REASON_CHECK_UNANSWERED,
+    ):
+        assert "NOT a scope problem" in exo.COULD_NOT_VERIFY_HINTS[reason], reason
