@@ -924,12 +924,12 @@ For the same reason `--control-mailbox` is not part of this mode, and the two `p
 pre-flight checks are skipped: a route that never calls PowerShell must not be refused by
 a machine that cannot run it. App mode still requires both.
 
-`--force` belongs to the certificate step and therefore does nothing here. It is accepted
-rather than refused — a delegated run parses the same flag set as app mode — but with no
-certificate step there is no key pair for it to replace and nothing for it to authorise. The
-refusal table below is the whole of what this mode refuses; the certificate row in app mode's
-table has no delegated counterpart, and the config refusal is answered by `--force-config`
-exactly as in app mode.
+`--force` belongs to the certificate step and therefore does nothing here: with no certificate
+step there is no key pair for it to replace and nothing for it to authorise. It is accepted
+rather than refused — a delegated run parses the same flag set as app mode — so nothing in the
+table below should be read as needing it. The certificate row in app mode's refusal table has
+no delegated counterpart, and the config refusal is answered by `--force-config` exactly as in
+app mode.
 
 ### `Allow public client flows` — conditional, and this is the only place it is set
 
