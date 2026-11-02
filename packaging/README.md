@@ -69,26 +69,6 @@ Keeping the pins current is a manual step: when a `pyproject.toml` dependency
 changes, refresh the resource blocks and run the suite. The pinned versions in
 this repo were taken from PyPI's own sdists and digests.
 
-## The private-tap caveat (read this before pointing an agent at it)
-
-`pom11/homebrew-micro-notify` is currently a **private** repository. Until the
-operator flips it public at v0.1.0, `brew install` needs authenticated git on
-the machine running it — otherwise `brew tap` fails with an authentication or
-"repository not found" error that looks like a broken formula. Either works:
-
-- the GitHub CLI credential helper: `gh auth setup-git` (then plain HTTPS git
-  against github.com carries your `gh` login), or
-- an SSH key added to your GitHub account, together with the usual git
-  `insteadOf` rewrite so HTTPS GitHub URLs are fetched over SSH — set the SSH
-  remote base as the replacement value for `https://github.com/` in
-  `git config --global url.<ssh-remote-base>.insteadOf https://github.com/`.
-
-Because a private tap cannot be installed anonymously, the documented fallback
-for anyone without access to the tap is a from-source install into their own
-virtualenv — `pip install` from a clone of the repo, as the README describes.
-The formula and the tap are the convenience path for the operator's own
-machines; they are not the only supported way to install.
-
 ## Preparing a release
 
 Run from a clean checkout of the repo you intend to release:

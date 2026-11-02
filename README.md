@@ -42,12 +42,7 @@ The honest limits, before you choose:
 brew install pom11/micro-notify/micro-notify
 ```
 
-Until the v0.1.0 visibility flip both `pom11/micro-notify` and its tap
-`pom11/homebrew-micro-notify` are **private**, so that command only works for someone
-with access to the tap and with git authenticated to GitHub (`gh auth setup-git`, or
-an SSH key registered for the tap). If you cannot authenticate to GitHub, install
-from a checkout of this repo instead — that is the unauthenticated path, and it is
-how the package is built from source:
+Prefer not to use Homebrew? Install from a checkout of this repo:
 
 ```sh
 git clone https://github.com/pom11/micro-notify.git
