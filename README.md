@@ -1,17 +1,40 @@
 # micro-notify
 
-`mnotify` is a command-line notifier for **agents and scripts**: it sends email from
-one Microsoft 365 mailbox through Microsoft Graph (app-only), and posts Teams
-messages through Workflows webhooks. No interactive sign-in, no per-agent Microsoft
-auth, no secrets in config files or environment variables.
+`mnotify` is a command-line notifier for **agents and scripts**: it sends email
+from a Microsoft 365 mailbox through Microsoft Graph, and posts Teams messages
+through Workflows webhooks or a delegated (signed-in-as-a-person) credential.
+Set the tenant up once and one Mac once, and from then on any script or agent can
+notify — no secret ever appears in a config file, a flag, or an environment
+variable.
 
 Design contract:
 [`docs/design/2026-10-27-micro-notify-design.md`](docs/design/2026-10-27-micro-notify-design.md)
-— cited below as §n. Admin-side (one-time, per tenant) setup:
+— cited below as §n. Admin-side (one-time, per tenant) setup for **both** modes —
+every manual portal step and every `az` / Exchange PowerShell command, plus the
+automated `mnotify admin bootstrap` equivalent:
 [`docs/ADMIN-SETUP.md`](docs/ADMIN-SETUP.md).
 
 Requires macOS (the secret store is the macOS keychain) and Python ≥ 3.12 if
 installing from source.
+
+## Which setup is for me?
+
+| What you want | Path | Set it up with | Needs a tenant admin? |
+| ------------- | ---- | -------------- | --------------------- |
+| A bot or shared mailbox that sends on its own; no human sign-in; the safest shape for automation | **App-only certificate** (shared mailbox) | `mnotify admin bootstrap --sender noreply@example.com --allow-domain example.com` — tenant objects, config and doctor in one command | Yes, once |
+| Messages that come **from you** — "as me" | **Delegated sign-in** | `mnotify admin bootstrap --mode delegated --sender me@contoso.com --allow-domain contoso.com`, then `mnotify login` on each machine | Once for the tenant; if the registration is already configured, `mnotify login` alone needs no admin |
+| Posts into a Teams **channel** | **Workflows webhook** target, `kind = channel` | create the Workflows template in Teams (ADMIN-SETUP step 4.1), then `mnotify teams targets add alerts --kind channel` | No — you need the channel, not the tenant |
+| A message to **one person**, or to a **1:1 / group chat** | webhook `kind = dm` (one shared DM workflow per tenant), **or** a `chat` target through your own sign-in | `mnotify teams targets add dm --kind dm`, or (delegated only) `mnotify teams chats add workchat --pick` | No for the webhook; a `chat` target requires you to be signed in (`mnotify login`) |
+
+The honest limits, before you choose:
+
+- **No files in Teams.** Attachments are email-only (`mnotify mail send --attach`,
+  total capped by `limits.max_attach_mb`, default 3 MB). `mnotify teams send` has no
+  attach flag — put a big file behind a `--link` button instead.
+- **A DM needs a webhook** (the one shared DM workflow) **or** a delegated `chat`
+  target; there is no bot-DM path that skips both.
+- **Send-only.** Nothing reads an inbox, a Teams reply, or chat history (§2).
+- **macOS only.** Secrets go to the macOS keychain via `/usr/bin/security`.
 
 ## Install
 
@@ -35,7 +58,7 @@ pip install .            # or: pipx install .
 Both names are installed: `mnotify` (the short form used everywhere below) and
 `micro-notify`. Confirm with `mnotify --version`.
 
-Dependencies are `msal` and `httpx`, nothing else (§3).
+Dependencies are `msal`, `cryptography` and `httpx`, nothing else (§3).
 
 ## Set up (one command, after the admin steps)
 
