@@ -8,12 +8,9 @@ tap formula pins by `sha256` (see `packaging/README.md`).
 
 ## [Unreleased]
 
-## [0.1.0] - unreleased
+## [0.1.0] - 2026-11-02
 
-First public release. The version bump itself is an operator-gated step
-(`pyproject.toml` and `src/micro_notify/__init__.py` must both say `0.1.0`
-before `scripts/release.py 0.1.0` will go through — the script refuses a
-mismatch).
+First public release.
 
 ### Added
 
