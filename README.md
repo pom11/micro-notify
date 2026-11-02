@@ -523,6 +523,80 @@ By design (§2 non-goals), and not an oversight:
 - **Reading Teams replies or interactive cards.** `--card-file` gives you a full
   Adaptive Card; buttons other than the single `Action.OpenUri` are your problem.
 
+## FAQ
+
+**`mnotify doctor` prints `token: warn — ... not verifiable from the token`. Is my setup broken?**
+No — in **app mode** that is the expected steady state, and it exits 0. The tenant
+hardening in ADMIN-SETUP step 3 *deliberately refuses* (removes) the tenant-wide
+Entra `Mail.Send` consent, so that the Exchange Online scoped role is the only
+thing limiting the app to one mailbox. That role is invisible to the Entra `roles`
+claim `doctor` reads, so the honest verdict is `warn`, not `pass`. **Do not
+re-grant the consent to silence the line** — that would undo the hardening. Prove
+the grant instead, with one guarded real send: `mnotify doctor --send-test
+<addr>` or plain `mnotify mail send`. A `token: fail` (exit 4) in app mode *is* a
+real fault: `AADSTS…` names a credential problem, and a `roles` list naming other
+roles but not `Mail.Send` means someone re-granted the consent — undo it
+(ADMIN-SETUP 3.2).
+
+In **delegated mode** the same line means the opposite: there is no scoped-role
+story there, so a `token` check that fails (exit 4, "neither an access token nor a
+refresh token") genuinely means nobody is signed in — fix with `mnotify login`. A
+delegated `warn` (token expired but a refresh token cached) is benign: the next
+send refreshes silently, though `mnotify login` refreshes it now.
+
+`doctor` is mode-aware, and the two check lists are:
+
+| Mode | Checks, in run order |
+| ---- | -------------------- |
+| app (= `mode = "app"`, the default) | `config` → `keychain` → `teams` → `token` → `allow` → `send-test` |
+| delegated | `config` → `keychain` → `teams` → `token` → `scopes` → `sender` → `allow` → `send-test` |
+
+Checks run in that order and the run stops at the first `fail`, reporting the rest
+as `skipped`; each `fail` prints a `fix:` hint naming the command or admin step.
+`send-test` is `skipped` unless you pass `--send-test <addr>` — a green check for a
+send nobody asked for would overstate what `doctor` proved.
+
+**Can I attach a file to a Teams message?**
+No. Attachments are **email-only** (`mnotify mail send --attach`, total capped by
+`limits.max_attach_mb`, default 3 MB, refused with exit 3 above it). A Teams
+message carries a card; the card's place for a big file is a `--link URL
+--link-title "Report"` button pointing at a share.
+
+**Is the Teams Workflows webhook URL sensitive?**
+Yes — treat it as a password. The URL's query string carries a signature, and
+anyone holding it can post into the channel or as the Workflows bot. That is why
+`mnotify teams targets add` collects it only at a hidden prompt and stores it in
+the keychain (account `teams:<target>`, service `mnotify`), why the config file
+refuses values that look like URLs, and why `targets list` / `--dry-run` / the
+audit log show the URL only masked or absent. If a URL leaks:
+`mnotify teams targets remove <name>`, delete or recreate the workflow in Teams,
+`add` the new URL. (A `chat` target's `chat_id` is *not* a secret — it is a
+conversation address, and it sits in the config file.)
+
+**How do I rotate the certificate?**
+When Entra warns the credential is near expiry, re-run
+`mnotify setup --gen-cert --force` with the same `--tenant-id` / `--client-id` /
+`--sender` / `--allow-domain` values (or re-run `mnotify admin bootstrap`, which
+reuses the existing pair while it is valid), upload the newly printed public
+certificate in Entra, verify the new thumbprint, then remove the old certificate.
+Keep the old one until a real `mnotify mail send` succeeds — Entra accepts several
+credentials at once. Post-step-3 the `token` line is `warn` either way, so the
+rotation problem you are looking for is an `AADSTS…` detail (exit 4). Full
+walkthrough: ADMIN-SETUP, *Rotating the certificate*.
+
+**How do I sign out / revoke a delegated session?**
+`mnotify logout` deletes the local token cache (keychain account
+`graph.delegated_token_cache`) — that is the *local* revoke and it stops this Mac
+only. The hard, tenant-wide revoke is Entra's: Entra ID → Users → *\<user\>* →
+**Revoke sessions**, plus removing the delegated consent if you mean it forever.
+The command prints that sentence too, because calling `logout` a full revoke would
+be a claim it cannot support.
+
+**`mnotify mail send` exits 3 and says the recipient is not allowed — but I allowed the domain.**
+Matching is exact: `example.com` admits `a@example.com` but not `a@dept.example.com`.
+Sub-domains need their own `--allow-domain` entry. `mnotify config show` prints the
+effective `[allow]` list.
+
 ## Troubleshooting
 
 | Symptom                                     | Do this                                                            |
