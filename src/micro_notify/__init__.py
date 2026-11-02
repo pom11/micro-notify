@@ -19,7 +19,7 @@ Rules for every module (design sections 2, 4, 5):
 
 from __future__ import annotations
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"
 
 # --- Exit codes (design section 4) -----------------------------------------
 # These are a public contract for agents driving the CLI; do not renumber.

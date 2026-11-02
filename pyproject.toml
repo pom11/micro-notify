@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "micro-notify"
-version = "0.0.1"
+version = "0.1.0"
 description = "CLI for agents and scripts: email from a Microsoft 365 mailbox (Graph app-only) and Teams messages (Workflows webhooks)."
 readme = "README.md"
 requires-python = ">=3.12"
