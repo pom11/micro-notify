@@ -593,9 +593,9 @@ The command prints that sentence too, because calling `logout` a full revoke wou
 be a claim it cannot support.
 
 **`mnotify mail send` exits 3 and says the recipient is not allowed — but I allowed the domain.**
-Matching is exact: `example.com` admits `a@example.com` but not `a@dept.example.com`.
-Sub-domains need their own `--allow-domain` entry. `mnotify config show` prints the
-effective `[allow]` list.
+Matching is exact: `example.com` admits `a@example.com` but not an address at a
+sub-domain such as `dept.example.com`. Sub-domains need their own `--allow-domain`
+entry. `mnotify config show` prints the effective `[allow]` list.
 
 ## Troubleshooting
 
@@ -615,6 +615,26 @@ effective `[allow]` list.
 `mnotify log --tail 20` shows what the tool already tried, including refusals. The
 admin-side failure table is in
 [`docs/ADMIN-SETUP.md`](docs/ADMIN-SETUP.md#where-to-look-when-something-fails).
+
+## Uninstall
+
+```sh
+brew uninstall micro-notify        # pip/pipx installs: pipx uninstall micro-notify (or pip uninstall)
+```
+
+There is deliberately **no `mnotify uninstall` command** — the tool never touches
+anything outside its named files, so cleanup is those files, listed here:
+
+| What | Where | Remove with |
+| ---- | ----- | ----------- |
+| Config + generated public cert | `~/.config/mnotify/config.toml` (0600) and, if `--gen-cert` was used, `~/.config/mnotify/entra-certificate.pem` | `rm` (a `MICRO_NOTIFY_CONFIG` override lives wherever you pointed it) |
+| Keychain secrets (service `mnotify`) | `graph.certificate_pem`, `graph.certificate_thumbprint`, `graph.client_secret`, `graph.delegated_token_cache`, `teams:<target>` per webhook target | `/usr/bin/security delete-generic-password -s mnotify -a <account>` per account — or open Keychain Access and delete the `mnotify` items; `mnotify logout` removes only the delegated cache |
+| Audit log + daily-cap counter | `~/Library/Logs/mnotify/sent.jsonl` and `~/Library/Application Support/mnotify` | `rm -r` (the audit log records no bodies and no secrets — deleting it loses your own history, nothing else) |
+
+Nothing else is installed: no launch agent, no daemon, no system extension. The
+tenant-side objects (app registration, certificate credential, Exchange scoped
+role, Workflows) live in your tenant, not on this Mac — ADMIN-SETUP's steps tell
+you what each one was, so you can remove the ones you no longer want.
 
 ## Development
 
