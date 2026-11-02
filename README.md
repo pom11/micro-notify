@@ -321,16 +321,17 @@ mnotify mail send --to ops@example.com --subject "hi" --body "x" --json
 # {"ok": true, "outcome": "sent", "recipients": ["ops@example.com"], "requestId": "…"}
 ```
 
-Exit codes are a public contract for agents — they do not change (§4):
+Exit codes are a public contract for agents — they do not change (§4). The fix
+column is the exact thing to do, per code:
 
-| Code | Meaning                                                            |
-| ---- | ------------------------------------------------------------------ |
-| 0    | sent (or a `--dry-run` payload printed, or a check passed)          |
-| 2    | usage or config error (bad flag, missing/invalid config, unknown target) |
-| 3    | refused by a guardrail (allowlist, recipient count, attachment size) |
-| 4    | auth error (missing keychain item, token acquisition, an unreadable `roles` claim, or a readable one that names other roles but not `Mail.Send`) |
-| 5    | remote error (Graph or webhook non-2xx; the message carries the request-id) |
-| 6    | daily cap reached (`limits.daily_max`)                              |
+| Code | Meaning                                                            | The fix                                                              |
+| ---- | ------------------------------------------------------------------ | -------------------------------------------------------------------- |
+| 0    | sent (or a `--dry-run` payload printed, or a check passed)          | nothing to do                                                        |
+| 2    | usage or config error (bad flag, missing/invalid config, unknown target) | read the message — it names the flag or file. `mnotify config show`; `mnotify teams targets list` |
+| 3    | refused by a guardrail (allowlist, recipient count, attachment size) | the message names the recipient or limit. Add the domain: `mnotify setup --force --allow-domain <domain>` (or re-run `mnotify admin bootstrap` with the extra `--allow-domain`; a bootstrap also refuses to *finish* with an empty allowlist). Shrink `--attach` totals or the recipient list against `[limits]` |
+| 4    | auth error (missing keychain item, token acquisition, an unreadable `roles` claim, or a readable one that names other roles but not `Mail.Send`) | app mode: re-run `mnotify setup --gen-cert` (or `--auth secret`) on this Mac; an `AADSTS…` detail means tenant/client ID or the uploaded certificate — ADMIN-SETUP step 1. Delegated mode: nobody is signed in or the cache is dead — `mnotify login` (then `mnotify whoami` to confirm); `mnotify logout` first if the cache itself is unreadable |
+| 5    | remote error (Graph or webhook non-2xx; the message carries the request-id) | a Graph `HTTP 403` on mail almost always means **the sender is outside the Exchange scoped role** — the `exchange-scope` step of `mnotify admin bootstrap` (ADMIN-SETUP steps 2.1–2.4) is what binds the app to one mailbox; re-run it and re-check `Test-ServicePrincipalAuthorization`. A `401` is a credential problem — treat it as exit 4. Teams `404`/`410`: the workflow was deleted or rotated — recreate it and `mnotify teams targets add <name> --kind <kind>` |
+| 6    | daily cap reached (`limits.daily_max`)                              | stop retrying today — the counter is keyed by UTC date and rolls at midnight UTC. If the volume is real, raise `daily_max` in `[limits]` deliberately |
 
 `1` means an unexpected crash — a bug, never a documented outcome. `130` is the
 shell convention for Ctrl-C. A stub of a future command exits 2 and says so loudly;
@@ -531,6 +532,8 @@ By design (§2 non-goals), and not an oversight:
 | exit 4 with an `AADSTS…` detail             | wrong tenant/client ID, certificate not uploaded, or expired — see ADMIN-SETUP.md step 1 |
 | exit 5 with `HTTP 403`                      | the mailbox is outside the Exchange scoped role — ADMIN-SETUP.md steps 2–3 |
 | exit 6                                      | `limits.daily_max` spent today (UTC); the counter rolls at midnight UTC |
+| exit 4 in delegated mode, "no delegated sign-in cached" | `mnotify login` — the app-mode certificate checks do not apply; a delegated send needs a signed-in person |
+| `doctor` `sender: fail`, signed-in UPN ≠ `[mail] sender` | exit 2 by design: a delegated send has no send-as-other. `mnotify logout` and sign in as the configured sender, or fix `[mail] sender` to the UPN |
 | `no recipient: pass --to ADDRESS`           | exit 2; `--to` is required for mail. `dm` targets need `--to <UPN>` too |
 | `unknown teams target '…'`                  | exit 2; `mnotify teams targets list` to see what exists             |
 | config already exists, rewrite refused      | expected without `--force`; re-run with it — Teams targets survive  |
