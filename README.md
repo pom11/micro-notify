@@ -60,10 +60,149 @@ Both names are installed: `mnotify` (the short form used everywhere below) and
 
 Dependencies are `msal`, `cryptography` and `httpx`, nothing else (§3).
 
-## Set up (one command, after the admin steps)
+## Quickstart 1 — a shared mailbox sends on its own (app-only)
+
+You need: a tenant-admin account that can register an Entra app and belongs to
+Exchange Online's **Organization Management** group, the Azure CLI signed in
+(`az login`) and PowerShell with the `ExchangeOnlineManagement` module on this Mac.
+Missing those? `mnotify admin bootstrap` will name them — `--install-missing` offers
+to `brew install` the two formulae, but only behind a `y` at a prompt.
+
+Read the plan first — it prints every `az` / `pwsh` command the real run would
+issue and changes nothing, not the keychain, not a file:
+
+```sh
+mnotify admin bootstrap --sender noreply@example.com --allow-domain example.com --dry-run
+```
+
+Then run it for real (this is the command that passed live acceptance; it is
+idempotent — a re-run reports `exists` everywhere and exits 0):
+
+```sh
+mnotify admin bootstrap --sender noreply@example.com --allow-domain example.com
+```
+
+**What you will see.** Steps print one line each in order: `preflight`, `entra-app`,
+`certificate`, `exchange-scope`, `config`, `doctor` — each `created`, `exists`, or
+`failed`. Halfway through, the Exchange Online step signs *you* in with the
+device-code flow and waits. You will see something like this on screen:
+
+```text
+mnotify: connecting to Exchange Online (device-code sign-in).
+To sign in, use a web browser to open the page https://microsoft.com/devicelogin and enter the code ABCD12345 to authenticate.
+```
+
+Open that URL in any browser, type the code it shows you (here `ABCD12345`), sign
+in as the admin, and the waiting command continues by itself. The code expires if
+you dawdle — re-run the command and you get a fresh one. `mnotify` never runs
+`az login` or `Connect-ExchangeOnline` for you, and never prints a secret: what it
+prints is names, GUIDs, thumbprints and addresses.
+
+Two portal steps stay yours (`bootstrap` deliberately never grants or removes an
+API permission): declaring `Mail.Send` and then **removing the tenant-wide consent**
+so the Exchange scoped role is the only grant. They are ADMIN-SETUP steps 1.4 and
+3.2 — read them before calling the setup finished.
+
+Finish by proving the pipeline with one real message (this spends one unit of the
+daily cap):
+
+```sh
+mnotify mail send --to you@example.com --subject "first mail" --body "hello from mnotify" --json
+echo "exit=$?"        # 0, and the JSON names the recipients and the Graph request-id
+```
+
+Expected steady state afterwards: `mnotify doctor` exits **0** with the `token` line
+yellow (`warn`) — on a correctly hardened tenant that is the *correct* end state,
+not a fault; see the FAQ.
+
+## Quickstart 2 — send as yourself (delegated)
+
+No Exchange scoping and no certificate: the sender is your own signed-in identity.
+One command configures the tenant half (it declares the five delegated Graph scopes
+and the public-client switch on the **same** `micro-notify` registration, and skips
+the certificate and the Exchange scoped role — a delegated send reads neither):
+
+```sh
+mnotify admin bootstrap --sender me@contoso.com --allow-domain contoso.com --mode delegated
+```
+
+It writes the config *before* the sign-in (login reads its client ID from that
+file), then runs `mnotify login` for you — the same device-code prompt as above,
+this time signed in as the person, not the admin. If a tenant rule refuses the
+optional tenant-wide consent, the step reports `skipped` and the run continues:
+your own `mnotify login` consents the same scopes for you alone. The sender must
+be the person who signs in — sign in as somebody else and the run refuses (exit 2)
+with both fixes named.
+
+From a machine that is already configured, the only step is:
+
+```sh
+mnotify login                      # device-code sign-in, cache lands in the keychain
+mnotify whoami                     # the signed-in UPN and token expiry — never a token
+```
+
+First mail (it goes out **as you** — the config cannot name another sender), and
+first Teams post into a chat you belong to:
+
+```sh
+mnotify mail send --to ops@contoso.com --subject "as me" --body "sent as myself" --json
+mnotify teams chats list                       # your Teams chats; ids shown masked
+mnotify teams chats add workchat --pick        # pick one from the list by number
+mnotify teams send workchat --title "Deploy" --text "staging is up"
+```
+
+`mnotify doctor` on a delegated config runs the delegated check list — `config`,
+`keychain`, `teams`, `token`, `scopes`, `sender`, `allow`, `send-test` — and here
+the `token` check **genuinely fails (exit 4) when nobody is signed in**; that is the
+opposite of the app-mode `warn`, and the FAQ explains both.
+
+## Quickstart 3 — a Teams channel (Workflows webhook)
+
+No tenant admin, no Entra app for this one: Teams Workflows hands out an HTTPS
+webhook URL per channel. In Teams: hover the channel → **···** → **Workflows** →
+template **“Post to a channel when a webhook request is received”** → choose the
+team and channel → **Add workflow** → copy the **Workflow URL**. (ADMIN-SETUP step
+4.1 covers the template choice and the Power Automate fallback.)
+
+That URL contains a signature and **is a secret**: you paste it at one hidden
+prompt and it goes straight to the keychain — never into a flag, an env var, a
+config file or a ticket.
+
+```sh
+mnotify teams targets add alerts --kind channel    # prompts for the URL, input hidden
+mnotify teams targets list                         # name, kind, presence — never the URL
+mnotify teams send alerts --title "Build 42" --text "nightly run **finished**" --dry-run
+mnotify teams send alerts --title "Build 42" --text "nightly run **finished**"
+```
+
+The `--dry-run` line prints the exact payload with the URL masked and costs nothing
+— no network, no daily-cap unit. Cards are built from `--title`, `--text`
+(markdown), repeatable `--fact k=v`, and one `--link URL --link-title T` button.
+
+## Quickstart 4 — a Teams DM to one person
+
+One shared DM workflow serves the whole tenant — not one per person. Build it in
+Power Automate (ADMIN-SETUP step 4.2 gives the exact recipe): an *Instant cloud
+flow* with trigger **When a Teams webhook request is received**, action **Post card
+in a chat or channel** with *Post as* `Flow bot`, *Post in* `Chat with Flow bot`,
+*Recipient* `triggerBody()?['recipient']` (raw expression), *Adaptive Card*
+`first(triggerBody()?['attachments'])?['content']`. Copy the trigger's HTTP URL.
+
+```sh
+mnotify teams targets add dm --kind dm
+mnotify teams send dm --to someone@example.com --text "the deploy needs your approval"
+```
+
+`dm` targets require `--to <UPN>` — and that UPN must be on the allowlist like any
+other recipient. (The delegated alternative with no workflow at all is a `chat`
+target — Quickstart 2.)
+
+## Set up by hand — `mnotify setup`
 
 `mnotify setup` writes `~/.config/mnotify/config.toml` (mode 0600) and puts the
-credential in the keychain. Run it at a terminal once per machine:
+credential in the keychain. Run it at a terminal once per machine. Use it when the
+app registration already exists and you are wiring one machine to it by hand; the
+`bootstrap` quickstarts above do the same writes plus the tenant half:
 
 ```sh
 mnotify setup
@@ -84,9 +223,14 @@ credential is generated, not typed.
 Then check the whole chain:
 
 ```sh
-mnotify doctor                    # config, keychain, Teams targets, token, Mail.Send role
+mnotify doctor                    # app-mode checks: config, keychain, teams, token, allow
 mnotify doctor --send-test you@example.com   # plus one real test send
 ```
+
+`doctor` is **mode-aware**: the check list above is the app-mode (`mode = "app"`)
+one; a `[mail] mode = "delegated"` config instead runs `config`, `keychain`,
+`teams`, `token`, `scopes`, `sender`, `allow`, `send-test` — both lists, and what
+each verdict means, are in the FAQ.
 
 `doctor` runs its checks in the order you will hit them and stops at the first
 failure, printing a `fix:` hint that names the command or admin step that resolves
@@ -251,16 +395,28 @@ guarded test message (reachable before and after ADMIN-SETUP step 3 — the `war
 
 ## Teams targets
 
-A target is a named Workflows webhook, stored as `kind` + name in the config with
-the URL in the keychain (§3.2). `channel` posts to one fixed channel; `dm` posts to
-one person per call through a single shared DM workflow, so `--to <UPN>` is required
-for `dm` and rejected for `channel`.
+A target is a named Teams destination recorded in `[teams.targets]`. The two
+webhook kinds — `channel` (one fixed channel) and `dm` (one person per call
+through the tenant's single shared DM workflow, so `--to <UPN>` is required for
+`dm` and rejected for `channel`) — keep their URL in the keychain (§3.2). The
+third kind, `chat`, addresses a Teams conversation by `chat_id` through the
+delegated sign-in; a chat id is not a secret, so it lives in the config file.
 
 ```sh
 mnotify teams targets add alerts --kind channel    # prompts for the URL, hidden input
 mnotify teams targets add dm --kind dm
 mnotify teams targets list                         # name, kind, presence — never the URL
 mnotify teams targets remove alerts                # config entry *and* keychain item
+```
+
+A `chat` target is registered from the signed-in person's chat list (delegated
+mode only — an app-mode config refuses it, and `chat` targets reject `--to`
+because the conversation is fixed when the alias is registered):
+
+```sh
+mnotify teams chats list                           # your chats; ids masked in human output
+mnotify teams chats add workchat --pick            # choose by number, or pass the 19:…@thread.v2 id
+mnotify teams send workchat --title "Deploy" --text "staging is up"
 ```
 
 The webhook URL contains a signature, so **it is a secret**: paste it only at the
@@ -275,18 +431,19 @@ verbatim and cannot be combined with the others.
 ## Keychain accounts
 
 All secrets live in the macOS keychain under service `mnotify` (§3.4), written only
-by `mnotify setup` and `mnotify teams targets add`:
+by the commands named here:
 
 | Keychain account                 | Holds                                              | Written by                           |
 | -------------------------------- | -------------------------------------------------- | ------------------------------------ |
 | `graph.certificate_pem`          | the private key (auth = `certificate`)              | `mnotify setup --gen-cert`            |
 | `graph.certificate_thumbprint`   | the certificate thumbprint paired with that key     | `mnotify setup --gen-cert`            |
 | `graph.client_secret`            | the client secret (auth = `secret`)                 | `mnotify setup --auth secret`         |
+| `graph.delegated_token_cache`    | the delegated (as-a-person) token cache             | `mnotify login`; removed by `mnotify logout` |
 | `teams:<target>`                 | the Workflows webhook URL for `<target>` (= secret) | `mnotify teams targets add`           |
 
 Ask `mnotify` about them rather than the keychain — `mnotify config show` prints the
 effective config with credentials reduced to presence markers, and `mnotify doctor`
-checks the accounts the configured auth mode needs. To delete one (a delete prints
+checks the accounts the configured mode needs. To delete one (a delete prints
 nothing secret): `/usr/bin/security delete-generic-password -s mnotify -a
 graph.client_secret`. Never read a value into a terminal, a log or a screenshot —
 and note that `security find-generic-password … -w` **prints the secret**, which is
@@ -300,9 +457,10 @@ how tests and CI get an isolated config).
 
 ```toml
 [mail]
+mode = "app"                      # the default; "delegated" = send as the signed-in person
 tenant_id = "00000000-0000-0000-0000-000000000000"   # your tenant GUID
 client_id = "00000000-0000-0000-0000-000000000000"   # your app (client) GUID
-sender = "noreply@example.com"
+sender = "noreply@example.com"    # delegated mode: must equal the signed-in UPN
 auth = "certificate"            # or "secret"
 default_reply_to = "ops@example.com"
 
@@ -323,6 +481,9 @@ state_dir = "~/Library/Application Support/mnotify"
 kind = "channel"                # the URL lives in the keychain, not here
 [teams.targets.dm]
 kind = "dm"
+[teams.targets.workchat]
+kind = "chat"                   # delegated mode; a chat id is config data, not a secret
+chat_id = "19:example@thread.v2"
 ```
 
 `mnotify setup` writes this file; `--force` rewrites it and preserves your
@@ -337,10 +498,14 @@ By design (§2 non-goals), and not an oversight:
 - **Reading or receiving anything.** No inbox, no Graph notifications, no reading
   Teams replies. `mnotify` is send-only, and the audit log is the only record it
   keeps.
+- **Files in Teams.** Attachments are email-only (see below); a Teams message
+  carries a card, not a file.
 - **Bulk or marketing mail.** No lists, no template engine, no throttled fan-out. A
   file body is the templating story; use a real sending service for campaigns.
 - **Calendar, contacts, OneDrive, Teams chat history** — nothing beyond `Mail.Send`
-  on one mailbox and Workflows posts.
+  on one mailbox (app mode) or on your own account (delegated mode, which adds only
+  `ChatMessage.Send` / `Chat.ReadBasic` / `User.Read` / `offline_access`), plus
+  Workflows and chat posts.
 - **A sanitising or escaping layer.** The body is what you wrote; `--html` marks it
   as HTML and nothing sanitises it.
 - **Windows and Linux.** Secrets go to the macOS keychain via `/usr/bin/security`.
