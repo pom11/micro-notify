@@ -1,0 +1,8 @@
+# Build context is the repository root; keep only what the image installs.
+*
+!pyproject.toml
+!README.md
+!src
+!src/**
+**/__pycache__
+**/*.pyc

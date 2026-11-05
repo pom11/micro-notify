@@ -1,0 +1,39 @@
+# micro-notify configuration for the Alpine container image.
+#
+# Placeholders only. Copy this file, replace the GUIDs and the mailbox, then
+# mount it read-only at /data/config.toml. Secrets never live in this file.
+#
+# [paths] must stay absolute and inside /data: the image runs as uid 10001 and
+# /data is the only directory that user may write. The macOS defaults expand
+# to ~/Library/... and are not suitable for the container.
+
+[mail]
+tenant_id = "00000000-0000-0000-0000-000000000000"
+client_id = "00000000-0000-0000-0000-000000000000"
+sender = "noreply@example.com"
+auth = "certificate"
+mode = "app"
+default_reply_to = ""
+
+[allow]
+domains = ["example.com"]
+addresses = []
+
+[limits]
+max_recipients = 20
+daily_max = 200
+max_attach_mb = 3
+
+[paths]
+audit = "/data/audit/sent.jsonl"
+state_dir = "/data/state"
+
+# Teams targets are optional. Uncomment a target only after its webhook URL is
+# available through the file backend; otherwise `mnotify doctor` fails the
+# teams check, by design.
+#
+# [teams.targets.alerts]
+# kind = "channel"
+#
+# [teams.targets.dm]
+# kind = "dm"
