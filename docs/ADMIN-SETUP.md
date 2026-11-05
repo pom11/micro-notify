@@ -128,6 +128,11 @@ Honest limits — compared with the macOS keychain, this backend loses:
   can read the files. Docker secrets mounted `root:root 0444` are the accepted
   convention, but they are readable by any process in the container.
 
+Delegated mode has one extra runtime requirement — the token cache is written
+back on refresh, so its secrets directory must stay writable. See
+[DELEGATED-SETUP.md](DELEGATED-SETUP.md#running-delegated-mode-in-a-linux-container)
+for the container login command and the honest limits.
+
 ---
 
 ## Step 1 — Register the app in Entra and give it the certificate

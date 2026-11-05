@@ -1,6 +1,6 @@
 """``mnotify logout`` — remove the local delegated token cache (amendment A.2).
 
-One job, stated honestly: delete keychain account ``graph.delegated_token_cache``.
+One job, stated honestly: delete secret-store account ``graph.delegated_token_cache``.
 That is **revocation level 1** in the amendment's two-level model — immediate and
 local. It stops this Mac and reaches nothing else; the hard revoke is Entra's
 "Revoke sessions" (plus removing the delegated consent), and the human output says
@@ -37,7 +37,7 @@ def add_parser(subparsers: "argparse._SubParsersAction") -> None:
         NAME,
         help="delete the local delegated token cache",
         description=(
-            "Delete the delegated token cache from the macOS keychain (account "
+            "Delete the delegated token cache from the secret store (account "
             f"'{delegation.ACCOUNT_DELEGATED_CACHE}'). This is a local revoke only — "
             "see the output for the hard revoke."
         ),
@@ -61,7 +61,7 @@ def run(args: argparse.Namespace) -> int:
         )
         return EXIT_OK
     if was_present:
-        print(f"removed keychain account '{delegation.ACCOUNT_DELEGATED_CACHE}'")
+        print(f"removed secret store account '{delegation.ACCOUNT_DELEGATED_CACHE}'")
     else:
         print(f"nothing to remove: '{delegation.ACCOUNT_DELEGATED_CACHE}' was not present")
     print(HARD_REVOKE_NOTE, file=sys.stderr)

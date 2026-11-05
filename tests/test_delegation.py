@@ -23,7 +23,7 @@ import types
 import msal
 import pytest
 
-from micro_notify import EXIT_AUTH, AuthError, delegation, secrets
+from micro_notify import EXIT_AUTH, EXIT_USAGE, AuthError, delegation, secrets
 from micro_notify.config import MAIL_MODE_DELEGATED, MailConfig, load_config
 from micro_notify.delegation import ACCOUNT_DELEGATED_CACHE
 from micro_notify.secrets import SERVICE
@@ -568,3 +568,156 @@ def test_logout_then_whoami_asks_for_a_login(signed_in) -> None:
     delegation.logout()
     with pytest.raises(AuthError, match="run mnotify login"):
         delegation.whoami()
+
+
+# --- S1: the cache goes through secrets, under the contract account --------
+def test_login_writes_the_cache_through_set_secret_with_the_exact_account(
+    fake_msal, fake_keychain, monkeypatch
+) -> None:
+    """Login must persist to ``secrets.set_secret``, not to a file of its own."""
+    calls: list[tuple[str, str]] = []
+    real_set = secrets.set_secret
+
+    def spy(account: str, value: str, **kwargs):
+        calls.append((account, value))
+        return real_set(account, value, **kwargs)
+
+    monkeypatch.setattr(secrets, "set_secret", spy)
+    result = delegation.login(mail=mail_config(), printer=lambda _text: None)
+
+    assert result.upn == PERSON
+    assert [account for account, _value in calls] == [ACCOUNT_DELEGATED_CACHE]
+    assert CANARY_ACCESS in calls[0][1], "the fabricated cache blob is what was stored"
+    assert state_in(fake_keychain), "the value reached the storage facade"
+
+
+def test_logout_deletes_through_secrets_with_the_exact_account(
+    signed_in, monkeypatch
+) -> None:
+    calls: list[str] = []
+    real_delete = secrets.delete
+
+    def spy(account: str, **kwargs):
+        calls.append(account)
+        return real_delete(account, **kwargs)
+
+    monkeypatch.setattr(secrets, "delete", spy)
+    assert delegation.logout() is True
+    assert calls == [ACCOUNT_DELEGATED_CACHE]
+    assert ACCOUNT_DELEGATED_CACHE not in signed_in.items
+
+
+def test_silent_refresh_rewrites_the_cache_through_set_secret(
+    fake_keychain, fake_msal, monkeypatch
+) -> None:
+    """A refresh is a cache change; it must go back through the same account."""
+    fake_keychain.seed(
+        ACCOUNT_DELEGATED_CACHE,
+        cache_state(expires_in=-100, access_token="AT-EXPIRED-OLD"),
+    )
+    fake_msal.silent_result = token_response(access_token="AT-FRESH-AFTER-REFRESH")
+    fake_msal.silent_changes_cache = True
+
+    calls: list[str] = []
+    real_set = secrets.set_secret
+
+    def spy(account: str, value: str, **kwargs):
+        calls.append(account)
+        return real_set(account, value, **kwargs)
+
+    monkeypatch.setattr(secrets, "set_secret", spy)
+    assert delegation.get_delegated_token() == "AT-FRESH-AFTER-REFRESH"
+    assert calls == [ACCOUNT_DELEGATED_CACHE]
+    assert "AT-FRESH-AFTER-REFRESH" in state_in(fake_keychain)
+
+
+# --- S2: the file backend must be writable before login starts --------------
+@pytest.fixture
+def file_cache_dir(tmp_path, monkeypatch):
+    """A real file backend under tmp_path: no keychain, no live state anywhere."""
+    root = tmp_path / "file-secrets"
+    root.mkdir(mode=0o700)
+    monkeypatch.setenv(secrets.SECRETS_BACKEND_ENV, secrets.BACKEND_FILE)
+    monkeypatch.setenv(secrets.SECRETS_DIR_ENV, str(root))
+    return root
+
+
+def test_login_refuses_a_read_only_file_backend_before_the_device_flow(
+    file_cache_dir, fake_msal
+) -> None:
+    """Even a pre-provisioned item needs a writable dir for refresh; say so up front."""
+    secrets.set_secret(ACCOUNT_DELEGATED_CACHE, cache_state())
+    path = file_cache_dir / secrets.account_filename(ACCOUNT_DELEGATED_CACHE)
+    file_cache_dir.chmod(0o500)
+    try:
+        with pytest.raises(AuthError) as excinfo:
+            delegation.login(mail=mail_config(), printer=lambda _text: None)
+    finally:
+        file_cache_dir.chmod(0o700)
+
+    assert excinfo.value.exit_code == EXIT_AUTH
+    assert str(path) in excinfo.value.message
+    assert "WRITABLE" in excinfo.value.message
+    assert fake_msal.flows == [], "no human should be sent to a browser for a doomed write"
+    assert fake_msal.device_flow_calls == 0
+
+
+def test_login_off_darwin_without_a_backend_is_the_l1_usage_error(
+    fake_msal, monkeypatch
+) -> None:
+    """Unset backend on Linux is exit 2 from L1, surfaced by login rather than crashing."""
+    monkeypatch.delenv(secrets.SECRETS_BACKEND_ENV, raising=False)
+    monkeypatch.delenv(secrets.SECRETS_DIR_ENV, raising=False)
+    monkeypatch.setattr(secrets.sys, "platform", "linux")
+
+    with pytest.raises(secrets.SecretBackendError) as excinfo:
+        delegation.login(mail=mail_config(), printer=lambda _text: None)
+
+    assert excinfo.value.exit_code == EXIT_USAGE
+    assert secrets.SECRETS_BACKEND_ENV in excinfo.value.message
+    assert fake_msal.flows == []
+
+
+# --- S3: doctor's row label and fix text follow the backend ----------------
+def test_doctor_delegated_row_says_secret_store_on_the_file_backend(
+    file_cache_dir, capsys
+) -> None:
+    from micro_notify.commands import doctor
+
+    secrets.set_secret(ACCOUNT_DELEGATED_CACHE, cache_state())
+    report = doctor.Report(machine=False)
+    assert doctor.check_delegated_keychain(report) is True
+
+    out = capsys.readouterr().out
+    assert "secret store: pass" in out
+    assert "keychain" not in out.lower()
+
+
+def test_doctor_delegated_missing_fix_text_is_backend_neutral_and_exit_4(
+    file_cache_dir, capsys
+) -> None:
+    from micro_notify.commands import doctor
+
+    report = doctor.Report(machine=False)
+    assert doctor.check_delegated_keychain(report) is False
+    assert report.exit_code == EXIT_AUTH
+
+    captured = capsys.readouterr()
+    assert "secret store: fail" in captured.err
+    assert "keychain" not in (captured.out + captured.err).lower()
+    assert secrets.SECRETS_DIR_ENV in captured.err
+
+
+def test_doctor_app_row_says_secret_store_on_the_file_backend(
+    file_cache_dir, capsys
+) -> None:
+    from micro_notify.commands import doctor
+
+    report = doctor.Report(machine=False)
+    assert doctor.check_keychain(report, load_config()) is False
+    assert report.exit_code == EXIT_AUTH
+
+    captured = capsys.readouterr()
+    assert "secret store: fail" in captured.err
+    assert "keychain" not in (captured.out + captured.err).lower()
+    assert secrets.SECRETS_DIR_ENV in captured.err

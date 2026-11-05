@@ -156,9 +156,9 @@ SENDER_HINT_TEMPLATE = "run `mnotify logout` then `mnotify login` as {upn}"
 def add_parser(subparsers: "argparse._SubParsersAction") -> None:
     doctor = subparsers.add_parser(
         NAME,
-        help="check config, keychain, token and Teams targets",
+        help="check config, secret store, token and Teams targets",
         description=(
-            "Report config validity, keychain presence, token acquisition, the "
+            "Report config validity, secret-store presence, token acquisition, the "
             "Mail.Send role and every Teams target URL. In [mail] mode = delegated "
             "the token checks are the cached sign-in's instead: expiry, the granted "
             "scopes, and that the signed-in UPN is the sender. Checks print presence "
@@ -190,13 +190,14 @@ class Report:
         self.checks: list[dict[str, Any]] = []
         self.exit_code = EXIT_OK
 
-    def record(self, name: str, status: str, detail: str = "", hint: str = "", exit_code: int = EXIT_OK) -> None:
+    def record(self, name: str, status: str, detail: str = "", hint: str = "", exit_code: int = EXIT_OK, *, label: str | None = None) -> None:
         self.checks.append({"name": name, "status": status, **({"detail": detail} if detail else {})})
         if status == FAIL:
             self.exit_code = exit_code or EXIT_USAGE
         if self.machine:
             return
-        line = f"{name}: {status}" + (f" — {detail}" if detail else "")
+        shown = label or name
+        line = f"{shown}: {status}" + (f" — {detail}" if detail else "")
         if status == FAIL:
             print(line, file=sys.stderr)
             if hint:
@@ -399,6 +400,13 @@ def _mail_send_args(address: str) -> argparse.Namespace:
 
 
 # --- Checks ------------------------------------------------------------------
+def _secret_store_label() -> str:
+    """The user-facing name of the active backend: keychain on macOS, secret store on file."""
+    if secrets.select_backend() == secrets.BACKEND_KEYCHAIN:
+        return "keychain"
+    return "secret store"
+
+
 def check_config(report: Report) -> Config | None:
     """1. config file exists, parses, [mail] keys present (design §3.4) -> exit 2."""
     try:
@@ -418,20 +426,29 @@ def check_keychain(report: Report, config: Config) -> bool:
     this process, so it cannot be printed.
     """
     missing = [account for account in config.mail.keychain_accounts() if not secrets.has(account)]
+    label = _secret_store_label()
     if missing:
+        if label == "keychain":
+            hint = (
+                f"store them with `mnotify setup --gen-cert` (or `mnotify setup --auth secret`) "
+                f"— service '{secrets.SERVICE}'"
+            )
+        else:
+            hint = (
+                f"store them with `mnotify setup --gen-cert` (or `mnotify setup --auth secret`) "
+                f"under {secrets.SECRETS_DIR_ENV} (file backend, mode 0600)"
+            )
         report.record(
             "keychain",
             FAIL,
             f"missing: {', '.join(missing)}",
-            hint=(
-                f"store them with `mnotify setup --gen-cert` (or `mnotify setup --auth secret`) "
-                f"— service '{secrets.SERVICE}'"
-            ),
+            hint=hint,
             exit_code=EXIT_AUTH,
+            label=label,
         )
         return False
     report.record(
-        "keychain", PASS, f"present: {', '.join(config.mail.keychain_accounts())}"
+        "keychain", PASS, f"present: {', '.join(config.mail.keychain_accounts())}", label=label
     )
     return True
 
@@ -447,15 +464,24 @@ def check_delegated_keychain(report: Report) -> bool:
     exists. Presence only, via :func:`micro_notify.secrets.has`: the value is a
     credential blob and is not read by this check.
     """
+    label = _secret_store_label()
     if secrets.has(delegation.ACCOUNT_DELEGATED_CACHE):
-        report.record("keychain", PASS, f"present: {delegation.ACCOUNT_DELEGATED_CACHE}")
+        report.record("keychain", PASS, f"present: {delegation.ACCOUNT_DELEGATED_CACHE}", label=label)
         return True
+    if label == "keychain":
+        hint = f"sign in with `mnotify login` (design amendment A.2) — service '{secrets.SERVICE}'"
+    else:
+        hint = (
+            f"sign in with `mnotify login` (design amendment A.2) — the token cache is "
+            f"a file under {secrets.SECRETS_DIR_ENV}"
+        )
     report.record(
         "keychain",
         FAIL,
         f"missing: {delegation.ACCOUNT_DELEGATED_CACHE}",
-        hint=f"sign in with `mnotify login` (design amendment A.2) — service '{secrets.SERVICE}'",
+        hint=hint,
         exit_code=EXIT_AUTH,
+        label=label,
     )
     return False
 
@@ -483,12 +509,13 @@ def check_teams(report: Report, config: Config, *, delegated: bool = False) -> b
         if not secrets.has(secrets.teams_account(target.name))
     ]
     if missing:
+        label = _secret_store_label()
         report.record(
             "teams",
             FAIL,
-            f"missing webhook URL in keychain accounts: {', '.join(missing)}",
+            f"missing webhook URL in {label} accounts: {', '.join(missing)}",
             hint=f"paste each URL with `mnotify teams targets add <name> --kind channel|dm` "
-                 f"(the URL is a secret; it goes to the keychain, never the config)",
+                 f"(the URL is a secret; it goes to the {label}, never the config)",
             exit_code=EXIT_AUTH,
         )
         return False
