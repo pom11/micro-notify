@@ -99,7 +99,7 @@ the payload it would have posted.
 With `--json`, every expected failure is one document on stdout:
 
 ```json
-{"ok": false, "outcome": "error", "exitCode": 3, "message": "recipient not allowed by [allow]: someone@example.net"}
+{"ok": false, "outcome": "error", "exitCode": 3, "message": "recipient not allowed by [allow]: someone@contoso.com"}
 ```
 
 Do not treat `{"ok": true}` alone as success: check the exit code first, then
