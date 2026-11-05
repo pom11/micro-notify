@@ -55,6 +55,81 @@ Two rules that hold for the whole procedure:
 
 ---
 
+## Linux / containers (file secret backend)
+
+macOS keeps using the login keychain by default; nothing in the steps below
+changes that. Linux and containers have no OS keychain, so `mnotify` uses an
+explicit file backend there — it never guesses and never falls back silently.
+
+| Variable | Meaning |
+| -------- | ------- |
+| `MICRO_NOTIFY_SECRETS` | `keychain` or `file`. Unset means `keychain` on macOS only; on every other OS `mnotify` exits 2 and asks you to choose. |
+| `MICRO_NOTIFY_SECRETS_DIR` | Directory holding one file per account. Required when the backend is `file`; unset is exit 2. It carries a path, never a secret value. |
+
+The file name is the account name verbatim (`graph.certificate_pem`,
+`graph.client_secret`, `graph.certificate_thumbprint`,
+`graph.delegated_token_cache`), except that a teams account's `:` becomes `__`:
+`teams:facturare` is the file `teams__facturare`. Write the value with no
+trailing newline (`printf '%s'`, not `echo`); the file contents are the secret,
+byte for byte.
+
+```sh
+export MICRO_NOTIFY_SECRETS=file
+export MICRO_NOTIFY_SECRETS_DIR=/var/lib/mnotify/secrets
+install -d -m 0700 "$MICRO_NOTIFY_SECRETS_DIR"
+mnotify setup --gen-cert ...          # writes 0600 files atomically
+```
+
+Permissions are checked on every read, fail-closed:
+
+- `0400` or `0600`, owned by the effective uid: accepted.
+- A read-only provisioned file (no owner/group/other write bit, world-readable),
+  typically `root:root 0444`: accepted. This is the standard Docker secrets mount.
+- Group- or other-writable, or a symlink: **unreadable** — `probe()` says
+  `unreadable` and `get()` exits 4. It is never treated as absent.
+- Missing file: **absent**, the same exit 44 -> 4 contract as a missing keychain
+  item.
+
+Writes (`mnotify setup`, `mnotify teams targets add`) go only inside
+`MICRO_NOTIFY_SECRETS_DIR`, as 0600, via a temp file in the same directory plus
+an atomic rename. A directory this uid cannot write to is refused with exit 4
+and a message naming the path — so a read-only mount is for secrets you provision
+yourself, not for CLI writes.
+
+**Docker, read-only mount (pre-provisioned secrets).** Put files named as above
+in `./mnotify-secrets`, make them `0444`, and mount the directory read-only:
+
+```yaml
+services:
+  mnotify:
+    environment:
+      MICRO_NOTIFY_SECRETS: file
+      MICRO_NOTIFY_SECRETS_DIR: /run/secrets/mnotify
+    volumes:
+      - type: bind
+        source: ./mnotify-secrets
+        target: /run/secrets/mnotify
+        read_only: true
+```
+
+**Docker, CLI-managed secrets.** Use a writable volume instead, e.g.
+`-v mnotify-secrets:/var/lib/mnotify/secrets` with the same two environment
+variables, and let `mnotify setup` create the 0600 files.
+
+Honest limits — compared with the macOS keychain, this backend loses:
+
+- **encryption at rest under a user login session.** The files are plaintext;
+  their protection is unix permissions plus the container boundary plus volume
+  encryption if the host provides it;
+- **keychain access-control.** There is no per-app ACL and no prompt before a
+  process reads a secret;
+- **system-level backup exclusion semantics** (the Time Machine-style guarantee);
+- **isolation from root.** Anything with root on the host or in the container
+  can read the files. Docker secrets mounted `root:root 0444` are the accepted
+  convention, but they are readable by any process in the container.
+
+---
+
 ## Step 1 — Register the app in Entra and give it the certificate
 
 Design §6 step 1. The certificate is generated on the machine that will run
