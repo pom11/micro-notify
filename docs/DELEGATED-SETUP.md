@@ -28,25 +28,33 @@ host terminal works. `nohup`, cron or CI with nobody to visit the URL does
 poll continues until the human acts or msal's flow expires; the existing expiry
 error text is unchanged.
 
-The container needs the same file-backend variables as app mode, plus a config
-file and a **writable** secrets directory:
+The container needs a config file and a **writable** secrets directory. The
+image built from `packaging/docker/Dockerfile` already sets
+`MICRO_NOTIFY_CONFIG=/data/config.toml`, `MICRO_NOTIFY_SECRETS=file` and
+`MICRO_NOTIFY_SECRETS_DIR=/run/secrets/mnotify`, so the example passes only the
+two mounts; override those variables only if your image uses different paths.
 
 ```sh
-# One-time: a writable volume for the token cache (and any other secrets).
+# One-time: create the volume, then make it writable by the image's uid (10001).
+# A new named volume is root-owned and the image runs unprivileged, so without
+# this step login is refused.
 docker volume create mnotify-delegated-secrets
+docker run --rm --user 0 -v mnotify-delegated-secrets:/x --entrypoint sh \
+  mnotify:local -c 'chown 10001:10001 /x && chmod 700 /x'
 
 docker run --rm -it \
-  -e MICRO_NOTIFY_CONFIG=/config/config.toml \
-  -e MICRO_NOTIFY_SECRETS=file \
-  -e MICRO_NOTIFY_SECRETS_DIR=/var/lib/mnotify/secrets \
-  -v "$PWD/delegated.toml:/config/config.toml:ro" \
-  -v mnotify-delegated-secrets:/var/lib/mnotify/secrets \
-  micro-notify:latest \
-  mnotify login --json
+  -v "$PWD/delegated.toml:/data/config.toml:ro" \
+  -v mnotify-delegated-secrets:/run/secrets/mnotify \
+  mnotify:local \
+  login --json
 ```
 
-Use the image and config path you already deploy. A minimal `delegated.toml`
-uses the documented placeholders:
+The image ENTRYPOINT is already `mnotify`, so the command is `login --json`, not
+`mnotify login --json`. `mnotify:local` is the tag produced by building
+`packaging/docker/Dockerfile` from the repository root
+(`docker build -f packaging/docker/Dockerfile -t mnotify:local .`); substitute
+the image tag you deploy. A minimal `delegated.toml` uses the documented
+placeholders:
 
 ```toml
 [mail]
