@@ -14,7 +14,12 @@ release gets from a commit to `brew install`.
 ```
 packaging/Formula/micro-notify.rb.tmpl   Homebrew formula template (the tap's only file)
 scripts/release.py                       prepares a release; publishes nothing
+packaging/docker/                        Alpine image for Linux; separate from Homebrew
 ```
+
+Linux containers are built from [`docker/`](docker/README.md): pinned Alpine,
+non-root runtime, mounted config/secrets. That path is additional to the macOS
+Homebrew release and does not change the formula, tap or release script.
 
 The tap itself is a separate repository, `pom11/homebrew-micro-notify`, laid
 out the way Homebrew expects for a third-party tap:

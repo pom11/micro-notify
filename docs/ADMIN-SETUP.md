@@ -624,6 +624,16 @@ mnotify log --tail 10
 
 ---
 
+## Docker (Linux)
+
+The production Linux image is documented in
+[`packaging/docker/README.md`](../packaging/docker/README.md): pinned Alpine,
+numeric non-root uid, config/secrets mounted at runtime, `[paths]` under `/data`.
+Secrets there come from the sibling L1 Linux file-backend contract; delegated
+mode's writable-secrets variant is card L2's docs. Neither is duplicated here.
+
+---
+
 ## Operator checklist
 
 Copy this into your ticket and tick it. Nothing here may be committed to the repo.
