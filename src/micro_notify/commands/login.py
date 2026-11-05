@@ -2,7 +2,7 @@
 
 Device-code sign-in against our own registration (A.1: the Azure CLI's first-party
 app cannot be used because it lacks ``Mail.Send`` / ``ChatMessage.Send``), with the
-token cache landing in the keychain and nowhere else.
+token cache landing in the secret store and nowhere else.
 
 Attributes:
 
@@ -35,8 +35,8 @@ def add_parser(subparsers: "argparse._SubParsersAction") -> None:
         help="sign in as a person (delegated mode)",
         description=(
             "Sign in with the device-code flow and cache the delegated token in the "
-            f"macOS keychain (account '{delegation.ACCOUNT_DELEGATED_CACHE}'). "
-            "Nothing is written to disk and no token is ever printed."
+            f"secret store (account '{delegation.ACCOUNT_DELEGATED_CACHE}'). "
+            "No token is ever printed."
         ),
     )
     login.add_argument(
@@ -70,8 +70,8 @@ def run(args: argparse.Namespace) -> int:
         line += f"; access token valid until {_expiry_text(result.expires_at)}"
     print(line)
     print(
-        f"token cache: keychain account '{delegation.ACCOUNT_DELEGATED_CACHE}' "
-        "(service mnotify); `mnotify logout` removes it",
+        f"token cache: secret store account '{delegation.ACCOUNT_DELEGATED_CACHE}'; "
+        "`mnotify logout` removes it",
         file=sys.stderr,
     )
     return EXIT_OK
