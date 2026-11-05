@@ -1,4 +1,4 @@
-"""Delegated (as-a-person) auth: device-code sign-in and the keychain token cache.
+"""Delegated (as-a-person) auth: device-code sign-in and the secret-store token cache.
 
 Design contract: ``docs/design/2026-10-27-micro-notify-design.md`` section 2 plus
 **Amendment 2026-10-30, sections A.1–A.3** (delegated mode). This module owns the
@@ -241,6 +241,31 @@ def _access_expiry(cache: msal.SerializableTokenCache) -> float | None:
 
 
 # --- Public API -------------------------------------------------------------
+def _require_writable_cache_dir() -> None:
+    """Fail closed before a device flow when the file backend cannot persist the cache.
+
+    The delegated cache is a secret, and on the file backend it is a file under
+    ``MICRO_NOTIFY_SECRETS_DIR``. Login always has something to write: a fresh
+    cache after sign-in, or a refreshed one when the item was pre-provisioned.
+    Checking the directory first turns a read-only mount into one clear refusal
+    naming the cache path, instead of a device-code wait that can only end in a
+    write error. The keychain backend keeps its existing behaviour.
+    """
+    if secrets.select_backend() != secrets.BACKEND_FILE:
+        return
+    from . import secrets_file
+
+    path = secrets_file.path_for(ACCOUNT_DELEGATED_CACHE)
+    try:
+        secrets_file._ensure_writable_dir(path.parent)
+    except secrets.KeychainError as exc:
+        raise AuthError(
+            f"delegated login needs a WRITABLE secrets dir for its token cache "
+            f"('{path}'): {exc.message}; set {secrets.SECRETS_DIR_ENV} to a writable "
+            f"directory (a pre-provisioned cache still needs the dir writable for refresh)"
+        ) from exc
+
+
 def login(
     interactive: bool = True,
     *,
@@ -248,7 +273,7 @@ def login(
     printer: Callable[[str], None] | None = None,
     timeout: float = DEVICE_FLOW_TIMEOUT_SECONDS,
 ) -> LoginResult:
-    """Sign a person in and cache the tokens in the keychain.
+    """Sign a person in and cache the tokens in the configured secret store.
 
     ``interactive=True`` runs the device-code flow: msal's own prompt (code and
     verification URL) is printed verbatim — it is public information meant for the
@@ -264,6 +289,7 @@ def login(
     (exit 4) for a refused, expired, interrupted or otherwise failed sign-in.
     """
     resolved = _mail_config(mail)
+    _require_writable_cache_dir()
     emit = printer if printer is not None else (lambda text: print(text, file=sys.stderr))
     cache = _new_cache(_read_cache_state())
     app = _build_app(cache, resolved)
