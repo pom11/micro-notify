@@ -1,0 +1,37 @@
+# micro-notify configuration for the container proof (card MN-P01).
+#
+# Committed CI fixture, placeholders only — the same shape as config.example.toml
+# with one Teams target switched on, because the proof has to send to it. Real
+# credentials never appear here or in the file backend's files: the proof posts to
+# a local TLS stub on the runner (packaging/docker/ci/stub_webhook.py).
+#
+# Mounted read-only at /data/config.toml, exactly like the example config. [paths]
+# stays absolute and under /data: the image runs as uid 10001 and /data is the only
+# directory that user may write.
+
+[mail]
+tenant_id = "00000000-0000-0000-0000-000000000000"
+client_id = "00000000-0000-0000-0000-000000000000"
+sender = "noreply@example.com"
+auth = "certificate"
+mode = "app"
+default_reply_to = ""
+
+[allow]
+domains = ["example.com"]
+addresses = []
+
+[limits]
+max_recipients = 20
+daily_max = 200
+max_attach_mb = 3
+
+[paths]
+audit = "/data/audit/sent.jsonl"
+state_dir = "/data/state"
+
+# Enabled for the proof: `teams send alerts` posts one card to the webhook URL held
+# by the file backend account `teams:alerts` (file `teams__alerts`), which the CI job
+# fills with the local stub's URL.
+[teams.targets.alerts]
+kind = "channel"

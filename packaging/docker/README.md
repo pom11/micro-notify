@@ -28,9 +28,10 @@ The base is pinned to `alpine:3.20`; `apk` supplies Python 3.12.x and pip. The
 build log prints the exact `python3 --version` and `python3 -m pip --version`
 lines — copy those into the release record for the image you ship.
 
-**Version record.** This worktree had no reachable Docker daemon, so no build
-was run here and no versions are asserted. The first real build must fill this
-in; see the PR body for the LEFT item.
+**Version record.** See [Container proof](#container-proof) below: the image is
+built on `ubuntu-latest` by `.github/workflows/container-proof.yml`, which prints
+the `python3 --version` and `python3 -m pip --version` lines into its job summary.
+Copy them into the release record for the image you ship.
 
 ### Why single stage, and the fallback
 
@@ -75,8 +76,7 @@ MICRO_NOTIFY_CONFIG=/data/config.toml
 ```
 
 Secrets are **never** in an image layer or in the config file. App mode
-mounts them read-only through the file backend defined by the sibling L1
-"Linux secret backend" card:
+mounts them read-only through the file backend (L1, merged in `b89f25d`):
 
 ```sh
 MICRO_NOTIFY_SECRETS=file
@@ -87,8 +87,8 @@ MICRO_NOTIFY_SECRETS_DIR=/run/secrets/mnotify
 The file backend's permission contract (L1): root-owned `0444` files on a
 read-only mount are accepted; group- or world-writable files are refused as
 unreadable with exit 4. The Dockerfile sets both `MICRO_NOTIFY_SECRETS*`
-variables, but this branch does not implement the backend — until L1 merges,
-the Linux image has no credential reader and `doctor` fails closed at auth.
+variables and the backend is merged, so the image does read credentials — the
+contract is what `.github/workflows/container-proof.yml` proves on real Linux.
 
 The smoke tree below is **fabricated**; never point these commands at a real
 keychain or the live `~/.config/mnotify/config.toml`:
@@ -100,7 +100,7 @@ printf '%s\n' 'AABBCCDDEEFF00112233445566778899AABBCCDD' \
   > secrets/graph.certificate_thumbprint
 chmod 0600 secrets/*
 
-# Permission proof, after L1 merges:
+# Permission proof (the same contract the CI job asserts):
 chmod 0666 secrets/graph.certificate_pem
 docker run --rm -it \
   -v "$PWD/packaging/docker/config.example.toml:/data/config.toml:ro" \
@@ -120,10 +120,71 @@ tenant credentials and is the app-mode ready signal.
 Delegated mode needs a writable secrets mount; that variant is card L2's docs,
 not something this image changes.
 
+## Container proof
+
+The image is built and `mnotify` is exercised on real Linux by
+`.github/workflows/container-proof.yml` — `pull_request` + `workflow_dispatch`,
+`runs-on: ubuntu-latest`, `permissions: contents: read`. It is the only place the
+image is ever built, because the maintainer's machine has no Docker daemon.
+
+The job runs two proofs, both against fabricated credentials only:
+
+1. **The permission contract.** With the secrets mounted `0444` on a read-only
+   volume, `doctor --json` as uid `10001` reports `config`, `keychain` and `teams`
+   passing and `token` failing closed on the fake credentials — **exit 4**. Flip
+   one secret to `0666` and the same command still exits **4**, this time stopping
+   at `keychain` because a group-writable secret is unreadable rather than absent.
+   The job also asserts `id -u` inside the container prints `10001`.
+2. **One real send.** `packaging/docker/ci/stub_webhook.py` serves TLS on the
+   runner with a throwaway self-signed certificate for `127.0.0.1`; the container
+   reaches it with `--network=host` and trusts it through `SSL_CERT_FILE`, which
+   httpx honours — there is no TLS bypass, no `verify=False` and no plain-HTTP URL
+   anywhere. `teams send alerts --text-file /ci/message.md --json` exits **0** and
+   the stub records an `application/json` Adaptive Card carrying the message text.
+
+The private key stays on the runner: only the certificate is mounted read-only,
+and the job's last step proves the key is not reachable from inside the container.
+Fixtures live in `packaging/docker/ci/` and contain canary values and placeholder
+GUIDs only; `tests/test_leak_guard.py` scans them like any other tracked file.
+
+| Case | Command | Exit |
+| --- | --- | --- |
+| secret `0666` | `doctor --json` | 4 (unreadable) |
+| secret `0444`, fake credentials | `doctor --json` | 4 (token fails closed) |
+| stub webhook reachable | `teams send alerts … --json` | 0 (one POST recorded) |
+
+### Recorded run
+
+First time this image was ever built and `mnotify` ever ran on Linux:
+
+| | |
+| --- | --- |
+| Date | 2026-11-13 |
+| Image tag | `mnotify:ci`, built from `packaging/docker/Dockerfile` (`alpine:3.20`) |
+| Runner | `ubuntu-latest`, GitHub Actions |
+| Run | [43458792797](https://github.com/pom11/micro-notify/actions/runs/43458792797) — success |
+| `python3 --version` | `Python 3.12.13` |
+| `python3 -m pip --version` | `pip 24.0 from /usr/lib/python3.12/site-packages/pip (python 3.12)` |
+| `id -u` in the container | `10001` |
+| Exits observed | `4` (secret `0666`) · `4` (fake credentials) · `0` (one alert sent) |
+
+The recorded run is the one that produced the versions above; the job re-runs and
+must stay green on every subsequent commit to the pull request. The stub's receipt,
+from that run's log, is the Adaptive Card the image built and posted:
+
+```json
+{
+  "path": "/hub/x",
+  "content_type": "application/json",
+  "content_length": 547,
+  "body": "{\"type\":\"message\",\"attachments\":[{\"contentType\":\"application/vnd.microsoft.card.adaptive\", … }]}"
+}
+```
+
 ## Updating the image
 
 1. Build and smoke on a host with Docker (the commands above).
 2. Record the printed Python/pip versions and the build log tail in the release
    notes.
-3. Re-run the permission proof after the L1 backend merges.
+3. Re-run the permission proof (the CI job does it on every pull request).
 4. Keep the Alpine tag pinned and bump it deliberately.

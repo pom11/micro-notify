@@ -46,8 +46,10 @@ RUN addgroup -g 10001 mnotify \
  && chown 10001:10001 /data \
  && chmod 0700 /data
 
-# Runtime contract. MICRO_NOTIFY_SECRETS* are the file-backend interface from
-# the L1 Linux secret-backend card; this image does not implement that backend.
+# Runtime contract. MICRO_NOTIFY_SECRETS* select the file backend (L1, merged in
+# b89f25d): it reads one file per account from the mounted secrets directory and
+# refuses anything a non-owner could have written. See packaging/docker/README.md
+# for the contract the CI job proves on real Linux.
 ENV HOME=/data \
     MICRO_NOTIFY_CONFIG=/data/config.toml \
     MICRO_NOTIFY_SECRETS=file \
