@@ -153,6 +153,34 @@ GUIDs only; `tests/test_leak_guard.py` scans them like any other tracked file.
 | secret `0444`, fake credentials | `doctor --json` | 4 (token fails closed) |
 | stub webhook reachable | `teams send alerts … --json` | 0 (one POST recorded) |
 
+### Recorded run
+
+First time this image was ever built and `mnotify` ever ran on Linux:
+
+| | |
+| --- | --- |
+| Date | 2026-11-13 |
+| Image tag | `mnotify:ci`, built from `packaging/docker/Dockerfile` (`alpine:3.20`) |
+| Runner | `ubuntu-latest`, GitHub Actions |
+| Run | [43458792797](https://github.com/pom11/micro-notify/actions/runs/43458792797) — success |
+| `python3 --version` | `Python 3.12.13` |
+| `python3 -m pip --version` | `pip 24.0 from /usr/lib/python3.12/site-packages/pip (python 3.12)` |
+| `id -u` in the container | `10001` |
+| Exits observed | `4` (secret `0666`) · `4` (fake credentials) · `0` (one alert sent) |
+
+The recorded run is the one that produced the versions above; the job re-runs and
+must stay green on every subsequent commit to the pull request. The stub's receipt,
+from that run's log, is the Adaptive Card the image built and posted:
+
+```json
+{
+  "path": "/hub/x",
+  "content_type": "application/json",
+  "content_length": 547,
+  "body": "{\"type\":\"message\",\"attachments\":[{\"contentType\":\"application/vnd.microsoft.card.adaptive\", … }]}"
+}
+```
+
 ## Updating the image
 
 1. Build and smoke on a host with Docker (the commands above).

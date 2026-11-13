@@ -13,6 +13,7 @@ guard's own patterns applied to the yaml and the CI fixtures it fabricates.
 from __future__ import annotations
 
 import py_compile
+import re
 import shutil
 from pathlib import Path
 
@@ -298,3 +299,30 @@ def test_readme_records_the_build_that_actually_ran() -> None:
     assert "exit 4" in text
     assert "exits **0**" in text
     assert "id -u" in text
+
+
+def test_readme_records_a_specific_real_run() -> None:
+    """The record must name a run and the versions it printed, not claim vaguely.
+
+    The *shape* is pinned rather than the exact patch numbers: bumping the pinned
+    Alpine changes the printed versions, and the offline suite must not go red
+    because a version record needs refreshing — it must go red because the record
+    is missing.
+    """
+    text = README.read_text(encoding="utf-8")
+    section = text.split("### Recorded run", 1)
+    assert len(section) == 2, "the Recorded run section must exist"
+    recorded = section[1]
+    assert re.search(r"Python 3\.\d+\.\d+", recorded), recorded[:400]
+    assert re.search(r"pip \d+\.\d+ from ", recorded), recorded[:400]
+    assert re.search(r"actions/runs/\d+", recorded), "an Actions run id/URL must be named"
+    assert "`10001`" in recorded, "the uid the container ran as must be recorded"
+    # All three exit codes, in the record and not just in the prose.
+    assert "`4`" in recorded and "`0`" in recorded
+
+
+def test_ci_fixtures_are_scanned_by_the_leak_guard_too() -> None:
+    """The guard walks `git ls-files`; these files must therefore be tracked."""
+    tracked = {str(p.relative_to(REPO_ROOT)) for p in test_leak_guard.tracked_files()}
+    for path in (WORKFLOW, CI_CONFIG, CI_MESSAGE, CI_STUB):
+        assert str(path.relative_to(REPO_ROOT)) in tracked, f"{path} is not tracked"
