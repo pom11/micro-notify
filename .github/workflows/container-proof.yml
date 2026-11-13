@@ -1,0 +1,196 @@
+name: container-proof
+
+# Proves the Alpine image builds and that `mnotify` actually runs on Linux: the
+# permission contract of the file secret backend, and one real Teams send over TLS
+# to a stub on the runner. Card MN-P01 — see packaging/docker/README.md.
+#
+# There is no Docker daemon on the maintainer's machine, so this job is the only
+# place the image is ever built. It needs no secrets and no network beyond the
+# runner itself: every credential in here is a fabricated canary.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  container-proof:
+    name: Alpine build + permission contract + one alert send
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: mnotify:ci
+      STUB_PORT: "18443"
+      SECRETS: ${{ runner.temp }}/secrets
+      RECEIVED: ${{ runner.temp }}/received.json
+      CERT: ${{ runner.temp }}/stub-cert.pem
+      KEY: ${{ runner.temp }}/stub-key.pem
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the Alpine image
+        run: |
+          set -euo pipefail
+          docker build -f packaging/docker/Dockerfile -t "$IMAGE" . \
+            2>&1 | tee "$RUNNER_TEMP/build.log"
+          # The Dockerfile prints these two lines; record what the pin installed.
+          python_version="$(grep -Eo 'Python 3[0-9.]+' "$RUNNER_TEMP/build.log" | head -1)"
+          pip_version="$(grep -Eo 'pip [0-9][0-9.]+ from [^ ]+' "$RUNNER_TEMP/build.log" | head -1)"
+          test -n "$python_version" || { echo "python3 --version not in the build log"; exit 1; }
+          test -n "$pip_version" || { echo "pip --version not in the build log"; exit 1; }
+          {
+            echo "## Image build ($IMAGE)"
+            echo "- built from \`packaging/docker/Dockerfile\` on \`ubuntu-latest\`"
+            echo "- \`$python_version\`"
+            echo "- \`$pip_version\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "recorded: $python_version / $pip_version"
+
+      - name: Fabricate the file-backend secrets (fake values only)
+        run: |
+          set -euo pipefail
+          rm -rf "$SECRETS"
+          mkdir -p "$SECRETS"
+          # Exactly the three accounts the file backend reads. printf, not echo:
+          # a trailing newline would become part of the stored secret value.
+          printf '%s' 'CANARY-NOT-A-KEY' > "$SECRETS/graph.certificate_pem"
+          printf '%s' 'AABBCCDDEEFF00112233445566778899AABBCCDD' \
+            > "$SECRETS/graph.certificate_thumbprint"
+          printf '%s' "https://127.0.0.1:${STUB_PORT}/hub/x" > "$SECRETS/teams__alerts"
+          # The Docker-secrets convention the L1 backend accepts: not writable by
+          # anyone, world-readable, and owned by the runner uid — never the
+          # container uid 10001, which is what makes it a provisioned file.
+          chmod 0444 "$SECRETS"/*
+          chmod 0755 "$SECRETS"
+          ls -l "$SECRETS"
+
+      - name: The container runs as the unprivileged uid it documents
+        run: |
+          set -euo pipefail
+          uid="$(docker run --rm --user 10001:10001 --entrypoint id "$IMAGE" -u)"
+          echo "container uid: $uid"
+          test "$uid" = "10001" || { echo "expected uid 10001, got $uid"; exit 1; }
+
+      - name: Proof A — a group/world-writable secret is refused (exit 4)
+        run: |
+          set -euo pipefail
+          chmod 0666 "$SECRETS/graph.certificate_pem"
+          rc=0
+          docker run --rm --user 10001:10001 \
+            -v "$GITHUB_WORKSPACE/packaging/docker/ci/config.toml:/data/config.toml:ro" \
+            -v "$SECRETS:/run/secrets/mnotify:ro" \
+            -w /data "$IMAGE" doctor --json \
+            > "$RUNNER_TEMP/doctor-unreadable.json" 2>&1 || rc=$?
+          echo "exit code: $rc"
+          test "$rc" -eq 4 || { echo "expected exit 4, got $rc"; cat "$RUNNER_TEMP/doctor-unreadable.json"; exit 1; }
+          python3 - "$RUNNER_TEMP/doctor-unreadable.json" <<'PY'
+          import json, sys
+          report = json.load(open(sys.argv[1]))
+          checks = {c["name"]: c for c in report["checks"]}
+          print("doctor rows:", {k: v["status"] for k, v in checks.items()})
+          assert report["exitCode"] == 4, report["exitCode"]
+          # The secret is refused before anything downstream runs: the permission
+          # contract, not a token failure, is what stopped this run.
+          assert checks["config"]["status"] == "pass", checks["config"]
+          assert checks["keychain"]["status"] == "fail", checks["keychain"]
+          assert checks["token"]["status"] == "skipped", checks["token"]
+          PY
+          chmod 0444 "$SECRETS/graph.certificate_pem"
+
+      - name: Proof A — with 0444 secrets the checks run and auth fails closed (exit 4)
+        run: |
+          set -euo pipefail
+          rc=0
+          docker run --rm --user 10001:10001 \
+            -v "$GITHUB_WORKSPACE/packaging/docker/ci/config.toml:/data/config.toml:ro" \
+            -v "$SECRETS:/run/secrets/mnotify:ro" \
+            -w /data "$IMAGE" doctor --json \
+            > "$RUNNER_TEMP/doctor-fake-creds.json" 2>&1 || rc=$?
+          echo "exit code: $rc"
+          cat "$RUNNER_TEMP/doctor-fake-creds.json"
+          test "$rc" -eq 4 || { echo "expected exit 4, got $rc"; exit 1; }
+          python3 - "$RUNNER_TEMP/doctor-fake-creds.json" <<'PY'
+          import json, sys
+          report = json.load(open(sys.argv[1]))
+          checks = {c["name"]: c for c in report["checks"]}
+          print("doctor rows:", {k: v["status"] for k, v in checks.items()})
+          assert report["exitCode"] == 4, report["exitCode"]
+          # The permission contract passed — the canary credentials are what failed,
+          # and they failed closed rather than being trusted.
+          for name in ("config", "keychain", "teams"):
+              assert checks[name]["status"] == "pass", (name, checks[name])
+          assert checks["token"]["status"] == "fail", checks["token"]
+          PY
+
+      - name: Proof B — one real Teams send to a local TLS stub
+        run: |
+          set -euo pipefail
+          # A throwaway self-signed certificate for 127.0.0.1. The private key
+          # stays on the runner: only the certificate is mounted into the image.
+          umask 077
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "$KEY" -out "$CERT" -days 1 \
+            -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1" 2>/dev/null
+
+          python3 packaging/docker/ci/stub_webhook.py \
+            --cert "$CERT" --key "$KEY" --port "$STUB_PORT" \
+            --out "$RECEIVED" --timeout 120 &
+          stub_pid=$!
+          # shellcheck disable=SC2064
+          trap "kill $stub_pid 2>/dev/null || true" EXIT
+
+          for _ in $(seq 1 30); do
+            if curl -sk --max-time 2 "https://127.0.0.1:${STUB_PORT}/health" >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          # --network=host so the container reaches the stub on the runner's
+          # loopback; SSL_CERT_FILE makes the image trust this one certificate.
+          # The key is deliberately absent from the mount list.
+          rc=0
+          docker run --rm --user 10001:10001 --network=host \
+            -e SSL_CERT_FILE=/ci/stub-cert.pem \
+            -v "$GITHUB_WORKSPACE/packaging/docker/ci/config.toml:/data/config.toml:ro" \
+            -v "$SECRETS:/run/secrets/mnotify:ro" \
+            -v "$CERT:/ci/stub-cert.pem:ro" \
+            -v "$GITHUB_WORKSPACE/packaging/docker/ci/message.md:/ci/message.md:ro" \
+            -w /data "$IMAGE" teams send alerts --text-file /ci/message.md --json \
+            > "$RUNNER_TEMP/send.json" 2>&1 || rc=$?
+          echo "send exit code: $rc"
+          cat "$RUNNER_TEMP/send.json"
+          test "$rc" -eq 0 || { echo "expected exit 0, got $rc"; exit 1; }
+
+          wait "$stub_pid" || true
+          trap - EXIT
+
+          test -s "$RECEIVED" || { echo "the stub recorded nothing"; exit 1; }
+          echo "### Payload received by the stub" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat "$RECEIVED" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "received payload:"
+          cat "$RECEIVED"
+          python3 - "$RECEIVED" <<'PY'
+          import json, sys
+          record = json.load(open(sys.argv[1]))
+          assert record["content_type"] == "application/json", record["content_type"]
+          assert "Container proof alert" in record["body"], record["body"][:400]
+          card = json.loads(record["body"])
+          assert card["type"] == "message", card
+          print("posted application/json carrying the Adaptive Card of the message")
+          PY
+
+      - name: The private key never entered the image
+        run: |
+          set -euo pipefail
+          # Belt and braces: the key was written by the job, so prove it is not
+          # readable from inside the container that sent the alert.
+          rc=0
+          docker run --rm --user 10001:10001 --entrypoint sh "$IMAGE" \
+            -c 'test ! -e /ci/stub-key.pem && test ! -e /run/secrets/stub-key.pem' || rc=$?
+          test "$rc" -eq 0 || { echo "the private key is reachable inside the container"; exit 1; }
+          echo "private key absent from the container, as intended"
