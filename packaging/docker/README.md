@@ -117,8 +117,10 @@ With fabricated credentials, a later `token`/`AADSTS...` failure (exit 4) is the
 expected fail-closed result. A green `doctor` with `token: warn` needs real
 tenant credentials and is the app-mode ready signal.
 
-Delegated mode needs a writable secrets mount; that variant is card L2's docs,
-not something this image changes.
+Delegated mode (`[mail] mode = "delegated"`) needs the same file backend plus a
+**writable** secrets mount: `mnotify login` writes the token cache back to
+`graph.delegated_token_cache`, so that mount drops the `:ro`. The procedure is
+in [`docs/DELEGATED-SETUP.md`](../../docs/DELEGATED-SETUP.md).
 
 ## Container proof
 
