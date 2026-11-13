@@ -10,3 +10,8 @@ build/
 
 # orchestrator-managed worker worktrees
 .worktrees/
+
+# `uv run` rewrites uv.lock on every gate run. The repo ships no lock file and
+# nothing consumes one (CI builds the image with pip), so it is a local build
+# artifact. Track it deliberately later if the build ever goes reproducible.
+uv.lock
