@@ -221,6 +221,18 @@ def test_workflow_never_mounts_the_private_key() -> None:
     assert "SSL_CERT_FILE" in workflow_text()
 
 
+def test_workflow_carries_no_context_expressions() -> None:
+    """`${{ runner.temp }}` in a job-level `env:` made GitHub refuse the whole file.
+
+    Pinned because nothing local catches it: pyyaml and ruamel both parse the file
+    happily, and the failed run has no job, no log and the file path as its name —
+    the only message is an "Invalid workflow file … Unrecognized named-value:
+    'runner'" annotation. The `runner` context is not available in a job-level
+    `env:` block, so the job derives its temp paths from `$RUNNER_TEMP` per step.
+    """
+    assert "${{" not in workflow_text()
+
+
 def test_ci_config_loads_through_the_product_loader(tmp_path, monkeypatch) -> None:
     target = tmp_path / "config.toml"
     shutil.copyfile(CI_CONFIG, target)
