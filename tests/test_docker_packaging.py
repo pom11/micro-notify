@@ -204,6 +204,10 @@ def test_workflow_runs_as_the_documented_uid_with_read_only_mounts() -> None:
     # the one certificate the job generated.
     assert "--network=host" in text
     assert "SSL_CERT_FILE=/ci/stub-cert.pem" in text
+    # The certificate must be readable by uid 10001 (it is public); at umask 077
+    # openssl writes it 0600 and the container cannot open it.
+    assert 'chmod 0444 "$CERT"' in text
+    assert 'chmod 0600 "$KEY"' in text
 
 
 def test_workflow_never_mounts_the_private_key() -> None:

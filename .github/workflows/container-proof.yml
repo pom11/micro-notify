@@ -144,6 +144,12 @@ jobs:
           openssl req -x509 -newkey rsa:2048 -nodes \
             -keyout "$KEY" -out "$CERT" -days 1 \
             -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1" 2>/dev/null
+          chmod 0600 "$KEY"
+          # The certificate is public, and it must be *readable* by uid 10001: at
+          # umask 077 openssl writes it 0600 owned by the runner uid, and the
+          # container's httpx then dies with PermissionError opening SSL_CERT_FILE.
+          # Same provisioned-world-readable convention as the mounted secrets.
+          chmod 0444 "$CERT"
 
           python3 packaging/docker/ci/stub_webhook.py \
             --cert "$CERT" --key "$KEY" --port "$STUB_PORT" \
@@ -154,10 +160,14 @@ jobs:
 
           for _ in $(seq 1 30); do
             if curl -sk --max-time 2 "https://127.0.0.1:${STUB_PORT}/health" >/dev/null; then
+              ready=1
               break
             fi
             sleep 1
           done
+          # Fail here, not inside the container: a stub that never came up looks
+          # exactly like a product failure in the log otherwise.
+          test "${ready:-0}" = "1" || { echo "the TLS stub never answered on ${STUB_PORT}"; exit 1; }
 
           # --network=host so the container reaches the stub on the runner's
           # loopback; SSL_CERT_FILE makes the image trust this one certificate.
