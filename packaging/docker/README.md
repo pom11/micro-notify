@@ -125,9 +125,12 @@ in [`docs/DELEGATED-SETUP.md`](../../docs/DELEGATED-SETUP.md).
 ## Container proof
 
 The image is built and `mnotify` is exercised on real Linux by
-`.github/workflows/container-proof.yml` — `pull_request` + `workflow_dispatch`,
-`runs-on: ubuntu-latest`, `permissions: contents: read`. It is the only place the
-image is ever built, because the maintainer's machine has no Docker daemon.
+`.github/workflows/container-proof.yml` — triggers `pull_request`, `push` to
+`main`, and `workflow_dispatch`; `runs-on: ubuntu-latest`,
+`permissions: contents: read`. The `push` trigger is what buys a proof run on
+main's own commit, so a merged change is proved on the commit that landed and not
+only on the branch that was reviewed. It is the only place the image is ever
+built, because the maintainer's machine has no Docker daemon.
 
 The job runs two proofs, both against fabricated credentials only:
 
