@@ -174,6 +174,34 @@ def workflow_text() -> str:
     return WORKFLOW.read_text(encoding="utf-8")
 
 
+def workflow_triggers() -> dict[str, list[str]]:
+    """The workflow's `on:` block as {trigger: [its child lines]}.
+
+    Parsed by hand rather than with a YAML loader: pyyaml reads bare `on:` as the
+    boolean `True`, and the offline extra carries pytest only. Splitting on the
+    two-space indent keeps a child line attributable to its own trigger, so
+    `branches: [main]` cannot satisfy the pin by appearing somewhere else.
+    """
+    triggers: dict[str, list[str]] = {}
+    current: str | None = None
+    seen_on = False
+    for line in workflow_text().splitlines():
+        if not seen_on:
+            seen_on = line.rstrip() == "on:"
+            continue
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent == 0:  # dedented back to the document root: the block is over
+            break
+        if indent == 2:
+            current = line.strip().rstrip(":")
+            triggers[current] = []
+        elif current is not None:
+            triggers[current].append(line.strip())
+    return triggers
+
+
 def test_workflow_triggers_on_pull_request_with_read_only_permissions() -> None:
     lines = [line.strip() for line in workflow_text().splitlines()]
     assert "on:" in lines
@@ -183,6 +211,15 @@ def test_workflow_triggers_on_pull_request_with_read_only_permissions() -> None:
     assert "permissions:" in lines
     assert "contents: read" in lines
     assert "runs-on: ubuntu-latest" in lines
+    # Card MN-P02: the trigger set is pinned, not merely sampled. `push` to main is
+    # what attaches a proof run to main's own bytes; without it the proof exists only
+    # against PR heads, and gateclerk's `ARG MICRO_NOTIFY_SHA` pin would inherit its
+    # evidence from a PR commit instead of from the main commit it actually pins.
+    assert workflow_triggers() == {
+        "pull_request": [],
+        "push": ["branches: [main]"],
+        "workflow_dispatch": [],
+    }, "the container-proof trigger set must be exactly pull_request + push(main) + workflow_dispatch"
 
 
 def test_workflow_builds_the_pinned_dockerfile_and_checks_exit_codes() -> None:
