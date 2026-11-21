@@ -221,7 +221,7 @@ strictly worse than letting mnotify finish and report exit 5 or 0.
 
 ## 5. Container pattern
 
-Two deployment shapes are legitimate; gateclerk's plan should choose one.
+Two deployment shapes are legitimate; the gateclerk deployment should choose one.
 
 **Same image (default).** Install the `mnotify` binary in gateclerk's image and
 exec it directly. There is no extra hop, no shared volume negotiation, and one
@@ -319,10 +319,9 @@ Two consequences for gateclerk:
 
 ## 9. Linux prerequisites
 
-Linux prerequisites are maintained in two places, not here: the Linux section
-of `docs/ADMIN-SETUP.md` (owned by the L1 lane) and `packaging/docker/` (owned
-by the L3 lane). Follow those for the runtime, package layout, secret file
-permissions, and container image. This document only defines how gateclerk
+Linux prerequisites are maintained in the Linux section of
+`docs/ADMIN-SETUP.md`, not here. Follow it for the runtime, package layout and
+secret file permissions. This document only defines how gateclerk
 calls the resulting binary.
 
 ## 10. Questions for the gateclerk deployment

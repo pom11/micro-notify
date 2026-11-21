@@ -28,33 +28,12 @@ host terminal works. `nohup`, cron or CI with nobody to visit the URL does
 poll continues until the human acts or msal's flow expires; the existing expiry
 error text is unchanged.
 
-The container needs a config file and a **writable** secrets directory. The
-image built from `packaging/docker/Dockerfile` already sets
-`MICRO_NOTIFY_CONFIG=/data/config.toml`, `MICRO_NOTIFY_SECRETS=file` and
-`MICRO_NOTIFY_SECRETS_DIR=/run/secrets/mnotify`, so the example passes only the
-two mounts; override those variables only if your image uses different paths.
+The container needs a config file and a **writable** secrets directory. Set
+`MICRO_NOTIFY_CONFIG` to the mounted config file, `MICRO_NOTIFY_SECRETS=file`
+and `MICRO_NOTIFY_SECRETS_DIR` to a volume the container uid can write, then
+run `mnotify login --json` in it.
 
-```sh
-# One-time: create the volume, then make it writable by the image's uid (10001).
-# A new named volume is root-owned and the image runs unprivileged, so without
-# this step login is refused.
-docker volume create mnotify-delegated-secrets
-docker run --rm --user 0 -v mnotify-delegated-secrets:/x --entrypoint sh \
-  mnotify:local -c 'chown 10001:10001 /x && chmod 700 /x'
-
-docker run --rm -it \
-  -v "$PWD/delegated.toml:/data/config.toml:ro" \
-  -v mnotify-delegated-secrets:/run/secrets/mnotify \
-  mnotify:local \
-  login --json
-```
-
-The image ENTRYPOINT is already `mnotify`, so the command is `login --json`, not
-`mnotify login --json`. `mnotify:local` is the tag produced by building
-`packaging/docker/Dockerfile` from the repository root
-(`docker build -f packaging/docker/Dockerfile -t mnotify:local .`); substitute
-the image tag you deploy. A minimal `delegated.toml` uses the documented
-placeholders:
+A minimal `delegated.toml` uses the documented placeholders:
 
 ```toml
 [mail]
