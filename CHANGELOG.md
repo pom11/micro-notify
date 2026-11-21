@@ -8,6 +8,11 @@ tap formula pins by `sha256` (see `packaging/README.md`).
 
 ## [Unreleased]
 
+### Removed
+
+- The Alpine Docker image under `packaging/docker/` and its container-proof CI
+  workflow. The file secret backend for Linux is unchanged.
+
 ## [0.1.0] - 2026-11-02
 
 First public release.
