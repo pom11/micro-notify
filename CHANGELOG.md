@@ -8,6 +8,10 @@ tap formula pins by `sha256` (see `packaging/README.md`).
 
 ## [Unreleased]
 
+### Added
+
+- CI: `pytest` on Ubuntu and macOS for every pull request and push to `main`.
+
 ### Removed
 
 - The Alpine Docker image under `packaging/docker/` and its container-proof CI
